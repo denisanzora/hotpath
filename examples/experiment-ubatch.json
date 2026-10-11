@@ -1,0 +1,23 @@
+{
+  "name": "ubatch-example",
+  "description": "Example: compare two microbatch sizes on your own model and llama-server. Paths come from hotpath.local.json (${...} keys); nothing machine-specific lives in this file. Adapt common_args to your hardware and model, then run with --dry-run first.",
+  "binary": "${runtime_binary}",
+  "model": "${model_path}",
+  "port": 8099,
+  "path_prepend": "${path_prepend}",
+  "common_args": ["--ctx-size", "4096", "--gpu-layers", "99", "--batch-size", "512", "--ubatch-size", "128",
+                  "--parallel", "1", "--slots", "--no-webui"],
+  "env": {},
+  "arms": [
+    {"name": "ub128", "args_override": {"--ubatch-size": 128}},
+    {"name": "ub512", "args_override": {"--ubatch-size": 512}}
+  ],
+  "workload": "workloads/example.json",
+  "n_predict": 64,
+  "rounds": 3,
+  "repetitions": 2,
+  "warmup": 1,
+  "cooldown_s": 5,
+  "health_timeout_s": 600,
+  "preconditions": {"sample_seconds": 5, "max_gpu_util_pct": 10, "min_free_vram_mib": 4000, "ports_must_be_free": [8099]}
+}

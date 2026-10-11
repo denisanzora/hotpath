@@ -1,0 +1,23 @@
+{
+  "_comment": "Optional. `hotpath init` writes a minimal version of this. Machine-specific values live in hotpath.local.json, which is gitignored. Every key is optional; commands tell you which one they need.",
+  "server_url": "http://127.0.0.1:8080",
+  "server_log": "/path/to/llama-server-stderr.log",
+  "model_path": "/path/to/model.gguf",
+  "runtime_binary": "/path/to/llama-server",
+  "runtime_bin_dir": "/path/to/llama.cpp/build/bin",
+  "build_dir": "/path/to/llama.cpp/build",
+  "owned_servers": ["http://127.0.0.1:8099"],
+  "path_prepend": [],
+  "model_filter": "",
+  "log_cpu_mode_prefill_tps_below": 10.0,
+  "launcher_settings_file": "/path/to/your-launcher-settings.json",
+  "launcher_settings_keys": {
+    "backend": "backend",
+    "context": "context",
+    "ngl": "gpuLayers",
+    "batch": "batchSize",
+    "ubatch": "ubatchSize",
+    "cuda_graphs": "cudaGraphs"
+  },
+  "launcher_env": {}
+}

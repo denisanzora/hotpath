@@ -1,0 +1,20 @@
+# local results, configs, and anything machine-specific
+/results/
+hotpath.local.json
+*.local.json
+workloads/
+*.log
+*.nsys-rep
+*.ncu-rep
+*.sqlite
+*.gguf
+*.bin
+
+# python / packaging
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/

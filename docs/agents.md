@@ -1,0 +1,68 @@
+# Using hotpath from AI coding agents
+
+hotpath has two agent-facing pieces. Both call the same CLI; neither contains a second implementation of the toolkit.
+
+## MCP server
+
+```
+pip install .            # installs `hotpath` and `hotpath-mcp`
+hotpath-mcp              # or: hotpath mcp
+```
+
+Transport is local stdio (newline-delimited JSON-RPC 2.0). Run it from the directory where your `hotpath.local.json` and `results/` live; file arguments must stay inside that directory.
+
+Generic client configuration (the shape most MCP clients accept):
+
+```json
+{
+  "mcpServers": {
+    "hotpath": { "command": "hotpath-mcp", "args": [] }
+  }
+}
+```
+
+If the client cannot find the command, use the absolute path to `hotpath-mcp` inside your virtual environment, or `"command": "python", "args": ["-m", "hotpath", "mcp"]` with that environment's Python.
+
+### Tools
+
+| Tool | Kind | CLI equivalent |
+|---|---|---|
+| `hotpath_tools` | read-only | `hotpath tools` |
+| `hotpath_gguf_summary` | read-only | `hotpath gguf` |
+| `hotpath_observe` | read-only (no inference) | `hotpath observe` |
+| `hotpath_triage` | read-only | `hotpath triage` |
+| `hotpath_compare` | read-only | `hotpath compare` |
+| `hotpath_workload` | writes a workload file | `hotpath workload` |
+| `hotpath_experiment_plan` | read-only dry run | `hotpath experiment --dry-run` |
+| `hotpath_list_results` | read-only | lists `results/local` |
+| `hotpath_experiment_run` | **active** | `hotpath experiment` |
+| `hotpath_measure` | **active** | `hotpath measure` |
+| `hotpath_bench` | **active** | `hotpath bench` |
+| `hotpath_kernels` | **active** | `hotpath kernels` |
+| `hotpath_profile` | **active** | `hotpath profile` |
+
+### Safety model
+
+- Active tools are **off by default**. The operator enables them by starting the server with `HOTPATH_MCP_ALLOW_ACTIVE=1`, and every active call must also pass `confirm=true`. Agents should only do so after the user agrees.
+- `measure` can only target servers in `owned_servers` in your local config; the `--i-own-this-server` override is not exposed.
+- Experiments launch their own servers on the spec's port and never touch your regular server.
+- Paths: experiment specs, workloads and records must be inside the directory the server was started in, or in a directory listed in `HOTPATH_MCP_EXTRA_ROOTS` (separated by `;` on Windows, `:` elsewhere). Models, server logs and `bench --model` can be anywhere. Runtime binaries, model paths and build directories come from `hotpath.local.json` or the spec, not from tool arguments, so keep your models and runtimes wherever you like.
+- Each call runs as a child process with a timeout (300 s read-only, 1800 s active by default, per-call `timeout_s`, capped by `HOTPATH_MCP_MAX_TIMEOUT_S`, default 7200). On expiry the whole process tree is killed.
+- Outputs are returned to the agent as text, including local paths from tool output. Do not connect this server to a client you do not trust with that information.
+
+## Agent skill
+
+`skills/hotpath/SKILL.md` follows the [Agent Skills](https://agentskills.io) format (`name`, `description`, instructions in Markdown). It teaches an agent the install steps, the passive-first workflow, when to ask before active commands, and how to read results.
+
+To use it, copy the `skills/hotpath` directory into your agent's skills directory. For Claude Code that is `.claude/skills/hotpath/` in a project or `~/.claude/skills/hotpath/` for all projects.
+
+## What has and has not been validated
+
+| Item | Status |
+|---|---|
+| MCP server: `initialize`, `tools/list`, `tools/call` over real stdio, active-tool refusal with and without the env var, path confinement, timeout kill of the process tree, a real `bench` call | **exercised** with a scripted JSON-RPC client on Windows |
+| MCP server in a specific agent (Claude Code, OpenCode, Cursor, ...) | **not yet validated**; the configuration above is the standard stdio shape |
+| SKILL.md frontmatter against the Agent Skills field rules (name format, description length) | checked with a script |
+| SKILL.md loaded by a specific agent (Claude Code, OpenCode, ...) | **not yet validated** |
+
+Reports from real agent setups are welcome.
