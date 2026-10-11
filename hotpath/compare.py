@@ -40,7 +40,9 @@ def comparability(sets):
 
 
 def output_equivalence(sets):
-    """Per prompt, do all arms produce the same greedy tokens? Reports first divergence index."""
+    """Per prompt, do all arms produce the same output? With token ids (hotpath's own workloads) the first
+    divergence index is reported; application-shaped requests carry no token ids, so their outputs are compared
+    by content hash (identical or not)."""
     labels = list(sets)
     if len(labels) < 2:
         return {}
@@ -48,20 +50,25 @@ def output_equivalence(sets):
     by_prompt = {}
     for lab in labels:
         for r in sets[lab]["requests"]:
-            by_prompt.setdefault(r["prompt_id"], {}).setdefault(lab, []).append(r.get("tokens") or [])
+            key = r.get("tokens") if r.get("tokens") else ("sha256:" + str(r.get("output_sha256")))
+            by_prompt.setdefault(r["prompt_id"], {}).setdefault(lab, []).append(key)
     result = {}
     for pid, arms in by_prompt.items():
         if ref not in arms:
             continue
         ref_tok = arms[ref][0]
-        entry = {"reference": ref, "stable_within_reference": all(t == ref_tok for t in arms[ref])}
+        entry = {"reference": ref, "stable_within_reference": all(t == ref_tok for t in arms[ref]),
+                 "basis": "token ids" if isinstance(ref_tok, list) else "output content hash"}
         for lab in labels[1:]:
             if lab not in arms:
                 continue
             other = arms[lab][0]
-            div = next((i for i, (a, b) in enumerate(zip(ref_tok, other)) if a != b), None)
-            if div is None and len(ref_tok) != len(other):
-                div = min(len(ref_tok), len(other))
+            if isinstance(ref_tok, list) and isinstance(other, list):
+                div = next((i for i, (a, b) in enumerate(zip(ref_tok, other)) if a != b), None)
+                if div is None and len(ref_tok) != len(other):
+                    div = min(len(ref_tok), len(other))
+            else:
+                div = None if ref_tok == other else -1  # -1: differs, position unknown (hash comparison)
             entry[lab] = {"identical": div is None, "first_divergence_index": div, "stable_within_arm": all(t == other for t in arms[lab])}
         result[pid] = entry
     return result
@@ -134,14 +141,16 @@ def compare_markdown(rep):
     lines = ["# Comparison  [%s]" % rep["evidence_class"], ""]
     if rep["comparability_issues"]:
         lines += ["**Not directly comparable:**"] + ["- " + i for i in rep["comparability_issues"]] + [""]
-    lines += ["| arm | n | prompt_n med | prefill t/s med (p10-p90) | decode t/s med (p10-p90) | wall ms med | proc dedicated MiB | proc shared MiB | failures |",
-              "|---|---|---|---|---|---|---|---|---|"]
+    lines += ["| arm | n | prompt_n med | prefill t/s med (p10-p90) | decode t/s med (p10-p90) | gen tok med | wall ms med | valid JSON / schema keys | proc dedicated MiB | proc shared MiB | failures |",
+              "|---|---|---|---|---|---|---|---|---|---|---|"]
     for lab, r in rep["arms"].items():
         pf = r.get("prefill_tps") or {}
         dc = r.get("decode_tps") or {}
-        lines.append("| %s | %s | %s | %s (%s-%s) | %s (%s-%s) | %s | %s | %s | %s |" % (
+        v = r.get("validity")
+        vtxt = "%s/%s / %s/%s" % (v["valid_json"], v["judged"], v["schema_required_present"], v["judged"]) if v else "n/a"
+        lines.append("| %s | %s | %s | %s (%s-%s) | %s (%s-%s) | %s | %s | %s | %s | %s | %s |" % (
             lab, r["n"], (r.get("prompt_n") or {}).get("median"), pf.get("median"), pf.get("p10"), pf.get("p90"),
-            dc.get("median"), dc.get("p10"), dc.get("p90"), (r.get("wall_ms") or {}).get("median"),
+            dc.get("median"), dc.get("p10"), dc.get("p90"), (r.get("predicted_n") or {}).get("median"), (r.get("wall_ms") or {}).get("median"), vtxt,
             r.get("process_dedicated_mib"), r.get("process_shared_mib"), len(r.get("failures") or [])))
     lines.append("")
     for k, v in rep["median_ratios"].items():

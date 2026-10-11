@@ -29,6 +29,8 @@ This is an early (0.1) release by a single developer. What has actually been run
 | Runtime | CUDA builds of a llama.cpp-derived `llama-server` / `llama-bench` / `test-backend-ops` |
 | Profilers | Nsight Systems 2024.6, Nsight Compute 2025.1 |
 
+| Passive `observe --log` → `diagnose` | one real log of 78 sessions / 1,849 requests (0.2.0): prefill/decode split on server time, 8% median prefix reuse, decode at 50% of the bandwidth ceiling, session drift, CPU-speed sessions and an unknown-microbatch session all reported from the log alone |
+| MCP in real agents | Claude Code 2.1.x and OpenCode 1.18.x, scripted one-shot sessions (details and limits in docs/agents.md) |
 | Diagnose → propose → experiment → verdict loop | one real run on the setup above (0.2.0): `bench` + `measure` of a 3-prompt workload → `diagnose` ranked a 194 ms (5%) per-request residual first → `propose` wrote a 3-arm spec (default, `--cache-ram 0`, `--ctx-checkpoints 0`) → `experiment` ran 9 interleaved launches → `diagnose` on the record: both candidates −4.2…4.4% wall, consistent on 3/3 prompts, greedy outputs identical, VRAM unchanged, with the finding's caveat (prefix reuse lost) attached |
 
 Not validated: Linux, macOS, AMD or Intel GPUs, multi-GPU systems, upstream `llama.cpp` releases other than the one above, other runtimes (vLLM, TensorRT-LLM, Ollama, ...). The code avoids Windows-only assumptions where it can (`nvidia-smi`, `lsof`, standard install locations for Nsight on Linux), but those paths are untested; please report what you find. The per-process GPU memory counters (`windows_process_gpu_counters`) are Windows-only and are simply absent elsewhere.
@@ -117,6 +119,17 @@ hotpath compare results/local/experiment-<name>-<timestamp>.json
 
 An experiment prints its comparison when it finishes; `compare` re-renders it, or compares several measurement/kernel records.
 
+## Already running a server? Diagnose from its log, no benchmark needed
+
+```
+hotpath observe --log path/to/llama-server.log         # passive: reads the log, no inference
+hotpath diagnose results/local/observation-*.json
+```
+
+From the server's own log hotpath reads every request's prompt and generation timings, token counts, how the slot was selected (LRU / longest common prefix) and how many tokens were reused, per session, with the launch facts the log printed. `diagnose` then reports, from that alone: whether the workload is prefill- or decode-bound (on the server's prompt+generation time — a log has no client wall time, and hotpath says so instead of inventing an overhead figure), how much of each prompt real traffic actually reuses (the evidence that decides whether cache settings may be touched), decode against the bandwidth ceiling for your model, sessions that ran at CPU speed, drift or regressions between sessions and whether launch facts changed, error lines, and whether the log format was understood at all. Each finding keeps its evidence class (`passive` / `historical`) and the list at the end names the single best next measurement — usually one `hotpath measure` against your own server to add wall time and per-request overhead.
+
+Mixed logs are handled explicitly: sessions below a prefill-rate threshold are treated as CPU fallback and reported, not averaged in; a session that did not print its microbatch is reported as unknown rather than borrowed from an older session; an unrecognized format is a finding, not an empty report.
+
 ## From "it is slow" to a measured bottleneck: diagnose and propose
 
 `compare` tells you the numbers; `diagnose` says what they mean and what to test next, and `propose` turns that into a spec the experiment runner accepts.
@@ -143,7 +156,19 @@ What it looks at today: the per-request split into prompt processing, generation
 
 `propose` keeps the comparison fair by construction: one variable differs between arms; the baseline arm is your current configuration (`server_args` in the local config, or the diagnosed experiment's own arguments, or `--common-args`); binary and model are `${...}` references into `hotpath.local.json`; rounds are interleaved by the runner. It prints the dry-run plan and never launches anything.
 
-Diagnoses are not results. A `hypothesis` finding is an argument for an experiment; the experiment's verdict is what you act on.
+Diagnoses are not results. A `hypothesis` finding is an argument for an experiment; the experiment's verdict is what you act on. Verdicts are paired per prompt (each prompt's candidate/baseline ratio against that prompt's own repetition noise), state the workload size (`N prompts x R rounds`, marked preliminary below 3 x 3), judge output identity, output validity and speed separately, and describe this machine and workload only. Experiments that trade prefix reuse for per-request overhead (`--cache-ram`, `--ctx-checkpoints`) carry a production gate: without an `observe --log` record showing how much real traffic reuses, the verdict says applicability is unknown; with high real reuse it says not to apply.
+
+## Measuring your real request shape
+
+Synthetic prompts measure the runtime; your application's requests add sampler settings, JSON schemas or grammars, cache options and generation limits that change the cost. A `requests` workload sends your own captured bodies:
+
+```
+hotpath workload workloads/real.json --from-requests captured.jsonl   # JSON array or JSONL of llama-server request bodies
+```
+
+Each item is sent as-is to `/v1/chat/completions` or `/completion` (streaming off), in order; the slot is cleared before each pass over the items (`erase_between: "repetition"`), so a pass starts cold and the items warm each other as in your application (`"item"` clears before every request, `false` never). Servers that do not implement slot erase (HTTP 501) are detected: the record and the verdict then say that prefill was measured with a warm cache. Arms change one thing with `request_override` (`{"set": {...}, "remove": [...]}` on top-level fields), e.g. the same requests with and without the JSON schema. Records keep per request: timings, token counts, an output hash, output length, and — when the request carried a schema — whether the output was valid JSON with the schema's required keys. Token ids are not available on the chat endpoint, so output equivalence is judged by content hash.
+
+What is retained where: the **workload file** holds your request bodies (prompts included) and lives in your local `workloads/`, which this repository's `.gitignore` excludes; **records** store body hashes, counts, timings and output hashes, never prompt or output text unless the spec sets `"store_outputs": true`; **server logs** written next to results are raw. Diagnoses never quote prompt or output content.
 
 ## Use it from an AI coding agent
 
@@ -206,8 +231,11 @@ Practical guidance:
 - The experiment runner launches whole servers per arm, which is slow for large models but isolates arms properly.
 - MCP server and agent skill are new and unvalidated in real agents (see docs/agents.md).
 - The test suite covers the diagnosis and proposal logic on synthetic record structures (`python -m unittest discover -s tests`); the commands that drive servers and profilers are verified by running the actual workflows (see CONTRIBUTING).
-- `diagnose` reasons from the measurements hotpath itself collects. Its rules are relative (shares, ratios, fractions of a ceiling) and were checked on one GPU/model/runtime; a finding is only as good as the records behind it, and it says `insufficient` rather than guess. It cannot see prefix-cache effectiveness (hotpath workloads disable the cache on purpose), request-level CPU costs inside the client, or anything a kernel profile has not been run for.
-- `propose` covers the experiment kinds `diagnose` emits as arm lists (microbatch sweep, CUDA-graph toggle, prompt-cache/checkpoint flags); findings whose confirmation is a procedure (a profile, a client-side request-shape comparison) are described, not generated.
+- `diagnose` reasons from the measurements hotpath itself collects. Its rules are relative (shares, ratios, fractions of a ceiling) and were checked on one GPU/model/runtime; a finding is only as good as the records behind it, and it says `insufficient` rather than guess. From a server log alone it cannot see client wall time, per-request overhead, or GPU state during requests; prefix-cache effectiveness comes only from a log's slot-selection lines (hotpath's own workloads disable the cache on purpose); nothing is known about kernels until a profile has been run.
+- Log parsing recognizes llama-server's per-request timing, slot-selection and release lines; builds that log differently are reported as a format problem. The threshold that separates CPU-fallback sessions (`log_cpu_mode_prefill_tps_below`, default 10 t/s) is a heuristic you can change in the local config.
+- `propose` covers the experiment kinds `diagnose` emits as arm lists (microbatch sweep, CUDA-graph toggle, prompt-cache/checkpoint flags, request shape); findings whose confirmation is a procedure (a profile, a launch check) are described, not generated.
+- `requests` workloads send top-level body fields as given; `request_override` edits top-level fields only. Output identity on the chat endpoint is a content-hash comparison, and validity checks only JSON parseability plus the schema's required top-level keys, not full schema conformance.
+- Agent integration is validated for Claude Code and (see docs/agents.md) OpenCode by scripted runs on one machine; other clients are untested.
 - `hotpath profile` and `hotpath kernels` are thin wrappers: they run the underlying tool and summarize its output; `diagnose` ranks a profile's kernel classes but does not interpret individual kernels.
 
 ## Troubleshooting

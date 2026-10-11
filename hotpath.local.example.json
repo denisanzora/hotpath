@@ -1,5 +1,5 @@
 {
-  "_comment": "Optional. `hotpath init` writes a minimal version of this. Machine-specific values live in hotpath.local.json, which is gitignored. Every key is optional; commands tell you which one they need.",
+  "_comment": "Optional. `hotpath init` writes a minimal version of this. Machine-specific values live in hotpath.local.json, which is gitignored. Every key is optional; commands tell you which one they need. server_args: the arguments your day-to-day llama-server runs with; `propose` uses them as the baseline arm and `diagnose` reads the microbatch from them (labelled 'declared, not observed') when a measured server did not report it. workload: default workload file for `propose`. log_requests_kept: newest per-request rows an observation keeps from the server log.",
   "server_url": "http://127.0.0.1:8080",
   "server_log": "/path/to/llama-server-stderr.log",
   "model_path": "/path/to/model.gguf",
@@ -8,8 +8,11 @@
   "build_dir": "/path/to/llama.cpp/build",
   "owned_servers": ["http://127.0.0.1:8099"],
   "path_prepend": [],
+  "server_args": ["--ctx-size", "4096", "--gpu-layers", "99", "--batch-size", "512", "--ubatch-size", "512", "--parallel", "1", "--slots", "--no-webui"],
+  "workload": "workloads/example.json",
   "model_filter": "",
   "log_cpu_mode_prefill_tps_below": 10.0,
+  "log_requests_kept": 4000,
   "launcher_settings_file": "/path/to/your-launcher-settings.json",
   "launcher_settings_keys": {
     "backend": "backend",

@@ -61,10 +61,12 @@ def build_spec(finding, cfg, common_args, workload, port=8099, rounds=3, repetit
                 nb = int(dict(zip(args[::2], args[1::2])).get("--batch-size", 0) or 0)
                 if ub and nb and nb < ub:
                     arm["args_override"] = dict(arm["args_override"], **{"--batch-size": ub})
-        for k in ("env_override", "env_remove", "args_remove"):
+        for k in ("env_override", "env_remove", "args_remove", "request_override"):
             if a.get(k):
                 arm[k] = a[k]
         arms.append(arm)
+    if kind == "request_shape" and not str(workload).endswith(".json"):
+        raise ValueError("a request_shape experiment needs a `requests` workload (hotpath workload --from-requests FILE)")
     spec = {
         "name": name or "%s-%s" % (kind, finding["id"]),
         "description": "Proposed by hotpath diagnose from finding '%s': %s. One variable (%s) differs between arms; everything else is identical. "

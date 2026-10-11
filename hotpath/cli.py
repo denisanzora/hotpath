@@ -121,6 +121,17 @@ def cmd_gguf(args):
 
 
 def cmd_workload(args):
+    if args.from_requests:
+        try:
+            w = wl_mod.workload_from_requests(args.from_requests, name=args.name if args.name != "synthetic" else "requests", limit=args.limit)
+        except ValueError as e:
+            raise SystemExit("error: %s" % e)
+        wl_mod.save_workload(w, args.out_file)
+        ident = wl_mod.workload_identity(w)
+        print("wrote %s: %d application request bodies (%s), fields %s" % (args.out_file, ident["n_prompts"], ", ".join(ident["endpoints"]), ident["fields_present"]))
+        print("The workload file holds your request bodies; keep it local (workloads/ is gitignored here). Records store hashes, counts and timings only, "
+              "unless the spec sets store_outputs.")
+        return 0
     w = wl_mod.build_workload(args.name, args.n_prompts, args.words, seed=args.seed, n_predict=args.n_predict, fmt=args.format)
     wl_mod.save_workload(w, args.out_file)
     print("wrote %s: %d prompts, word counts %s, n_predict %d, format %s" % (args.out_file, len(w["prompts"]), args.words, args.n_predict, args.format))
@@ -324,6 +335,8 @@ def build_parser():
     s.add_argument("--words", type=int, nargs="+", default=[450, 900, 1300, 2000]); s.add_argument("--seed", type=int, default=1)
     s.add_argument("--n-predict", type=int, default=64)
     s.add_argument("--format", choices=sorted(wl_mod.FORMATS), default="chatml", help="prompt wrapper; chat models need chatml")
+    s.add_argument("--from-requests", help="build a `requests` workload from your captured llama-server request bodies (JSON array or JSONL) instead of synthetic prompts")
+    s.add_argument("--limit", type=int, help="with --from-requests: keep only the first N bodies")
     s.set_defaults(fn=cmd_workload)
 
     s = sub.add_parser("measure", help="ACTIVE: run a workload against a server you own and record timings")

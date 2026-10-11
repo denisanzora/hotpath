@@ -69,16 +69,22 @@ def observe(cfg, log_path=None, model_path=None, binary_path=None, base_url=None
     if lp and Path(lp).is_file():
         sessions = logparse.parse_log(lp, model_filter=cfg.get("model_filter"))
         all_requests = [r for s in sessions for r in s["requests"]]
+        rows = logparse.compact_requests(sessions, limit=int(cfg.get("log_requests_kept", 4000)))
         rec["log"] = {
             "source_basename": Path(lp).name,
             "sessions": len(sessions),
+            "parse_coverage": logparse.parse_coverage(lp, sessions),
             "launch_facts_printed": logparse.launch_facts_coverage(sessions),
             "session_table": logparse.session_table(sessions),
             "all_sessions_stats": logparse.request_stats(all_requests),
             "gpu_like_sessions_stats": logparse.request_stats(all_requests, min_pp_tps=cfg.get("log_cpu_mode_prefill_tps_below", 10.0)),
             "latest_session_stats": logparse.request_stats(sessions[-1]["requests"]) if sessions else None,
+            "cache_reuse": logparse.cache_reuse_stats(rows),
+            "requests": rows,
+            "cpu_mode_prefill_tps_below": cfg.get("log_cpu_mode_prefill_tps_below", 10.0),
             "note": "sessions whose prefill is below log_cpu_mode_prefill_tps_below t/s are treated as CPU-mode "
-                    "for the gpu_like statistics; the log itself does not say which backend served a request",
+                    "for the gpu_like statistics; the log itself does not say which backend served a request. "
+                    "`requests` holds the newest per-request rows (server timings only; a server log has no client wall time).",
         }
     else:
         rec["log"] = {"available": False}

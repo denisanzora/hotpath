@@ -111,7 +111,8 @@ class ExperimentVerdictTests(unittest.TestCase):
         cand = [_req(1500, 2000, 64, 1300, 3400, prompt_id="p%02d" % i, tokens=[99] + list(range(1, 64))) for i in range(6)]
         rec = _experiment("e", {"base": ([], base, 5000), "cand": ([], cand, 5000)})
         v = dg.diagnose([rec])["experiment_verdicts"][0]["arms"][0]
-        self.assertIn("explaining the output differences", v["verdict"])
+        self.assertIn("explain the difference", v["verdict"])
+        self.assertTrue(v["verdict"].startswith("faster"))
         self.assertEqual(v["outputs"]["identical"], 0)
 
     def test_within_noise_is_weak(self):

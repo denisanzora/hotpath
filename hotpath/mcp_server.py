@@ -143,10 +143,16 @@ def _compare(a):
     return ["compare"] + [_inside_cwd(r, "record") for r in a["records"]]
 
 
-@tool("hotpath_workload", "Generate a deterministic synthetic prompt workload file.",
-      _s({"out_file": _STR, "n_prompts": _INT, "words": {"type": "array", "items": _INT}, "n_predict": _INT, "format": {"type": "string", "enum": ["chatml", "raw"]}}, ["out_file"]))
+@tool("hotpath_workload", "Generate a deterministic synthetic prompt workload file, or (from_requests) build a `requests` workload from the user's captured llama-server request bodies (file inside the working directory; bodies stay local).",
+      _s({"out_file": _STR, "n_prompts": _INT, "words": {"type": "array", "items": _INT}, "n_predict": _INT, "format": {"type": "string", "enum": ["chatml", "raw"]},
+          "from_requests": _STR, "limit": _INT}, ["out_file"]))
 def _workload(a):
     argv = ["workload", _inside_cwd(a["out_file"], "out_file")]
+    if a.get("from_requests"):
+        argv += ["--from-requests", _inside_cwd(a["from_requests"], "from_requests")]
+        if a.get("limit"):
+            argv += ["--limit", str(a["limit"])]
+        return argv
     if a.get("n_prompts"):
         argv += ["--n-prompts", str(a["n_prompts"])]
     if a.get("words"):

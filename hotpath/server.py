@@ -121,6 +121,17 @@ def erase_slot(base, slot_id=0):
         return {"error": "erase failed HTTP %d" % e.code}
 
 
+def request(base, endpoint, body, timeout=900):
+    """One non-streaming request with an application-shaped body (`/v1/chat/completions` or `/completion`).
+    Returns the server JSON plus wall-clock time; the caller decides what to keep from it."""
+    body = dict(body)
+    body["stream"] = False
+    t0 = time.perf_counter()
+    r = _post(base + endpoint, body, timeout=timeout)
+    r["_wall_ms"] = round((time.perf_counter() - t0) * 1000.0, 1)
+    return r
+
+
 def completion(base, prompt, n_predict, temperature=0.0, seed=42, cache_prompt=False, ignore_eos=True, timeout=900, extra=None):
     """One non-streaming completion. Returns the server JSON plus wall-clock time.
 

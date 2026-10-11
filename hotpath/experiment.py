@@ -82,7 +82,8 @@ def plan(spec):
             shown[0] = "%s(%s)" % (redact_path(cmd[0]), redact_path(str(Path(cmd[0]).parent.parent.parent)))
         ov = {k: env.get(k) for k in (spec.get("env") or {})}
         ov.update(a.get("env_override") or {})
-        lines.append("arm %-12s %s   env=%s" % (a["name"], " ".join(shown), ov))
+        req = "   request_override=%s" % a["request_override"] if a.get("request_override") else ""
+        lines.append("arm %-12s %s   env=%s%s" % (a["name"], " ".join(shown), ov, req))
     return "\n".join(lines)
 
 
@@ -143,10 +144,13 @@ def run(spec, out_dir, dry_run=False, wait_for_preconditions_s=0):
         print("waiting for preconditions: %s" % pc["reasons"])
         time.sleep(60)
     workload = load_workload(spec["workload"])
-    if spec.get("n_predict"):
-        workload["n_predict"] = int(spec["n_predict"])
-    if "ignore_eos" in spec:
-        workload["ignore_eos"] = bool(spec["ignore_eos"])
+    if workload.get("kind") != "requests":
+        if spec.get("n_predict"):
+            workload["n_predict"] = int(spec["n_predict"])
+        if "ignore_eos" in spec:
+            workload["ignore_eos"] = bool(spec["ignore_eos"])
+    elif spec.get("store_outputs"):
+        workload["store_outputs"] = True
     rounds = int(spec.get("rounds", 3))
     rec = new_record("experiment", "controlled", name=spec["name"], spec_redacted=json.loads(plan_json(spec)),
                      preconditions_result=pc, workload=workload_identity(workload),
@@ -181,13 +185,15 @@ def run(spec, out_dir, dry_run=False, wait_for_preconditions_s=0):
                 snap = srv.passive_snapshot(base)
                 pid = proc.pid
                 res = run_workload(base, workload, repetitions=int(spec.get("repetitions", 2)), warmup=int(spec.get("warmup", 1)),
-                                   pid=pid, progress=lambda s: print("    " + s))
+                                   pid=pid, progress=lambda s: print("    " + s), request_override=a.get("request_override"))
                 for r in res["requests"]:
                     r["round"] = rnd
                 for r in res["warmup_requests"]:
                     r["round"] = rnd
                 arm_rec["requests"] += res["requests"]
                 arm_rec["warmup_requests"] += res["warmup_requests"]
+                if res.get("slot_erase_error"):
+                    arm_rec["slot_erase_error"] = res["slot_erase_error"]
                 arm_rec["gpu_snapshots"] += [dict(s, round=rnd) for s in res["gpu_snapshots"]]
                 arm_rec["launch_facts"].append({"round": rnd, "load_s": load_s, "props": snap.get("props"),
                                                 "process_counters_after": gpu_mod.windows_process_gpu_counters(pid),

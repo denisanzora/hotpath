@@ -97,10 +97,14 @@ def collect(records):
                 "failures": []}
             ev["server_props"] = ev["server_props"] or props
         elif kind == "observation":
-            ev["log_stats"] = (rec.get("log") or {}).get("gpu_like_sessions_stats") or ev["log_stats"]
+            log = rec.get("log") or {}
+            ev["log_stats"] = log.get("gpu_like_sessions_stats") or ev["log_stats"]
             ev["launch"] = {"launcher_settings": rec.get("launcher_settings") or {}, "launcher_env": rec.get("launcher_env_documented") or {},
-                            "session_table": (rec.get("log") or {}).get("session_table") or [], "gpu_now": rec.get("gpu_now") or {},
+                            "session_table": log.get("session_table") or [], "gpu_now": rec.get("gpu_now") or {},
                             "server_process": rec.get("server_process") or {}}
+            ev["log"] = {"rows": log.get("requests") or [], "sessions": log.get("session_table") or [], "cache": log.get("cache_reuse") or {},
+                         "coverage": log.get("parse_coverage") or {}, "cpu_threshold": _f(log.get("cpu_mode_prefill_tps_below"), 10.0),
+                         "available": bool(log.get("sessions")), "source": log.get("source_basename")}
             ev["server_props"] = ev["server_props"] or ((rec.get("server") or {}).get("props"))
             if (rec.get("model") or {}).get("summary"):
                 ev["model"] = rec["model"]["summary"]
@@ -116,25 +120,73 @@ def collect(records):
 
 
 def phase_split(requests):
-    """Per-request shares of prompt processing, generation and the residual (client wall minus both)."""
+    """Per-request shares of prompt processing, generation and the residual.
+
+    With client wall times (measurement/experiment records) the base is the wall and the residual is wall minus
+    the server's prompt+generation time. With server-log rows there is no wall time: the base is prompt+generation
+    itself, the residual is unknown, and `basis` says so. The two are never mixed in one split."""
     rows = []
+    basis = None
     for r in requests:
         w, p, g = _f(r.get("wall_ms")), _f(r.get("prompt_ms")), _f(r.get("predicted_ms"))
-        if not w or p is None or g is None or w <= 0:
+        if p is None or g is None:
             continue
-        rows.append({"prefill": p / w, "decode": g / w, "residual": max(0.0, w - p - g) / w, "residual_ms": max(0.0, w - p - g),
-                     "prompt_n": r.get("prompt_n"), "predicted_n": r.get("predicted_n"), "wall_ms": w})
+        if w and w > 0 and basis != "server":
+            basis = "client_wall"
+            rows.append({"prefill": p / w, "decode": g / w, "residual": max(0.0, w - p - g) / w, "residual_ms": max(0.0, w - p - g),
+                         "prompt_n": r.get("prompt_n"), "predicted_n": r.get("predicted_n"), "wall_ms": w})
+        elif not w and p + g > 0 and basis != "client_wall":
+            basis = "server"
+            rows.append({"prefill": p / (p + g), "decode": g / (p + g), "residual": None, "residual_ms": None,
+                         "prompt_n": r.get("prompt_n"), "predicted_n": r.get("predicted_n"), "wall_ms": p + g})
     if len(rows) < MIN_REQUESTS_FOR_SPLIT:
         return None
-    return {"n": len(rows),
-            "prefill_share": percentiles([x["prefill"] for x in rows]), "decode_share": percentiles([x["decode"] for x in rows]),
-            "residual_share": percentiles([x["residual"] for x in rows]), "residual_ms": percentiles([x["residual_ms"] for x in rows]),
-            "prompt_n": percentiles([x["prompt_n"] for x in rows]), "predicted_n": percentiles([x["predicted_n"] for x in rows]),
-            "wall_ms": percentiles([x["wall_ms"] for x in rows])}
+    out = {"n": len(rows), "basis": basis,
+           "prefill_share": percentiles([x["prefill"] for x in rows]), "decode_share": percentiles([x["decode"] for x in rows]),
+           "prompt_n": percentiles([x["prompt_n"] for x in rows]), "predicted_n": percentiles([x["predicted_n"] for x in rows]),
+           "wall_ms": percentiles([x["wall_ms"] for x in rows])}
+    if basis == "client_wall":
+        out["residual_share"] = percentiles([x["residual"] for x in rows])
+        out["residual_ms"] = percentiles([x["residual_ms"] for x in rows])
+    else:
+        out["residual_share"] = None
+        out["residual_ms"] = None
+    return out
+
+
+def _passive_arm_from_log(ev):
+    """When no active record exists, diagnose the newest server-log session that looks GPU-served and has enough
+    requests. Rows carry server timings only; the arm says so (`time_basis`)."""
+    log = ev.get("log") or {}
+    rows = log.get("rows") or []
+    if not rows:
+        return None, None
+    thr = log.get("cpu_threshold") or 10.0
+    by_session = {}
+    for r in rows:
+        by_session.setdefault(r.get("session"), []).append(r)
+    for sid in sorted(by_session, reverse=True):
+        rs = [r for r in by_session[sid] if r.get("prompt_ms") is not None and r.get("predicted_ms") is not None]
+        if len(rs) < MIN_REQUESTS_FOR_SPLIT:
+            continue
+        pf = percentiles([r.get("prompt_tps") for r in rs if r.get("prompt_tps")])
+        if pf and pf["median"] < thr:
+            continue  # CPU fallback session: reported by rule_sessions, not diagnosed as the GPU baseline
+        reqs = [{"prompt_id": "log-%s-%d" % (sid, i), "prompt_n": r.get("prompt_n"), "prompt_ms": r.get("prompt_ms"), "prompt_tps": r.get("prompt_tps"),
+                 "predicted_n": r.get("predicted_n"), "predicted_ms": r.get("predicted_ms"), "predicted_tps": r.get("predicted_tps"),
+                 "wall_ms": None, "cache_n": r.get("reused_tokens"), "slot_by": r.get("slot_by")} for i, r in enumerate(rs)]
+        sess = next((s for s in log.get("sessions") or [] if s.get("session") == sid), {})
+        settings = {"n_ubatch": _f(sess.get("n_ubatch")), "n_batch": _f(sess.get("n_batch")), "env_ggml": (ev.get("launch") or {}).get("launcher_env") or {},
+                    "settings_source": "server log, session %s" % sid}
+        label = "%s/session-%s" % (log.get("source") or "log", sid)
+        return label, {"requests": reqs, "evidence_class": "passive", "settings": settings, "vram": {"gpu_after": [(ev.get("launch") or {}).get("gpu_now") or {}]},
+                       "failures": [], "time_basis": "server prompt+generation time from the log; no client wall time", "session": sid}
+    return None, None
 
 
 def _baseline_arm(ev):
-    """The arm a diagnosis describes: the first arm of the newest experiment, else the newest measurement."""
+    """The arm a diagnosis describes: the first arm of the newest experiment, else the newest measurement, else the
+    newest usable server-log session (passive)."""
     if ev["experiments"]:
         rec = ev["experiments"][-1]
         first = next(iter(rec["arms"]))
@@ -142,7 +194,10 @@ def _baseline_arm(ev):
     if ev["arms"]:
         k = list(ev["arms"])[-1]
         return k, ev["arms"][k]
-    return None, None
+    label, arm = _passive_arm_from_log(ev)
+    if arm:
+        ev["arms"][label] = arm
+    return label, arm
 
 
 def _finding(fid, title, severity, confidence, evidence_class, measurements, why, experiment=None, opportunity=None, risks=None, notes=None):
@@ -172,27 +227,59 @@ def rule_phase(ev, label, arm):
         shape, why = "decode-bound", "most of each request is token generation; prompt-side changes cannot move most of the latency"
     else:
         shape, why = "mixed", "prompt processing and generation each take a substantial part of the request; both sides matter"
-    return _finding("workload_phase_split", "Workload is %s (prefill %.0f%%, decode %.0f%%, other %.0f%% of request wall time)" % (shape, 100 * pf, 100 * dc, 100 * rs),
-                    "info", "confirmed" if sp["n"] >= 6 else "likely", arm["evidence_class"],
-                    {"arm": label, "requests": sp["n"], "prompt_tokens_median": _med(sp["prompt_n"]), "generated_tokens_median": _med(sp["predicted_n"]),
-                     "wall_ms_median": _med(sp["wall_ms"]), "prefill_share_median": round(pf, 3), "decode_share_median": round(dc, 3), "residual_share_median": round(rs, 3),
-                     "shares_p10_p90": {"prefill": [sp["prefill_share"]["p10"], sp["prefill_share"]["p90"]], "decode": [sp["decode_share"]["p10"], sp["decode_share"]["p90"]]}},
-                    why, notes=["Shares are computed per request from the server's own prompt/generation timings and the client wall time, then summarized; "
-                                "they describe this workload's prompt and generation lengths, not the model in general."])
+    if sp["basis"] == "client_wall":
+        title = "Workload is %s (prefill %.0f%%, decode %.0f%%, other %.0f%% of request wall time)" % (shape, 100 * pf, 100 * dc, 100 * rs)
+        note = ("Shares are computed per request from the server's own prompt/generation timings and the client wall time, then summarized; "
+                "they describe this workload's prompt and generation lengths, not the model in general.")
+    else:
+        title = "Workload is %s (prefill %.0f%%, decode %.0f%% of the server's prompt+generation time; overhead outside them is not in a log)" % (shape, 100 * pf, 100 * dc)
+        note = ("Computed from the server log's per-request prompt and generation timings (session %s). A server log has no client wall time, so the per-request overhead "
+                "outside these two phases (HTTP, cache saves, checkpoints) is unknown here; `hotpath measure` against your own server is the single measurement that adds it." % arm.get("session"))
+    meas = {"arm": label, "time_basis": sp["basis"], "requests": sp["n"], "prompt_tokens_median": _med(sp["prompt_n"]), "prompt_tokens_p10_p90": [sp["prompt_n"]["p10"], sp["prompt_n"]["p90"]],
+            "generated_tokens_median": _med(sp["predicted_n"]), "generated_tokens_p10_p90": [sp["predicted_n"]["p10"], sp["predicted_n"]["p90"]],
+            "request_ms_median": _med(sp["wall_ms"]), "prefill_share_median": round(pf, 3), "decode_share_median": round(dc, 3),
+            "residual_share_median": round(rs, 3) if rs is not None else None,
+            "shares_p10_p90": {"prefill": [sp["prefill_share"]["p10"], sp["prefill_share"]["p90"]], "decode": [sp["decode_share"]["p10"], sp["decode_share"]["p90"]]}}
+    return _finding("workload_phase_split", title, "info", "confirmed" if sp["n"] >= 6 else "likely", arm["evidence_class"], meas, why, notes=[note])
+
+
+def cache_pattern_evidence(ev):
+    """What the records say about how often real requests reuse a prefix. Decides whether a change that trades
+    prefix reuse for per-request overhead can be recommended beyond the isolated workload it was measured on."""
+    cache = (ev.get("log") or {}).get("cache") or {}
+    if not cache.get("available") or not cache.get("reused_share_of_prompt"):
+        return {"available": False, "note": "no slot-selection/release lines in a log; reuse pattern of real traffic unknown"}
+    share = cache["reused_share_of_prompt"]
+    sel = cache.get("selected_by") or {}
+    n_sel = sum(sel.values()) or 1
+    lcp = sel.get("LCP similarity", 0) / n_sel
+    med = share["median"]
+    level = "low" if med < 0.15 and share["p90"] < 0.5 else ("high" if med >= 0.5 else "mixed")
+    return {"available": True, "reused_share_median": med, "reused_share_p90": share["p90"], "lcp_fraction": round(lcp, 3), "requests": cache.get("requests_with_reuse_data"),
+            "level": level, "source": "server log slot-selection and release lines (real traffic)"}
 
 
 def rule_residual(ev, label, arm):
     sp = phase_split(arm["requests"]) if arm else None
-    if not sp:
+    if not sp or sp["basis"] != "client_wall":
         return None
     rs, rms = _med(sp["residual_share"]), _med(sp["residual_ms"])
     if rs is None or rs < OVERHEAD_SHARE_WORTH_NOTING:
         return None
     s = arm.get("settings") or {}
+    cp = cache_pattern_evidence(ev)
+    risks = ["Disabling the prompt cache or checkpoints removes prefix reuse across requests; if the real traffic repeats long prefixes, the saved overhead can cost more prompt processing than it saves."]
+    if cp.get("available"):
+        risks.append("Cache-pattern evidence from the log: real requests reuse a median %.0f%% of their prompt (p90 %.0f%%; LCP-selected %.0f%%) — reuse is %s, so a flag that removes it is %s." % (
+            100 * cp["reused_share_median"], 100 * cp["reused_share_p90"], 100 * cp["lcp_fraction"], cp["level"],
+            "defensible for this traffic" if cp["level"] == "low" else "likely to cost more than it saves on this traffic"))
+    else:
+        risks.append("No cache-pattern evidence: include an `observe --log` record of the real server so the reuse rate of real traffic is known before adopting such a flag.")
+    risks.append("Resuming from a checkpoint is not bit-identical to recomputing a prompt; outputs may differ at near-ties either way.")
     return _finding("per_request_overhead", "%.0f ms per request (%.0f%%) is spent outside prompt processing and generation" % (rms, 100 * rs),
                     "medium" if rs < 0.15 else "high", "likely", arm["evidence_class"],
                     {"arm": label, "residual_ms_median": round(rms), "residual_ms_p10_p90": [sp["residual_ms"]["p10"], sp["residual_ms"]["p90"]], "residual_share_median": round(rs, 3),
-                     "cache_ram_flag": s.get("cache_ram"), "ctx_checkpoints_flag": s.get("ctx_checkpoints")},
+                     "cache_ram_flag": s.get("cache_ram"), "ctx_checkpoints_flag": s.get("ctx_checkpoints"), "cache_pattern_evidence": cp},
                     "This time is paid on every request regardless of prompt or output length: HTTP and JSON handling, tokenization and template rendering, sampler setup, "
                     "and in llama-server the prompt-cache state save and context checkpoints, which copy sequence state between device and host.",
                     opportunity={"bound_share_of_request": round(rs, 3), "basis": "the whole residual; a candidate rarely removes all of it"},
@@ -200,9 +287,110 @@ def rule_residual(ev, label, arm):
                                 "arms": [{"name": "default", "args_override": {}}, {"name": "cache-ram-0", "args_override": {"--cache-ram": 0}},
                                          {"name": "ctx-checkpoints-0", "args_override": {"--ctx-checkpoints": 0}}],
                                 "metric": "wall_ms median and the residual, prefill unchanged, outputs equivalent",
-                                "note": "Flags are llama-server's; a build that lacks one fails to start, which the experiment reports as a launch failure."},
-                    risks=["Disabling the prompt cache or checkpoints removes prefix reuse across requests; if the real traffic repeats long prefixes, the saved overhead can cost more prompt processing than it saves. Measure with the real request pattern before adopting.",
-                           "Resuming from a checkpoint is not bit-identical to recomputing a prompt; outputs may differ at near-ties either way."])
+                                "note": "Flags are llama-server's; a build that lacks one fails to start, which the experiment reports as a launch failure. "
+                                        "The experiment's workload disables prompt caching on purpose, so it measures the overhead only; the reuse side needs the log evidence above."},
+                    risks=risks)
+
+
+def rule_cache_reuse(ev):
+    cp = cache_pattern_evidence(ev)
+    cache = (ev.get("log") or {}).get("cache") or {}
+    if not cp.get("available"):
+        if (ev.get("log") or {}).get("available"):
+            return _finding("prefix_reuse_unknown", "Prefix reuse of real traffic is not visible in this log", "info", "insufficient", "passive",
+                            {"cache_stats": cache}, "The log printed no slot-selection or release lines (verbosity), so how much of each prompt the server reused cannot be read.",
+                            notes=["llama-server prints 'selected slot by LRU/LCP similarity' and 'release: ... n_tokens' at its default verbosity; a quieter log level hides them."])
+        return None
+    sel = cache.get("selected_by") or {}
+    meas = {"requests": cp["requests"], "reused_share_of_prompt_median": cp["reused_share_median"], "reused_share_p90": cp["reused_share_p90"],
+            "reused_tokens_median": _med(cache.get("reused_tokens")), "selected_by": sel, "f_sim_best_median": _med(cache.get("f_sim_best"))}
+    if cp["level"] == "low":
+        return _finding("prefix_reuse_low", "Real requests reuse a median %.0f%% of their prompt from the slot (p90 %.0f%%)" % (100 * cp["reused_share_median"], 100 * cp["reused_share_p90"]),
+                        "medium", "likely", "passive", meas,
+                        "Consecutive requests share only a short prefix (typically the system message), so prompt caching rarely saves prompt processing on this traffic; meanwhile every "
+                        "request may pay the server's cache bookkeeping (state saves, checkpoints), which a log cannot show.",
+                        opportunity={"bound": "the per-request bookkeeping overhead, measurable only with client wall times", "basis": "low reuse means little is lost by changing cache settings"},
+                        experiment={"kind": "server_overhead_flags", "variable": "prompt-cache/checkpoint flags",
+                                    "arms": [{"name": "default", "args_override": {}}, {"name": "cache-ram-0", "args_override": {"--cache-ram": 0}}],
+                                    "metric": "wall_ms with client timing (hotpath measure/experiment); the log alone cannot show the gain"},
+                        risks=["If the application's prompts are reordered so that long static text comes first, reuse would rise and the cache would become valuable; re-check the log after such a change.",
+                               "On recurrent/hybrid models partial reuse happens only at checkpoints; reordering prompts without checkpoints at the right place changes little."],
+                        notes=["Prompt-order changes in the application (static instructions before per-request content) are usually the larger lever when reuse is this low."])
+    return _finding("prefix_reuse_%s" % cp["level"], "Real requests reuse a median %.0f%% of their prompt from the slot (p90 %.0f%%)" % (100 * cp["reused_share_median"], 100 * cp["reused_share_p90"]),
+                    "info", "likely", "passive", meas,
+                    "Prompt caching is doing useful work for this traffic; changes that trade it for lower per-request overhead would cost prompt processing here.",
+                    risks=["Do not disable the prompt cache or checkpoints for this deployment on the strength of an isolated-request experiment."])
+
+
+def rule_sessions(ev):
+    log = ev.get("log") or {}
+    table = log.get("sessions") or []
+    if not table:
+        return None
+    thr = log.get("cpu_threshold") or 10.0
+    used = [s for s in table if (s.get("requests") or 0) >= MIN_REQUESTS_FOR_SPLIT and s.get("prefill_median_tps")]
+    cpu = [s for s in used if s["prefill_median_tps"] < thr]
+    gpu = [s for s in used if s["prefill_median_tps"] >= thr]
+    out = []
+    if cpu:
+        n_req = sum(s["requests"] for s in cpu)
+        out.append(_finding("cpu_fallback_sessions", "%d of %d sessions with requests ran at CPU-like speed (prefill median < %.0f t/s), %d requests" % (len(cpu), len(used), thr, n_req),
+                            "high" if cpu[-1] is used[-1] else "medium", "likely", "passive",
+                            {"sessions": [{"session": s["session"], "prefill_median_tps": s["prefill_median_tps"], "decode_median_tps": s["decode_median_tps"], "device": s.get("device"), "requests": s["requests"]} for s in cpu]},
+                            "A session whose prompt processing runs at single-digit tokens per second is not using the GPU for the model (no offload, a failed CUDA load, or a deliberate CPU "
+                            "launch); every request in it is many times slower than the GPU sessions in the same log." + (" The latest session is one of them." if cpu[-1] is used[-1] else ""),
+                            experiment={"kind": "launch_check", "variable": "backend/offload", "arms": "check the launch command and the session's device line and 'offloaded N/M layers' fact; relaunch with full GPU offload and compare the next session",
+                                        "metric": "prefill t/s in the next session"},
+                            risks=["If the fallback was the launcher's reaction to memory pressure, forcing the GPU can fail to load; check free VRAM first."]))
+    if len(gpu) >= 2:
+        prev, last = gpu[-2], gpu[-1]
+        changes = []
+        for k in ("prefill_median_tps", "decode_median_tps"):
+            a, b = prev.get(k), last.get(k)
+            if a and b and abs(b - a) / a > 0.15:
+                changes.append("%s %.1f -> %.1f (%+.0f%%)" % (k, a, b, 100 * (b - a) / a))
+        facts = {k: (prev.get(k), last.get(k)) for k in ("n_batch", "n_ubatch", "device", "compute_mib") if prev.get(k) != last.get(k)}
+        facts_missing = [k for k in ("n_batch", "n_ubatch", "device") if not last.get(k)]
+        if changes:
+            out.append(_finding("session_drift", "Latest GPU session differs from the previous one: %s" % "; ".join(changes), "medium", "likely", "historical",
+                                {"previous_session": prev["session"], "latest_session": last["session"], "launch_facts_changed": facts, "launch_facts_not_printed_in_latest": facts_missing,
+                                 "requests": [prev["requests"], last["requests"]]},
+                                "Throughput moved between two launches of the same deployment. If launch facts changed (microbatch, batch, device), that is the first suspect; if nothing "
+                                "printed changed, the cause is outside the log (other GPU load, thermals, a different build)." +
+                                (" The latest session printed none of %s, so a changed launch setting cannot be excluded from the log alone." % facts_missing if facts_missing else ""),
+                                experiment={"kind": "ubatch_sweep" if "n_ubatch" in facts else "launch_check", "variable": "--ubatch-size" if "n_ubatch" in facts else "launch facts",
+                                            "arms": [{"name": "ub%s" % v, "args_override": {"--ubatch-size": int(v)}} for v in sorted({int(x) for x in facts.get("n_ubatch", ()) if x})] if "n_ubatch" in facts else "relaunch both configurations under hotpath experiment",
+                                            "metric": "prefill and decode t/s medians, controlled"},
+                                notes=["Historical comparison: the two sessions ran under conditions hotpath did not control."]))
+        best = max(gpu, key=lambda s: s["prefill_median_tps"])
+        if best is not last and (best["prefill_median_tps"] - last["prefill_median_tps"]) / best["prefill_median_tps"] > 0.15 and not changes:
+            out.append(_finding("regression_vs_best_session", "Latest session prefill %.1f t/s is %.0f%% below the best GPU session in this log (%.1f t/s, session %s)" % (
+                last["prefill_median_tps"], 100 * (1 - last["prefill_median_tps"] / best["prefill_median_tps"]), best["prefill_median_tps"], best["session"]),
+                "medium", "likely", "historical", {"best_session": best["session"], "latest_session": last["session"]},
+                "Something between those launches made prompt processing slower; compare their launch facts in the observation's session table.",
+                notes=["Historical comparison; conditions were not controlled."]))
+    warn = sum(s.get("warnings") or 0 for s in table)
+    err = sum(s.get("errors") or 0 for s in table)
+    if err:
+        out.append(_finding("log_errors", "%d error lines across sessions (CUDA errors, allocation failures or asserts)" % err, "high", "confirmed", "passive",
+                            {"errors": err, "warnings": warn}, "Requests served around an error are not representative, and an allocation failure often precedes a fallback to slower paths.",
+                            notes=["See the observation's session table for the sessions that carry them."]))
+    return out or None
+
+
+def rule_coverage(ev):
+    log = ev.get("log") or {}
+    cov = log.get("coverage") or {}
+    if not log.get("available") and not cov:
+        return None
+    if cov.get("problem"):
+        return _finding("log_format_problem", "The server log could not be read as expected: %s" % cov["problem"], "high", "insufficient", "passive", cov,
+                        "Every log-based finding depends on the parser recognizing this runtime's lines; with this coverage the absence of findings means nothing.",
+                        notes=["Supported: llama-server stderr logs with 'prompt eval time' / 'eval time' / 'total time' per request. Other runtimes and heavily customized builds are not parsed."])
+    if cov and cov.get("requests_parsed", 0) < 20:
+        return _finding("log_thin", "Only %d requests in the log" % cov.get("requests_parsed", 0), "info", "insufficient", "passive", cov,
+                        "Medians over fewer than ~20 requests are fragile; the findings are indicative only.")
+    return None
 
 
 def rule_microbatch(ev, label, arm):
@@ -213,18 +401,23 @@ def rule_microbatch(ev, label, arm):
         ls = (ev.get("launch") or {}).get("launcher_settings") or {}
         ub = _f(ls.get("ubatch"))
         source = "launcher settings"
-    if ub is None:
-        tbl = (ev.get("launch") or {}).get("session_table") or []
-        vals = [r.get("n_ubatch") for r in tbl if r.get("n_ubatch")]
-        ub = _f(vals[-1]) if vals else None
-        source = "server log (latest session that printed it)"
-    if ub is None:
-        return _finding("microbatch_unknown", "Microbatch size is not in the evidence", "info", "insufficient", "passive", {},
-                        "Prefill throughput depends strongly on the microbatch (prompt tokens processed per GEMM); without the value the prefill rules cannot run.",
-                        notes=["Provide an experiment record (the arm's args carry --ubatch-size), launcher settings via launcher_settings_file, or a server log that printed n_ubatch."])
     sp = phase_split(arm["requests"]) if arm else None
     pf_share = _med(sp["prefill_share"]) if sp else None
     pf_tps = _med(percentiles([r.get("prompt_tps") for r in arm["requests"]])) if arm else None
+    if ub is None:
+        # an older session's value is not this session's value: report it, do not diagnose from it
+        tbl = (ev.get("launch") or {}).get("session_table") or []
+        older = [(r.get("session"), r.get("n_ubatch")) for r in tbl if r.get("n_ubatch")]
+        note = ("Provide an experiment record (the arm's args carry --ubatch-size), launcher settings via launcher_settings_file, or a server log at a verbosity that prints n_ubatch."
+                if not older else "The diagnosed session did not print n_ubatch (log verbosity); the last session that did was session %s with n_ubatch=%s, which may not be the current setting." % older[-1])
+        return _finding("microbatch_unknown", "Microbatch size of the diagnosed session is not in the evidence", "info", "insufficient", "passive",
+                        {"prefill_tps_median": pf_tps, "last_printed": {"session": older[-1][0], "n_ubatch": older[-1][1]} if older else None},
+                        "Prefill throughput depends strongly on the microbatch (prompt tokens processed per GEMM); without the value the prefill rules cannot run.", notes=[note])
+    if ub < 16 and pf_tps and pf_tps > 150:
+        return _finding("microbatch_inconsistent", "Recorded microbatch %d cannot produce the measured prefill of %.0f t/s; the real setting is not in the evidence" % (ub, pf_tps),
+                        "info", "insufficient", "passive", {"n_ubatch": ub, "source": source, "prefill_tps_median": pf_tps},
+                        "With a microbatch below 16 prompt processing cannot exceed a small multiple of the decode rate; the measurement contradicts the setting, so the setting is stale or belongs to another session.",
+                        notes=["Check which session the setting came from; a launcher settings file may describe a different launch than the one in the log."])
     if ub >= SMALL_UBATCH:
         return _finding("microbatch_not_small", "Microbatch %d is already in the range where prefill is batched GEMM work" % ub, "info", "likely", "passive",
                         {"n_ubatch": ub, "source": source, "prefill_tps_median": pf_tps},
@@ -289,9 +482,10 @@ def rule_server_vs_bench(ev, label, arm):
                                 {"server_decode_tps_median": dc_tps, "bench_tg_tps": best["avg_ts"], "bench_n_gen": best.get("n_gen"), "fraction": round(frac, 3)},
                                 "Per generated token the server adds sampling (and grammar constraints if the client sends a schema), logit transfer and streaming; llama-bench pays none of it. "
                                 "A gap this size is CPU-side per-token work, not GPU kernels.",
-                                experiment={"kind": "request_shape", "variable": "client request parameters",
-                                            "arms": "measure the same prompts with the application's real request body (schema, sampler settings) and with plain greedy settings on the same server",
-                                            "metric": "decode t/s and tokens generated; outputs' validity"},
+                                experiment={"kind": "request_shape", "variable": "request body fields (schema / grammar / sampler)",
+                                            "arms": [{"name": "as-captured"}, {"name": "no-schema", "request_override": {"remove": ["response_format", "json_schema", "grammar"]}}],
+                                            "metric": "decode t/s and generated tokens per request, and output validity; a validity loss is a decision-level difference, not a speedup",
+                                            "note": "Needs a `requests` workload built from your captured request bodies (hotpath workload --from-requests). The schema-free arm shows what the constraint costs; it is a diagnosis, not a configuration to adopt if validity drops."},
                                 risks=["Removing a grammar or sampler the application relies on changes outputs; the fix is usually in the sampler path, not in the request."]))
     return out or None
 
@@ -360,9 +554,16 @@ def rule_vram(ev, label, arm):
                         experiment={"kind": "vram_headroom", "variable": "memory footprint", "arms": "smaller --ctx-size or --ubatch-size vs current; or fewer other GPU processes", "metric": "per-process shared MiB (Windows) and decode/prefill t/s"},
                         risks=["Reducing context or microbatch to free memory trades capacity or prefill speed for stability."])
     headroom = total - used if used else None
-    return _finding("vram_headroom", "GPU memory headroom %s MiB of %.0f" % (round(headroom) if headroom else "unknown", total), "info", "likely", arm["evidence_class"] if arm else "passive",
+    passive_now = not after and used is not None
+    notes = None
+    if passive_now:
+        pid_found = ((ev.get("launch") or {}).get("server_process") or {}).get("pid_found")
+        notes = ["Measured at observation time, not during requests%s; the number is the GPU's state now, not the served configuration's footprint." % (
+            " and the observed server was not running" if pid_found is False else "")]
+    return _finding("vram_headroom", "GPU memory headroom %s MiB of %.0f%s" % (round(headroom) if headroom else "unknown", total, " (at observation time)" if passive_now else ""),
+                    "info", "likely" if not passive_now else "insufficient", arm["evidence_class"] if arm else "passive",
                     dict(meas, headroom_mib=round(headroom) if headroom else None),
-                    "Headroom bounds which microbatch/context candidates can be tried without spilling; the compute buffer grows with the microbatch.")
+                    "Headroom bounds which microbatch/context candidates can be tried without spilling; the compute buffer grows with the microbatch.", notes=notes)
 
 
 def rule_profile(ev):
@@ -474,31 +675,56 @@ def experiment_verdict(rec):
         full = "%s/%s" % (rec.get("name"), lab)
         oe = rep.get("output_equivalence") or {}
         ident = [e.get(full, {}).get("identical") for e in oe.values() if full in e]
-        row["outputs"] = {"prompts_compared": len(ident), "identical": sum(1 for x in ident if x),
+        basis = next((e.get("basis") for e in oe.values() if full in e), None)
+        row["outputs"] = {"prompts_compared": len(ident), "identical": sum(1 for x in ident if x), "basis": basis,
                           "first_divergence_indices": [e[full].get("first_divergence_index") for e in oe.values() if full in e and not e[full].get("identical")]}
+        # validity (application-shaped requests with a schema): a decision-level property, judged apart from speed and from token identity
+        bv, cv = (base.get("summary") or {}).get("validity"), (cand.get("summary") or {}).get("validity")
+        if bv or cv:
+            from hotpath.measure import summarize_requests as _sr
+            bv = bv or _sr(base.get("requests") or []).get("validity") or {}
+            cv = cv or _sr(cand.get("requests") or []).get("validity") or {}
+            row["validity"] = {"baseline": bv, "candidate": cv,
+                               "dropped": bool(bv and cv and (cv.get("schema_required_present", 0) < bv.get("schema_required_present", 0) or cv.get("valid_json", 0) < bv.get("valid_json", 0)))}
         w = row["metrics"].get("wall_ms", {})
+        n_prompts = w.get("prompts") or 0
+        n_rounds = int((rec.get("spec_redacted") or {}).get("rounds") or 1)
+        small = n_prompts < 3 or n_rounds < 3
+        scope = "on this machine and workload (%d prompts x %d rounds%s)" % (n_prompts, n_rounds, "; preliminary" if small else "")
         all_identical = row["outputs"]["prompts_compared"] > 0 and row["outputs"]["identical"] == row["outputs"]["prompts_compared"]
         if row["failures"]:
             verdict = "reject: launch failures in this arm"
+        elif row.get("validity", {}).get("dropped"):
+            verdict = "reject: output validity dropped (%s -> %s schema-conformant of %s): a decision-level difference, whatever the speed" % (
+                bv.get("schema_required_present"), cv.get("schema_required_present"), cv.get("judged"))
         elif w.get("call") == "improvement" and all_identical:
-            verdict = "keep: end-to-end improvement (%.1f%% wall, consistent on %d/%d prompts) with identical greedy outputs" % (100 * (1 - w["ratio"]), w["consistent_direction"], w["prompts"])
+            verdict = "keep %s: %.1f%% wall improvement, same direction on %d/%d prompts, identical outputs (%s)" % (scope, 100 * (1 - w["ratio"]), w["consistent_direction"], w["prompts"], basis)
         elif w.get("call") == "improvement":
-            verdict = "keep only after explaining the output differences (numerical shift vs behavior change)"
+            verdict = "faster %s, but outputs differ on %d/%d prompts: explain the difference (numerical shift vs behavior change) before keeping" % (
+                scope, row["outputs"]["prompts_compared"] - row["outputs"]["identical"], row["outputs"]["prompts_compared"])
         elif w.get("call") == "regression":
-            verdict = "reject: end-to-end regression (%.1f%% wall)" % (100 * (w["ratio"] - 1))
+            verdict = "reject %s: %.1f%% wall regression" % (scope, 100 * (w["ratio"] - 1))
         elif any(m["call"] == "improvement" for m in row["metrics"].values()):
-            verdict = "inconclusive: a component improved but wall time did not move beyond the within-prompt noise; more rounds or a longer workload would decide"
+            verdict = "inconclusive %s: a component improved but wall time did not move beyond the within-prompt noise; more rounds or a longer workload would decide" % scope
         elif any(m["call"].startswith("improvement within noise") for m in row["metrics"].values()):
-            verdict = "inconclusive: a small improvement within the within-prompt noise; more rounds would decide"
+            verdict = "inconclusive %s: a small improvement within the within-prompt noise; more rounds would decide" % scope
         else:
-            verdict = "no measurable difference"
+            verdict = "no measurable difference %s" % scope
         row["verdict"] = verdict
+        if base.get("slot_erase_error") or cand.get("slot_erase_error"):
+            row["warm_cache_note"] = ("the server does not implement slot erase (%s): repetitions after the first ran with a warm prompt cache, so prefill and cache_n describe "
+                                      "warm-cache behavior; decode and validity are unaffected" % (base.get("slot_erase_error") or cand.get("slot_erase_error")))
         rows.append(row)
-    return {"experiment": rec.get("name"), "evidence_class": rep.get("evidence_class"), "comparability_issues": rep.get("comparability_issues"), "arms": rows}
+    return {"experiment": rec.get("name"), "evidence_class": rep.get("evidence_class"), "comparability_issues": rep.get("comparability_issues"), "arms": rows,
+            "scope_note": "A verdict describes this workload on this machine; it is not a property of the runtime in general."}
 
 
 def insufficiencies(ev, arm):
     out = []
+    passive_only = bool(arm) and arm.get("evidence_class") == "passive"
+    if passive_only:
+        out.append("Only server-log evidence: client wall time, per-request overhead (cache saves, checkpoints, HTTP) and GPU state during requests are not in a log. "
+                   "Single best next measurement: `hotpath measure --server <your server> --workload <w>` (a few requests, your own server, cache off) — it adds the wall time and the residual to the same diagnosis.")
     if not ev["bench"]:
         out.append("No llama-bench record: the server's share of prefill/decode cost cannot be separated from the runtime's (hotpath bench).")
     if not ev["profiles"]:
@@ -509,7 +735,8 @@ def insufficiencies(ev, arm):
         out.append("Fewer than 6 measured requests in the diagnosed arm: shares and medians have little spread information.")
     if not ev["experiments"]:
         out.append("No controlled experiment yet: every configuration finding above is a hypothesis until an interleaved A/B confirms it.")
-    out.append("Prefix-cache effectiveness is not measured by hotpath's workloads (they disable the prompt cache on purpose); judge it from the server log's slot-selection lines or an experiment that sends the real request sequence.")
+    if not cache_pattern_evidence(ev).get("available"):
+        out.append("Prefix-cache effectiveness of real traffic is unknown: hotpath's workloads disable the prompt cache on purpose; an `observe --log` record of the real server supplies the reuse pattern.")
     return out
 
 
@@ -545,6 +772,9 @@ def diagnose(records, bandwidth_gbs=None, cfg=None):
     ev = apply_local_config(collect(records), cfg)
     label, arm = _baseline_arm(ev)
     findings = []
+    f = rule_coverage(ev)
+    if f:
+        findings.append(f)
     for fn in (rule_phase, rule_residual, rule_microbatch, rule_vram):
         f = fn(ev, label, arm)
         if f:
@@ -556,6 +786,12 @@ def diagnose(records, bandwidth_gbs=None, cfg=None):
         fs = fn(ev, label, arm)
         if fs:
             findings.extend(fs)
+    f = rule_cache_reuse(ev)
+    if f:
+        findings.append(f)
+    fs = rule_sessions(ev)
+    if fs:
+        findings.extend(fs)
     fs = rule_profile(ev)
     if fs:
         findings.extend(fs)
@@ -570,7 +806,21 @@ def diagnose(records, bandwidth_gbs=None, cfg=None):
         origin = next((f for f in findings if f["id"] == prov.get("finding")), None)
         if origin:
             v["tests_finding"] = origin["id"]
-            v["caveats"] = origin.get("risks") or []
+            v["caveats"] = list(origin.get("risks") or [])
+        # a flag that trades prefix reuse for per-request overhead: its production applicability depends on real traffic's reuse pattern
+        if prov.get("experiment_kind") == "server_overhead_flags" or any("--cache-ram" in str(a.get("args_override")) or "--ctx-checkpoints" in str(a.get("args_override"))
+                                                                          for a in (r.get("spec_redacted") or {}).get("arms") or []):
+            cp = cache_pattern_evidence(ev)
+            if not cp.get("available"):
+                gate = "production applicability unknown: no cache-pattern evidence for real traffic (add an `observe --log` record of the real server). The gain was measured on isolated requests with the prompt cache off."
+            elif cp["level"] == "low":
+                gate = "production applicability supported: real traffic reuses a median %.0f%% of each prompt (p90 %.0f%%), so little prefix reuse is lost." % (100 * cp["reused_share_median"], 100 * cp["reused_share_p90"])
+            else:
+                gate = "do not apply to production on this evidence: real traffic reuses a median %.0f%% of each prompt; removing the cache would cost more prompt processing than this saves." % (100 * cp["reused_share_median"])
+            v["production_gate"] = gate
+            for row in v["arms"]:
+                if row["verdict"].startswith("keep"):
+                    row["verdict"] += " — " + gate
         verdicts.append(v)
     # a finding whose experiment has been run in these records is settled by its verdict: do not recommend it again
     tested = {v["tests_finding"]: v for v in verdicts if v.get("tests_finding")}
@@ -595,10 +845,20 @@ def diagnosis_markdown(d):
             for m, x in row["metrics"].items():
                 lines.append("  - %s: %s (ratio %.3f; %s -> %s; same direction on %d/%d prompts; baseline within-prompt spread %.1f%%)" % (
                     m, x["call"], x["ratio"], x["baseline_median"], x["candidate_median"], x["consistent_direction"], x["prompts"], 100 * x["baseline_within_prompt_spread_median"]))
-            lines.append("  - outputs identical %d/%d%s; VRAM delta %s MiB; failures %d" % (row["outputs"]["identical"], row["outputs"]["prompts_compared"],
-                         "" if not row["outputs"]["first_divergence_indices"] else " (first divergence at %s)" % row["outputs"]["first_divergence_indices"], row.get("vram_delta_mib"), row["failures"]))
+            lines.append("  - outputs identical %d/%d by %s%s; VRAM delta %s MiB; failures %d" % (row["outputs"]["identical"], row["outputs"]["prompts_compared"], row["outputs"].get("basis"),
+                         "" if not row["outputs"]["first_divergence_indices"] or row["outputs"]["first_divergence_indices"] == [-1] * len(row["outputs"]["first_divergence_indices"]) else " (first divergence at %s)" % row["outputs"]["first_divergence_indices"], row.get("vram_delta_mib"), row["failures"]))
+            if row.get("warm_cache_note"):
+                lines.append("  - note: %s" % row["warm_cache_note"])
+            if row.get("validity"):
+                b, c = row["validity"]["baseline"], row["validity"]["candidate"]
+                lines.append("  - validity: valid JSON %s/%s -> %s/%s; schema keys present %s/%s -> %s/%s%s" % (
+                    b.get("valid_json"), b.get("judged"), c.get("valid_json"), c.get("judged"), b.get("schema_required_present"), b.get("judged"), c.get("schema_required_present"), c.get("judged"),
+                    " (DROPPED)" if row["validity"]["dropped"] else ""))
+        if v.get("production_gate"):
+            lines.append("- production gate: %s" % v["production_gate"])
         for c in v.get("caveats") or []:
             lines.append("- caveat (from finding `%s`): %s" % (v.get("tests_finding"), c))
+        lines.append("- scope: %s" % v.get("scope_note"))
         lines.append("")
     lines += ["## Findings (ranked)", ""]
     for f in d["findings"]:

@@ -32,18 +32,18 @@ On Windows, if a server or `llama-bench` exits immediately with no output, a CUD
 ## Workflow
 
 1. `hotpath gguf MODEL.gguf --bandwidth-gbs N` to see bytes streamed per token and the decode ceiling.
-2. If a server is already running: `hotpath observe --server URL --log LOG` then `hotpath triage results/local/observation-*.json`. Findings are hypotheses with a proposed experiment; they are not results.
-3. `hotpath workload workloads/w.json --words 450 900 1300 --n-predict 64`.
+2. If the user already runs a server, start passive: `hotpath observe --log LOG` (add `--server URL` if it is up) then `hotpath diagnose results/local/observation-*.json`. This alone gives the prefill/decode split of real traffic, the prefix-reuse rate, decode vs the bandwidth ceiling, CPU-fallback sessions and session drift — all `passive`/`historical`. It cannot give client wall time or per-request overhead; the diagnosis names the one measurement that would. Say which findings are observed and which are inferred.
+3. `hotpath workload workloads/w.json --words 450 900 1300 --n-predict 64` for a synthetic workload, or `hotpath workload workloads/real.json --from-requests captured.jsonl` when the user has captured their application's request bodies (the file stays local; never paste its contents into a reply or a record).
 4. Collect direct evidence (active, ask first): `hotpath bench --ub <current> --pp 512 --tg 128` for the runtime alone, and `hotpath measure --server URL --workload workloads/w.json --label baseline` against a server the user owns (listed in `owned_servers`).
 5. `hotpath diagnose results/local/measurement-baseline-*.json results/local/bench-*.json` (add observation/profile records if present). Report findings with their confidence level (`confirmed`, `likely`, `hypothesis`, `insufficient`), the measurements they cite, and the "cannot establish" list. Do not present a `hypothesis` as a cause.
 6. `hotpath propose results/local/diagnosis-*.json --out experiments/next.json` writes a one-variable spec for the recommended finding (or `--finding ID`) and prints the plan; show the plan to the user. Only edit `common_args` if the user's real launch arguments differ (or set `server_args` in `hotpath.local.json`).
 7. After approval: `hotpath experiment experiments/next.json --wait-s 600`. Use at least 3 rounds for any claim.
-8. `hotpath diagnose results/local/experiment-<name>-*.json` gives the verdict per arm: wall-time ratio with spread overlap, VRAM delta, greedy-output equivalence, and keep / reject / inconclusive. Diverging outputs need explanation before recommending a change. Then diagnose again with the new record to see what remains.
+8. `hotpath diagnose results/local/experiment-<name>-*.json` gives the verdict per arm: paired per-prompt ratios against within-prompt noise, VRAM delta, output identity (token ids or content hash), output validity when a schema was involved, and keep / reject / inconclusive with the workload size stated. Report it as a result for this machine and workload, never as a general property of the runtime. For cache/checkpoint flags, repeat the production gate the verdict prints (it depends on the real traffic's reuse rate from an `observe --log` record). Diverging outputs need explanation before recommending a change; a validity drop is a rejection whatever the speed. Then diagnose again with the new record to see what remains.
 9. For kernel work: `hotpath kernels test --op OP` (correctness vs CPU) before `hotpath kernels perf`, and `hotpath profile --label L --pp 0 --tg 64` for a decode kernel-share profile; `diagnose` ranks a profile's kernel classes.
 
 ## MCP
 
-`hotpath mcp` (or `hotpath-mcp`) serves the same commands over stdio. Active tools are disabled unless the operator set `HOTPATH_MCP_ALLOW_ACTIVE=1`, and each active call needs `confirm=true`. See `docs/agents.md` in the repository.
+`hotpath mcp` (or `hotpath-mcp`) serves the same commands over stdio. Active tools are disabled unless the operator set `HOTPATH_MCP_ALLOW_ACTIVE=1`, and each active call needs `confirm=true`; passing `confirm=true` without the operator flag is refused by the server, and no read-only tool can launch a server or benchmark. Validated with Claude Code (`claude -p --mcp-config`); see `docs/agents.md` for the exact status per client.
 
 ## Limits
 
