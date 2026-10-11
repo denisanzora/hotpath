@@ -93,6 +93,9 @@ def cmd_propose(args):
     except ValueError as e:
         raise SystemExit("error: %s" % e)
     print("wrote %s (baseline arguments from: %s)" % (args.out, source))
+    if spec["provenance"].get("removed_server_args"):
+        print("left out of the copied server arguments (the runner supplies its own, so the experiment cannot reuse your server's port, log, "
+              "slot directory or model flags): %s" % ", ".join(spec["provenance"]["removed_server_args"]))
     print("")
     if cfg.get("_missing"):
         print("hotpath.local.json not found: the spec references ${runtime_binary} and ${model_path}; create the config before running it.")

@@ -15,7 +15,7 @@
 ### Changed
 - Experiment verdicts are paired per prompt against within-prompt noise, state the workload size (marked preliminary below 3 prompts × 3 rounds), keep speed, output identity and validity separate, and describe the measured machine and workload only.
 - Experiments trading prefix reuse for per-request overhead (`--cache-ram`, `--ctx-checkpoints`) carry a production gate based on the real traffic's reuse rate.
-- MCP-launched experiments check the spec's contents: `binary`/`model`/`path_prepend` must be `${key}` references, environment overrides are limited to `GGML_`/`LLAMA_`/`CUDA_`, and server arguments that change the host or model are refused. `hotpath_observe` only contacts loopback servers; `*.local.json` files cannot be written by MCP tools.
+- MCP-launched experiments check the spec's contents: `binary`/`model`/`path_prepend` must be `${key}` references, environment overrides are limited to `GGML_`/`LLAMA_`/`CUDA_`, and server arguments that write files, change the network binding, download a model or change which model loads are refused. `hotpath propose` leaves such arguments (`--port`, `--log-file`, `--slot-save-path`, `--model`, ...) out of the baseline it copies from your config, so an experiment server cannot take over your server's port or log. `hotpath_observe` only contacts loopback servers; `*.local.json` files cannot be written by MCP tools.
 - `hotpath tools` reports whether the optional validator is installed.
 
 ### Fixed

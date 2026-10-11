@@ -196,8 +196,16 @@ def _list(a):
 # references, environment overrides are limited to the variables that tune the runtime, and server arguments that move the
 # server off loopback, fetch a model from the network, or choose another model are refused.
 _SPEC_ENV_PREFIXES = ("GGML_", "LLAMA_", "CUDA_")
-_SPEC_FORBIDDEN_FLAGS = {"--host", "--hf-repo", "-hf", "--hf-file", "-hff", "--model-url", "-mu", "--model", "-m", "--api-key", "--api-key-file",
-                         "--ssl-key-file", "--ssl-cert-file", "--webui-config-file", "--path", "--media-path"}
+# llama-server arguments an agent-authored spec may not carry: they write files (a log file is truncated on open), bind
+# or authenticate on the network, fetch from the network, or change which model or adapter files load. The runner always
+# supplies --model, --host 127.0.0.1 and --port itself, and the spec's own `slot_save_path` field covers that use and is
+# confined separately. `hotpath propose` strips the same flags from the baseline it copies from the user's config.
+from hotpath.propose import RUNNER_OWNED_FLAGS as _SPEC_FORBIDDEN_FLAGS  # noqa: E402
+
+
+def _flag_of(token):
+    """`--flag=value` and `--flag` name the same argument."""
+    return str(token).split("=", 1)[0]
 
 
 def _is_ref(v):
@@ -223,14 +231,14 @@ def check_spec_for_agent(path):
                 if not str(k).startswith(_SPEC_ENV_PREFIXES):
                     problems.append("%s: environment variable %s is not a GGML_/LLAMA_/CUDA_ runtime setting" % (where, k))
         for k in (d.get("args_override") or {}):
-            if k in _SPEC_FORBIDDEN_FLAGS:
+            if _flag_of(k) in _SPEC_FORBIDDEN_FLAGS:
                 problems.append("%s: server argument %s is not allowed in agent-run specs" % (where, k))
     fields("spec", spec)
     for a in spec["arms"]:
         fields("arm %s" % a.get("name"), a)
     for tok in spec.get("common_args") or []:
-        if tok in _SPEC_FORBIDDEN_FLAGS:
-            problems.append("common_args: server argument %s is not allowed in agent-run specs" % tok)
+        if _flag_of(tok) in _SPEC_FORBIDDEN_FLAGS:
+            problems.append("common_args: server argument %s is not allowed in agent-run specs" % _flag_of(tok))
     ssp = spec.get("slot_save_path", False)
     if isinstance(ssp, str) and ssp != "auto":
         _inside_cwd(ssp, "slot_save_path")

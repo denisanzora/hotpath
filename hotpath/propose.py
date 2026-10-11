@@ -36,6 +36,36 @@ def baseline_args(diagnosis_record, cfg, override=None):
     return list(DEFAULT_COMMON_ARGS), "hotpath defaults (adapt --ctx-size and --gpu-layers to your model)"
 
 
+# llama-server arguments the experiment runner owns or that must never be shared with the user's own server: it adds
+# --model, --host 127.0.0.1 and --port itself (a copied --port could take over the user's production port), and an
+# inherited log file, slot directory or credential would make an experiment server write to or authenticate like the
+# production one. The MCP server refuses the same flags in agent-authored specs.
+RUNNER_OWNED_FLAGS = frozenset({
+    "--host", "--port", "--model", "-m", "--api-key", "--api-key-file", "--ssl-key-file", "--ssl-cert-file", "--path", "--media-path", "--webui-config-file",
+    "--log-file", "--slot-save-path", "--prompt-cache", "--prompt-cache-all", "--prompt-cache-ro",
+    "--hf-repo", "-hf", "-hfr", "--hf-file", "-hff", "--hf-repo-draft", "-hfd", "--hf-token", "-hft", "--model-url", "-mu", "--docker-repo", "-dr",
+    "--model-draft", "-md", "--lora", "--lora-scaled", "--lora-init-without-apply", "--control-vector", "--control-vector-scaled",
+    "--mmproj", "-mm", "--mmproj-url", "-mmu",
+})
+
+
+def strip_runner_owned(args):
+    """Drop runner-owned flags (and their values) from copied server arguments. Returns (kept_args, removed_flag_names);
+    only flag names are reported, since their values are often private paths."""
+    args = [str(a) for a in args]
+    kept, removed, i = [], [], 0
+    while i < len(args):
+        flag = args[i].split("=", 1)[0]
+        if flag in RUNNER_OWNED_FLAGS:
+            removed.append(flag)
+            has_value = "=" not in args[i] and i + 1 < len(args) and not args[i + 1].startswith("-")
+            i += 2 if has_value else 1
+            continue
+        kept.append(args[i])
+        i += 1
+    return kept, removed
+
+
 def _is_requests_workload(path):
     try:
         with open(path, "r", encoding="utf-8") as f:
@@ -117,8 +147,11 @@ def propose(diagnosis_path, finding_id, cfg, workload, out_path, common_args=Non
     if finding_id not in findings:
         raise ValueError("no finding %r in the diagnosis; available: %s" % (finding_id, sorted(findings)))
     args, source = baseline_args(d, cfg, common_args)
-    spec = build_spec(findings[finding_id], cfg, _strip_launch_prefix(args), workload, port=port, rounds=rounds, repetitions=repetitions, warmup=warmup, n_predict=n_predict)
+    args, removed = strip_runner_owned(_strip_launch_prefix(args))
+    spec = build_spec(findings[finding_id], cfg, args, workload, port=port, rounds=rounds, repetitions=repetitions, warmup=warmup, n_predict=n_predict)
     spec["provenance"]["common_args_source"] = source
+    if removed:
+        spec["provenance"]["removed_server_args"] = sorted(set(removed))
     spec["provenance"]["diagnosis"] = Path(diagnosis_path).name
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(spec, indent=2) + "\n", encoding="utf-8")

@@ -321,6 +321,49 @@ class _InDir:
         os.chdir(self.old)
 
 
+class RunnerOwnedFlagTests(unittest.TestCase):
+    def test_propose_strips_flags_that_would_share_the_users_server_resources(self):
+        # review: a user's server_args with --port / --log-file would make the experiment server bind the production port
+        # (the runner's own --port is overridden by a later duplicate) and write to the production log
+        args = ["--ctx-size", "8192", "--port", "8080", "--host=0.0.0.0", "--log-file", "prod.log", "--slot-save-path", "D:/slots",
+                "-m", "x.gguf", "--api-key", "k", "--jinja", "--cache-ram", "0", "--no-webui"]
+        kept, removed = pp.strip_runner_owned(args)
+        self.assertEqual(kept, ["--ctx-size", "8192", "--jinja", "--cache-ram", "0", "--no-webui"])
+        self.assertEqual(sorted(removed), ["--api-key", "--host", "--log-file", "--port", "--slot-save-path", "-m"])
+        self.assertEqual(pp.strip_runner_owned(["--ctx-size", "4096", "--port"])[0], ["--ctx-size", "4096"])    # flag with no value at the end
+        self.assertEqual(pp.strip_runner_owned(["--no-webui", "--port", "--jinja"])[0], ["--no-webui", "--jinja"])  # next token is a flag, not a value
+
+    def test_propose_end_to_end_and_provenance_lists_names_not_values(self):
+        with tempfile.TemporaryDirectory() as td:
+            finding = {"id": "f", "title": "t", "experiment": {"kind": "server_overhead_flags", "variable": "v", "metric": "m",
+                       "arms": [{"name": "default"}, {"name": "cache-ram-0", "args_override": {"--cache-ram": 0}}]}}
+            d = os.path.join(td, "diag.json")
+            with open(d, "w", encoding="utf-8") as f:
+                json.dump({"findings": [finding], "recommended_next_experiment": {"finding": "f"}}, f)
+            spec, _ = pp.propose(d, None, {"server_args": ["--ctx-size", "8192", "--port", "8080", "--log-file", "C:/private/prod.log"]}, "w.json",
+                                 os.path.join(td, "s.json"))
+            self.assertEqual(spec["common_args"], ["--ctx-size", "8192"])
+            self.assertEqual(spec["provenance"]["removed_server_args"], ["--log-file", "--port"])
+            self.assertNotIn("private", json.dumps(spec))
+            self.assertNotIn("8080", json.dumps(spec))
+
+    def test_mcp_refuses_these_flags_including_equals_form(self):
+        with tempfile.TemporaryDirectory() as td, _InDir(td):
+            base = {"name": "s", "binary": "${runtime_binary}", "model": "${model_path}", "port": 8099, "arms": [{"name": "a"}, {"name": "b"}], "workload": "w.json"}
+            for common in (["--log-file", "x.log"], ["--host=0.0.0.0"], ["--port", "8080"], ["--slot-save-path", "D:/x"], ["--lora", "a.gguf"]):
+                with open("s.json", "w", encoding="utf-8") as f:
+                    json.dump(dict(base, common_args=common), f)
+                with self.assertRaises(ValueError, msg=str(common)):
+                    mcp.check_spec_for_agent("s.json")
+            with open("s.json", "w", encoding="utf-8") as f:
+                json.dump(dict(base, common_args=["--ctx-size", "4096", "--jinja"], arms=[{"name": "a"}, {"name": "b", "args_override": {"--log-file=x": 1}}]), f)
+            with self.assertRaises(ValueError):
+                mcp.check_spec_for_agent("s.json")
+            with open("s.json", "w", encoding="utf-8") as f:
+                json.dump(dict(base, common_args=["--ctx-size", "4096", "--jinja", "--cache-ram", "0"]), f)
+            mcp.check_spec_for_agent("s.json")                                  # ordinary tuning flags pass
+
+
 class McpSpecGateTests(unittest.TestCase):
     def _spec(self, td, **over):
         spec = {"name": "s", "binary": "${runtime_binary}", "model": "${model_path}", "path_prepend": "${path_prepend}", "port": 8099,

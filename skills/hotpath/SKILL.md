@@ -45,7 +45,7 @@ On Windows, if a server or `llama-bench` exits immediately with no output, a CUD
 
 ## MCP
 
-`hotpath mcp` (or `hotpath-mcp`) serves the same commands over stdio. Active tools are disabled unless the operator set `HOTPATH_MCP_ALLOW_ACTIVE=1`, and each active call needs `confirm=true`; passing `confirm=true` without the operator flag is refused by the server, and no read-only tool can launch a server or benchmark. Spec files are checked before an MCP-launched experiment (programs and models must be `${key}` references, environment overrides limited to `GGML_`/`LLAMA_`/`CUDA_`), and the tools only talk to loopback servers when read-only, write only inside the working directory, and never touch `*.local.json`. Validated with Claude Code and OpenCode on one machine; see `docs/agents.md` for the exact status per client.
+`hotpath mcp` (or `hotpath-mcp`) serves the same commands over stdio. Active tools are disabled unless the operator set `HOTPATH_MCP_ALLOW_ACTIVE=1`, and each active call needs `confirm=true`; passing `confirm=true` without the operator flag is refused by the server, and no read-only tool can launch a server or benchmark. Spec files are checked before an MCP-launched experiment (programs and models must be `${key}` references, environment overrides limited to `GGML_`/`LLAMA_`/`CUDA_`, no file-writing, network or model-changing server arguments), and the tools only talk to loopback servers when read-only, write only inside the working directory, and never touch `*.local.json`. Validated with Claude Code and OpenCode on one machine; see `docs/agents.md` for the exact status per client.
 
 ## Limits
 
