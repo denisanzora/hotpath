@@ -971,7 +971,7 @@ def diagnose(records, bandwidth_gbs=None, cfg=None):
             v["production_gate"] = gate
             for row in v["arms"]:
                 if row["verdict"].startswith("keep"):
-                    row["verdict"] += " — " + gate
+                    row["verdict"] += " - " + gate
         verdicts.append(v)
     # a finding whose experiment has been run in these records is settled by its verdict: do not recommend it again
     tested = {v["tests_finding"]: v for v in verdicts if v.get("tests_finding")}

@@ -10,7 +10,7 @@
 - Explicit cache modes (`cold`, `warm`, `as-is`) with per-request cache state read from the server's `cache_n`. Cold uses `cache_prompt: false` on every request (slot erase alone is not trusted: a host prompt cache can restore an erased prompt). Prefill, overhead and wall-time comparisons use only requests individually verified in the comparison's state, pair prompts across arms, and are marked not comparable otherwise.
 - Output checks at separate levels: valid JSON, required top-level keys, and full JSON Schema (Draft 2020-12) validation with the optional `jsonschema` package (`pip install "hotpath[schema]"`); `schema_validation: full` fails with an install hint instead of downgrading. Unenforced keywords (`format`, non-local `$ref`) are listed.
 - MCP tools `hotpath_diagnose` (read-only) and `hotpath_propose`; `hotpath_workload` accepts `from_requests`. Agent Skill and docs updated; validated with Claude Code and OpenCode.
-- 65 unit tests (`python -m unittest discover -s tests`).
+- 75 unit tests (`python -m unittest discover -s tests`).
 
 ### Changed
 - Experiment verdicts are paired per prompt against within-prompt noise, state the workload size (marked preliminary below 3 prompts × 3 rounds), keep speed, output identity and validity separate, and describe the measured machine and workload only.
@@ -23,6 +23,9 @@
 - A malformed `cache_n` crashed a run mid-way and values such as `-1` or `true` counted as reuse; missing or malformed values are now `unknown`, never cold.
 - Summaries no longer crash on records without `cache_n` or timing fields.
 - Schema-error paths no longer contain output keys.
+- Two records of the same kind written within one second no longer overwrite each other (found when an agent ran two diagnoses back to back).
+- Commands no longer abort with `UnicodeEncodeError` after writing their record when the console code page cannot encode a dash in a report.
+- `pip install` works: the optional-dependencies table in the candidate's `pyproject.toml` had swallowed the classifiers list, which broke every install.
 
 ### Upgrading
 `pip install --upgrade .` (or `pip install --upgrade git+https://github.com/denisanzora/hotpath`). No configuration change is required. Add `".[schema]"` for full schema validation.

@@ -321,6 +321,18 @@ class _InDir:
         os.chdir(self.old)
 
 
+class ConsoleEncodingTests(unittest.TestCase):
+    def test_unencodable_characters_do_not_abort_a_command(self):
+        # found by exercising diagnose under a cp437 console: UnicodeEncodeError on an em dash after the record was written
+        import subprocess
+        import sys
+        env = dict(os.environ, PYTHONIOENCODING="cp437")
+        code = "from hotpath import cli; cli._tolerant_console(); print('a \\u2014 b')"
+        r = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, env=env)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("a ", r.stdout)
+
+
 class RunnerOwnedFlagTests(unittest.TestCase):
     def test_propose_strips_flags_that_would_share_the_users_server_resources(self):
         # review: a user's server_args with --port / --log-file would make the experiment server bind the production port

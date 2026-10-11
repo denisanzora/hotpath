@@ -392,7 +392,18 @@ def build_parser():
     return p
 
 
+def _tolerant_console():
+    """Reports contain characters (dashes, arrows) that legacy Windows code pages cannot encode; printing one must not
+    abort a command after its record was already written. Unencodable characters become '?' on the console only."""
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(errors="replace")
+        except (AttributeError, ValueError):
+            pass
+
+
 def main(argv=None):
+    _tolerant_console()
     args = build_parser().parse_args(argv)
     try:
         return args.fn(args)
