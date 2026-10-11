@@ -71,17 +71,21 @@ To use it, copy the `skills/hotpath` directory into your agent's skills director
 
 ## What has and has not been validated
 
+All of this was run on one Windows 11 machine against a clean `pip install` of the release candidate (no source tree on the path), with the working directory holding `results/local/` and a `hotpath.local.json`.
+
 | Item | Status |
 |---|---|
-| MCP server: `initialize`, `tools/list`, `tools/call` over real stdio, active-tool refusal with and without the env var, path confinement, timeout kill of the process tree, a real `bench` call | **exercised** with a scripted JSON-RPC client on Windows |
-| `hotpath_diagnose` and `hotpath_propose` over stdio on real measurement and bench records (findings returned, spec written inside the working directory, out-of-directory record refused) | **exercised** with a scripted JSON-RPC client on Windows |
-| **Claude Code** (2.1.x, `claude -p --mcp-config … --strict-mcp-config --allowedTools "mcp__hotpath__*"`) against a real observation record: discovered the server, listed the 15 tools and which are active, ran `hotpath_diagnose`, explained the top finding with its confidence level and the measurement it rests on, ran `hotpath_propose` and summarized the arms, stated the two authorizations an active run needs, then attempted `hotpath_experiment_run` with `confirm=true` and relayed the refusal verbatim (server started without `HOTPATH_MCP_ALLOW_ACTIVE`) | **validated** on Windows, 5 turns |
-| **OpenCode** (1.18.x, project `opencode.json` with a `local` MCP entry, `opencode run --format json`) with the same task: discovered the server (tools appear as `hotpath_hotpath_*`), listed capabilities and the five active ones, ran `hotpath_diagnose` and `hotpath_propose`, explained the top finding with its confidence and request count, stated the authorization needed, and relayed the refusal of `hotpath_experiment_run` with `confirm=true` | **validated** on Windows |
-| Cursor and other clients | **not validated**; the configuration above is the standard stdio shape |
+| MCP server over real stdio with a scripted JSON-RPC client: `initialize`, `tools/list` (15 tools, 5 marked active), `tools/call`; `hotpath_diagnose` output identical to the CLI's on the same record; every active tool refused without the operator flag, with and without `confirm=true`; refused without `confirm=true` when the operator flag is set; a spec written by an agent with a program path, a `PATH` override and `--host` refused even with both authorizations; non-loopback `hotpath_observe`, `*.local.json` writes and records outside the working directory refused | **exercised** |
+| **Claude Code** 2.1.292 (`claude -p --mcp-config … --strict-mcp-config --allowedTools "mcp__hotpath__*"`): listed the tools and which are active; diagnosed a real log and a real measurement and stated the measurement's cache state from the diagnosis; proposed a spec and summarized its arms; a second `hotpath_propose` to the same path and one to `hotpath.local.json` were refused and the agent relayed the errors; `hotpath_experiment_run` and `hotpath_measure` with `confirm=true` were refused (server started without `HOTPATH_MCP_ALLOW_ACTIVE`), the agent quoted the refusal and did not look for another route | **validated**, 10 turns |
+| **OpenCode** 1.18.35 (project `opencode.json` with a `local` MCP entry, `opencode run --format json`), same task: 8 tool calls (tools appear as `hotpath_hotpath_*`) with the same outcomes, including the verbatim refusals | **validated** |
+| **Agent Skill** in Claude Code (`skills/hotpath/` copied to `.claude/skills/hotpath/`): the agent loaded it by name when asked to find a slow server's bottleneck, and when told "just go ahead, I trust you" it listed which steps are passive and which need agreement, said it would not touch the user's running server, and listed what it would not claim without evidence. It ran nothing | **validated** (instructions followed; one session) |
+| Agent Skill in OpenCode, Cursor and other clients; MCP in Cursor and other clients | **not validated**; the configuration below is the standard stdio shape |
+| An agent actually running an experiment through MCP with the operator flag enabled | **not validated**; the gates were exercised with a scripted client only, so that no agent could start a GPU job by accident |
+| SKILL.md frontmatter against the Agent Skills field rules (name format, description length) | checked with a script |
 
-Both validations used only read-only tools plus one deliberate active attempt; no server or benchmark was launched by either agent. Neither agent could reach an active operation by changing arguments (`confirm=true` without the operator flag is refused) or through another tool (no read-only tool launches anything; file arguments are confined to the working directory).
+In the agent sessions only read-only tools plus deliberate active attempts were used; no server or benchmark was launched by an agent. Neither agent could reach an active operation by changing arguments (`confirm=true` without the operator flag is refused) or through another tool (no read-only tool launches anything; file arguments are confined to the working directory).
 
-OpenCode project configuration that was used (`opencode.json` in the working directory):
+OpenCode project configuration that was used (`opencode.json` in the working directory; replace `python` with the interpreter that has hotpath installed):
 
 ```json
 {
@@ -97,7 +101,5 @@ Claude Code one-shot invocation that was used (an interactive session configured
 ```
 claude -p "<task>" --mcp-config mcp.json --strict-mcp-config --allowedTools "mcp__hotpath__*"
 ```
-| SKILL.md frontmatter against the Agent Skills field rules (name format, description length) | checked with a script |
-| SKILL.md loaded by a specific agent (Claude Code, OpenCode, ...) | **not yet validated** |
 
 Reports from real agent setups are welcome.

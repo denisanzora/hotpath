@@ -72,9 +72,11 @@ def workload_from_requests(path, name="requests", limit=None):
     llama-server (`/v1/chat/completions` or `/completion` JSON), kept verbatim including sampler, schema/grammar,
     cache and generation options, so an experiment measures the real request shape.
 
-    The workload file holds the bodies (it lives in your local `workloads/`, which hotpath's .gitignore excludes).
-    Records never store bodies or generated text for this kind unless `--store-outputs` is given; they store hashes,
-    token counts and timings. Streaming is forced off because timings come from the final response."""
+    The workload file holds the bodies, prompts included: keep it in your local `workloads/` (excluded by hotpath's
+    .gitignore) and do not publish it. Records never store bodies or generated text for this kind unless the experiment
+    spec sets "store_outputs": true; they store hashes, token counts, timings and validation results. Streaming is
+    forced off because timings come from the final response. Prompt-cache handling is chosen per experiment with the
+    spec's "cache_mode" (cold, warm, as-is), not here."""
     text = Path(path).read_text(encoding="utf-8").strip()
     if text.startswith("["):
         raw = json.loads(text)
@@ -95,12 +97,12 @@ def workload_from_requests(path, name="requests", limit=None):
             break
     if not items:
         raise ValueError("no request bodies found in %s" % path)
-    return {"name": name, "kind": "requests", "source_basename": Path(path).name, "erase_between": "repetition", "items": items,
+    return {"name": name, "kind": "requests", "source_basename": Path(path).name, "items": items,
             "n_predict": None, "temperature": None,
-            "note": "Real request bodies as sent by the application; arms may override fields with request_override. "
-                    "erase_between: 'repetition' (slot cleared before each pass; items warm each other as in the application), 'item', or false. "
+            "note": "Real request bodies as sent by the application, prompts included: keep this file local. Arms may override fields with "
+                    "request_override. Cache handling is the experiment spec's cache_mode (cold by default: cache_prompt=false on every request). "
                     "Output validity is judged against each item's own schema, whatever an arm removes. "
-                    "Records keep hashes, counts and timings only, unless outputs are explicitly stored."}
+                    "Records keep hashes, counts, timings and validation results only, unless the spec sets store_outputs."}
 
 
 def workload_identity(w):

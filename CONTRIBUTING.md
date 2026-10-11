@@ -1,10 +1,10 @@
 # Contributing
 
-Thanks for helping. Hotpath is small on purpose: standard-library Python, no runtime dependencies.
+Thanks for helping. Hotpath is small on purpose: standard-library Python with no required runtime dependencies. The one optional extra is `jsonschema` (`pip install "hotpath[schema]"`) for full JSON Schema validation of outputs; everything must keep working, and say what it did not check, without it.
 
 ## Ground rules
 
-- **Keep it dependency-free** unless there is a strong reason. `dependencies = []` is a feature.
+- **Keep the core dependency-free** unless there is a strong reason. `dependencies = []` is a feature; new capabilities that need a library go behind an optional extra, and an explicit request for that capability must fail with an install hint instead of silently doing less.
 - **Never commit measurements from your machine, model files, logs, profiler captures, prompts, or local paths.** `.gitignore` covers the common cases; check `git status` before you commit. Records written by hotpath reduce paths to basenames, but server logs written next to them are raw.
 - **Do not claim support you have not run.** If you add Linux/macOS/AMD/other-runtime behavior, say in the PR what hardware, OS and runtime version you exercised it on, and update the "Validated" table in the README.
 - **Evidence labels matter.** Every record carries an evidence class (`passive`, `active`, `historical`, `controlled`, `hypothesis`). New features should not blur them, and comparisons must keep refusing to compute ratios between non-comparable records.
@@ -13,7 +13,7 @@ Thanks for helping. Hotpath is small on purpose: standard-library Python, no run
 
 1. Fork, create a branch, make a focused change.
 2. Verify by running the real CLI workflow your change touches against a llama.cpp server you own (see the README quickstart). End-to-end runs are preferred over unit tests here; include the commands you ran and their outcome in the PR description.
-3. Run the unit tests: `python -m unittest discover -s tests`. They cover the diagnosis and proposal logic on synthetic record structures (shapes and arithmetic, never performance claims).
+3. Run the unit tests: `python -m unittest discover -s tests` (with and without `jsonschema` installed). They cover diagnosis, proposal, cache-state and validation logic, MCP gates and packaging metadata on synthetic inputs (shapes and arithmetic, never performance claims). Source-tree tests cannot see a broken `pyproject.toml`: after touching packaging, install into a fresh virtual environment and run `hotpath --version`.
 4. Open a pull request describing what changed and how you verified it.
 
 ## Diagnosis rules
@@ -22,7 +22,7 @@ Rules in `hotpath/diagnose.py` must be relative (shares of a request, ratios bet
 
 ## MCP server and skill
 
-`hotpath/mcp_server.py` must stay a thin layer over the CLI (each tool builds argv and runs `python -m hotpath`). Active tools must stay gated behind `HOTPATH_MCP_ALLOW_ACTIVE=1` and `confirm=true`.
+`hotpath/mcp_server.py` must stay a thin layer over the CLI (each tool builds argv and runs `python -m hotpath`). Active tools must stay gated behind `HOTPATH_MCP_ALLOW_ACTIVE=1` and `confirm=true`, and an experiment an agent can start must pass `check_spec_for_agent` (programs and models only as `${key}` references to the operator's config). Read-only tools must not launch processes, reach non-loopback hosts or overwrite files.
 
 ## Adding a tool adapter
 

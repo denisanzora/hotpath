@@ -707,7 +707,7 @@ def cache_comparability(base_ev, cand_ev):
     b, c = base_ev["state"], cand_ev["state"]
     if b == "cold" and c == "cold":
         return {"comparable": True, "basis": "cold", "detail": "both arms cold: cache_n = 0 on %d/%d and %d/%d requests (isolation: %s)" % (
-            base_ev["cold"], base_ev["requests"], cand_ev["cold"], cand_ev["requests"], base_ev.get("isolation"))}
+            base_ev["cold"], base_ev["requests"], cand_ev["cold"], cand_ev["requests"], base_ev.get("isolation") or "not recorded; state taken from cache_n")}
     if b == "warm" and c == "warm" and base_ev.get("mode") == cand_ev.get("mode") == "warm":
         return {"comparable": True, "basis": "warm", "detail": "both arms warm by design (cache_mode warm, same request sequence): prefill numbers describe reuse behavior, not cold processing"}
     if b == "unknown" and c == "unknown":
@@ -784,7 +784,8 @@ def experiment_verdict(rec):
         full = "%s/%s" % (rec.get("name"), lab)
         oe = rep.get("output_equivalence") or {}
         ident = [e.get(full, {}).get("identical") for e in oe.values() if full in e]
-        basis = next((e.get("basis") for e in oe.values() if full in e), None)
+        # records written before the basis field existed compared token ids, the only method then
+        basis = next((e.get("basis") for e in oe.values() if full in e and e.get("basis")), None) or "token ids"
         row["outputs"] = {"prompts_compared": len(ident), "identical": sum(1 for x in ident if x), "basis": basis,
                           "first_divergence_indices": [e[full].get("first_divergence_index") for e in oe.values() if full in e and not e[full].get("identical")]}
         # validity (application-shaped requests with a schema): judged apart from speed and from output identity, on the

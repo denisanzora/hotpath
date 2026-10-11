@@ -87,7 +87,7 @@ class RunnerTests(unittest.TestCase):
                 "timings": {"prompt_n": 4, "cache_n": 1000, "prompt_ms": 10, "prompt_per_second": 400, "predicted_n": 5, "predicted_ms": 100, "predicted_per_second": 50},
                 "choices": [{"message": {"content": '{"a": 1}'}, "finish_reason": "stop"}], "_wall_ms": 150})
             gpu_mod.gpu_dynamic = lambda: {}
-            w = {"kind": "requests", "erase_between": "repetition", "items": [{"id": "r00", "sha256": "x", "endpoint": "/v1/chat/completions", "body": BODY}]}
+            w = {"kind": "requests", "cache_mode": "cold", "items": [{"id": "r00", "sha256": "x", "endpoint": "/v1/chat/completions", "body": BODY}]}
             out = ms.run_requests_workload("http://x", w, repetitions=2, warmup=0, request_override={"remove": ["response_format"]})
             self.assertEqual(out["slot_erase_error"], "erase failed HTTP 501")
             self.assertEqual(len(out["requests"]), 2)

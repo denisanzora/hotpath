@@ -3,6 +3,9 @@
 hotpath.local.json
 *.local.json
 workloads/
+# captured request bodies and any other JSONL (they contain prompts); specs and records are plain .json
+*.jsonl
+captured*
 *.log
 *.nsys-rep
 *.ncu-rep
