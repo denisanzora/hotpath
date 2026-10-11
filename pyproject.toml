@@ -7,11 +7,6 @@ license = { text = "MIT" }
 requires-python = ">=3.10"
 dependencies = []
 keywords = ["llama.cpp", "inference", "profiling", "benchmark", "cuda", "gguf"]
-
-[project.optional-dependencies]
-# full JSON Schema validation of outputs in request-shape experiments; without it only the schema's required
-# top-level keys are checked and records say so
-schema = ["jsonschema>=4.18"]
 classifiers = [
   "Development Status :: 3 - Alpha",
   "Environment :: Console",
@@ -20,6 +15,11 @@ classifiers = [
   "Programming Language :: Python :: 3",
   "Topic :: Software Development :: Testing",
 ]
+
+[project.optional-dependencies]
+# full JSON Schema validation of outputs in request-shape experiments; without it only the schema's required
+# top-level keys are checked and records say so
+schema = ["jsonschema>=4.18"]
 
 [project.scripts]
 hotpath = "hotpath.cli:main"
