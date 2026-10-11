@@ -902,7 +902,23 @@ def apply_local_config(ev, cfg):
     return ev
 
 
+def cache_conditions(records):
+    """The prompt-cache state under which each measured request set was taken, from the server's own cache_n per request.
+    Reported for every measurement and experiment arm so a reader (or an agent) never has to infer it: a record written
+    before cache_n was kept, or by a server that does not report it, says `unknown`, never cold."""
+    out = []
+    for r in records:
+        if r.get("kind") == "measurement" and r.get("requests"):
+            out.append(dict(arm_cache_evidence({"requests": r["requests"], "cache": r.get("cache")}), source="measurement %s" % (r.get("label") or r.get("name") or "")))
+        elif r.get("kind") == "experiment":
+            for lab, a in (r.get("arms") or {}).items():
+                if a.get("requests"):
+                    out.append(dict(arm_cache_evidence(a), source="experiment %s / %s" % (r.get("name"), lab)))
+    return out
+
+
 def diagnose(records, bandwidth_gbs=None, cfg=None):
+    conditions = cache_conditions(records)
     ev = apply_local_config(collect(records), cfg)
     label, arm = _baseline_arm(ev)
     findings = []
@@ -964,12 +980,22 @@ def diagnose(records, bandwidth_gbs=None, cfg=None):
             f.setdefault("notes", []).append("Tested by experiment %s; see its verdict above." % tested[f["id"]]["experiment"])
     recommended = next((f for f in findings if f["id"] not in tested and f.get("experiment") and isinstance(f["experiment"].get("arms"), list) and f["severity"] in ("high", "medium")), None)
     return {"kind": "diagnosis", "evidence_class": "hypothesis" if not ev["experiments"] else "controlled", "sources": ev["sources"], "diagnosed_arm": label,
+            "cache_conditions": conditions,
             "baseline_args": (arm or {}).get("args"), "findings": findings, "experiment_verdicts": verdicts, "insufficient_evidence": insufficiencies(ev, arm),
             "recommended_next_experiment": {"finding": recommended["id"], **recommended["experiment"]} if recommended else None}
 
 
 def diagnosis_markdown(d):
     lines = ["# Diagnosis", "", "Sources: %s" % ", ".join(d["sources"]), "Diagnosed arm: %s" % d.get("diagnosed_arm"), ""]
+    if d.get("cache_conditions"):
+        lines += ["## Cache conditions of the measured requests", ""]
+        for c in d["cache_conditions"]:
+            if c["state"] == "unknown":
+                what = "unknown: the records carry no usable cache_n (older record, or a server that does not report it); not assumed cold"
+            else:
+                what = "%s (cache_n = 0 on %d/%d requests, > 0 on %d)" % (c["state"], c["cold"], c["requests"], c["warm"])
+            lines.append("- %s: %s%s" % (c["source"], what, "; isolation: %s" % c["isolation"] if c.get("isolation") else ""))
+        lines.append("")
     for v in d.get("experiment_verdicts") or []:
         lines += ["## Experiment verdict: %s  [%s]" % (v["experiment"], v["evidence_class"]), ""]
         if v.get("comparability_issues"):

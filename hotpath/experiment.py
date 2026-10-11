@@ -150,16 +150,8 @@ def run(spec, out_dir, dry_run=False, wait_for_preconditions_s=0):
     if dry_run:
         print(plan(spec))
         return None
-    pre = spec.get("preconditions") or {}
-    t_end = time.time() + wait_for_preconditions_s
-    while True:
-        pc = check_preconditions(pre)
-        if not pc.get("checked") or pc["ok"]:
-            break
-        if time.time() >= t_end:
-            raise SystemExit("preconditions not met: %s" % pc["reasons"])
-        print("waiting for preconditions: %s" % pc["reasons"])
-        time.sleep(60)
+    # Everything that can be decided from the spec alone is validated first, so a spec that can never run fails at once
+    # instead of after waiting (possibly minutes) for an idle GPU.
     workload = load_workload(spec["workload"])
     if workload.get("kind") != "requests":
         if spec.get("n_predict"):
@@ -180,7 +172,17 @@ def run(spec, out_dir, dry_run=False, wait_for_preconditions_s=0):
         from hotpath.measure import CACHE_MODES, require_schema_validation
         if workload.get("cache_mode", "cold") not in CACHE_MODES:
             raise SystemExit("error: cache_mode must be one of %s, got %r" % (", ".join(CACHE_MODES), workload.get("cache_mode")))
-        require_schema_validation(workload.get("schema_validation", "auto"))   # fails before any server is launched
+        require_schema_validation(workload.get("schema_validation", "auto"))   # fails before any wait or launch
+    pre = spec.get("preconditions") or {}
+    t_end = time.time() + wait_for_preconditions_s
+    while True:
+        pc = check_preconditions(pre)
+        if not pc.get("checked") or pc["ok"]:
+            break
+        if time.time() >= t_end:
+            raise SystemExit("preconditions not met: %s" % pc["reasons"])
+        print("waiting for preconditions: %s" % pc["reasons"])
+        time.sleep(60)
     ssp = slot_save_path_for(spec, None, out_dir)
     if ssp:
         Path(ssp).mkdir(parents=True, exist_ok=True)

@@ -58,6 +58,34 @@ class CacheEvidenceTests(unittest.TestCase):
         self.assertEqual(dg.request_cache_state(r), "warm")
 
 
+class RecordNameAndConditionsTests(unittest.TestCase):
+    def test_same_second_records_never_overwrite(self):
+        # found by a real agent: two diagnose calls in one second wrote one file, silently losing the first diagnosis
+        from hotpath.records import write_record
+        with tempfile.TemporaryDirectory() as td:
+            paths = [write_record({"kind": "diagnosis", "n": i}, td, "diagnosis") for i in range(5)]
+            self.assertEqual(len({str(p) for p in paths}), 5)
+            seen = []
+            for p in paths:
+                with open(p, encoding="utf-8") as f:
+                    seen.append(json.load(f)["n"])
+            self.assertEqual(sorted(seen), [0, 1, 2, 3, 4])
+
+    def test_diagnosis_states_cache_conditions_of_measurements(self):
+        # found by a real agent: it could not tell what cache state a measurement's numbers were taken under
+        cold = {"kind": "measurement", "evidence_class": "active", "label": "baseline", "created": "x", "target": {}, "gpu": {}, "workload": {},
+                "settings": {}, "cache": {"mode": "cold", "isolation": "cache_prompt=false on every request"},
+                "requests": [_req("p%d" % (i % 3), 0) for i in range(6)]}
+        old = dict(cold, label="old-format", cache=None, requests=[_req("p%d" % (i % 3)) for i in range(6)])     # no cache_n at all
+        d = dg.diagnose([cold, old])
+        by = {c["source"]: c for c in d["cache_conditions"]}
+        self.assertEqual(by["measurement baseline"]["state"], "cold")
+        self.assertEqual(by["measurement old-format"]["state"], "unknown")
+        md = dg.diagnosis_markdown(d)
+        self.assertIn("measurement baseline: cold (cache_n = 0 on 6/6 requests", md)
+        self.assertIn("not assumed cold", md)
+
+
 class PairedContaminationTests(unittest.TestCase):
     def _arms(self, warm_prompt_in_cand=True):
         base = [_req("p%d" % (i % 10), 0, wall=3000, pms=2000) for i in range(60)]
@@ -208,6 +236,26 @@ class ExplicitValidationTests(unittest.TestCase):
                 self.assertIn("jsonschema", str(cm.exception))
             finally:
                 ms.schema_validator = saved
+
+    def test_spec_errors_surface_before_waiting_for_the_gpu(self):
+        # review: with --wait-s a spec that could never run waited for an idle GPU first and failed afterwards
+        saved_pre, saved_val = ex.check_preconditions, ms.schema_validator
+        calls = []
+        with tempfile.TemporaryDirectory() as td:
+            wl = os.path.join(td, "w.json")
+            with open(wl, "w", encoding="utf-8") as f:
+                json.dump({"name": "t", "kind": "requests", "items": [{"id": "r00", "endpoint": "/completion", "body": {"prompt": "x"}, "sha256": "x"}]}, f)
+            spec = {"name": "t", "binary": "/nonexistent", "model": "m.gguf", "workload": wl, "schema_validation": "full", "arms": [{"name": "a"}, {"name": "b"}],
+                    "rounds": 1, "preconditions": {"max_gpu_util_pct": 10}}
+            try:
+                ex.check_preconditions = lambda pre: (calls.append(1) or {"checked": True, "ok": False, "reasons": ["busy"]})
+                ms.schema_validator = lambda: None
+                with self.assertRaises(SystemExit) as cm:
+                    ex.run(spec, td, wait_for_preconditions_s=600)
+                self.assertIn("jsonschema", str(cm.exception))
+                self.assertEqual(calls, [])                        # the GPU was never even consulted
+            finally:
+                ex.check_preconditions, ms.schema_validator = saved_pre, saved_val
 
     def test_request_override_on_synthetic_workload_is_refused(self):
         # review: the arms would have run identical requests while the record claimed a request-shape comparison

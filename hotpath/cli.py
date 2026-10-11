@@ -383,7 +383,7 @@ def build_parser():
 
     s = sub.add_parser("kernels", help="ACTIVE: test-backend-ops test/perf on a build directory for ops matching a filter")
     s.add_argument("mode", choices=["test", "perf"]); s.add_argument("--build-dir", help="llama.cpp build tree containing test-backend-ops (default: build_dir in the local config)"); s.add_argument("--label")
-    s.add_argument("--op", default="MUL_MAT"); s.add_argument("--params", help="regex on the case parameter string, e.g. PTQ1_0")
+    s.add_argument("--op", default="MUL_MAT"); s.add_argument("--params", help="regex on the case parameter string, e.g. type_a=q4_0")
     s.add_argument("--backend", default="CUDA0")
     s.set_defaults(fn=cmd_kernels)
     return p

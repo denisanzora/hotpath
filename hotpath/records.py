@@ -110,10 +110,19 @@ def write_record(rec, out_dir, stem):
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
     ts = _dt.datetime.now().strftime("%Y%m%d-%H%M%S")
-    path = out / ("%s-%s.json" % (stem, ts))
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(scrub(rec), f, indent=1, ensure_ascii=False)
-    return path
+    data = json.dumps(scrub(rec), indent=1, ensure_ascii=False)
+    # Created exclusively: two records of the same kind written within one second (a diagnosis of two inputs run back
+    # to back by an agent, say) must not overwrite each other. A numeric suffix keeps names unique; the .md companion
+    # takes its name from the returned path.
+    for n in range(0, 1000):
+        path = out / ("%s-%s%s.json" % (stem, ts, "" if n == 0 else "-%d" % (n + 1)))
+        try:
+            with open(path, "x", encoding="utf-8") as f:
+                f.write(data)
+            return path
+        except FileExistsError:
+            continue
+    raise RuntimeError("could not find a free record name for %s-%s" % (stem, ts))
 
 
 def load_record(path):
