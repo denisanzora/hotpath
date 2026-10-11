@@ -89,7 +89,7 @@ def cmd_propose(args):
             print("no workload given; wrote a default synthetic one: %s (3 ChatML prompts of 450/900/1300 words, n_predict 64)" % workload)
     try:
         spec, source = prop_mod.propose(args.diagnosis, args.finding, cfg, workload, args.out, common_args=args.common_args, port=args.port,
-                                        rounds=args.rounds, repetitions=args.repetitions, warmup=args.warmup, n_predict=args.n_predict)
+                                        rounds=args.rounds, repetitions=args.repetitions, warmup=args.warmup, n_predict=args.n_predict, force=args.force)
     except ValueError as e:
         raise SystemExit("error: %s" % e)
     print("wrote %s (baseline arguments from: %s)" % (args.out, source))
@@ -327,6 +327,7 @@ def build_parser():
     s.add_argument("--common-args", nargs="+", help="baseline llama-server arguments (default: server_args in the local config, else the diagnosed experiment's, else hotpath defaults)")
     s.add_argument("--port", type=int, default=8099); s.add_argument("--rounds", type=int, default=3); s.add_argument("--repetitions", type=int, default=2)
     s.add_argument("--warmup", type=int, default=1); s.add_argument("--n-predict", type=int)
+    s.add_argument("--force", action="store_true", help="replace an existing spec file (never a *.local.json)")
     s.set_defaults(fn=cmd_propose)
 
     s = sub.add_parser("gguf", help="model header summary: shapes, types, bytes per decode token")

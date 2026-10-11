@@ -71,7 +71,8 @@ class OverrideAndValidityTests(unittest.TestCase):
                  "valid_json": v, "schema_required_present": s, "schema_valid": f, "validation_level": ms.VALIDATION_LEVEL_FULL}
                 for v, s, f in ((True, True, True), (True, False, False), (False, False, False))]
         s = ms.summarize_requests(reqs)
-        self.assertEqual(s["validity"], {"judged": 3, "valid_json": 2, "schema_required_present": 1, "schema_valid": 1, "validation_level": ms.VALIDATION_LEVEL_FULL})
+        self.assertEqual(s["validity"], {"judged": 3, "valid_json": 2, "schema_required_present": 1, "schema_checked": 3, "schema_valid": 1,
+                                         "validation_level": ms.VALIDATION_LEVEL_FULL, "schema_unchecked_keywords": []})
 
 
 class RunnerTests(unittest.TestCase):

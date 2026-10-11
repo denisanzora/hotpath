@@ -36,6 +36,14 @@ def baseline_args(diagnosis_record, cfg, override=None):
     return list(DEFAULT_COMMON_ARGS), "hotpath defaults (adapt --ctx-size and --gpu-layers to your model)"
 
 
+def _is_requests_workload(path):
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f).get("kind") == "requests"
+    except (OSError, ValueError, AttributeError):
+        return False
+
+
 def _strip_launch_prefix(args):
     """Experiment records store argv as [binary, --model, model, ...]; the spec wants only what follows."""
     args = list(args)
@@ -65,8 +73,9 @@ def build_spec(finding, cfg, common_args, workload, port=8099, rounds=3, repetit
             if a.get(k):
                 arm[k] = a[k]
         arms.append(arm)
-    if kind == "request_shape" and not str(workload).endswith(".json"):
-        raise ValueError("a request_shape experiment needs a `requests` workload (hotpath workload --from-requests FILE)")
+    if kind == "request_shape" and not _is_requests_workload(workload):
+        raise ValueError("a request_shape experiment needs a `requests` workload built from your captured request bodies "
+                         "(hotpath workload OUT --from-requests FILE); %r is not one, and the arms would run identical requests" % str(workload))
     spec = {
         "name": name or "%s-%s" % (kind, finding["id"]),
         "description": "Proposed by hotpath diagnose from finding '%s': %s. One variable (%s) differs between arms; everything else is identical. "
@@ -84,7 +93,20 @@ def build_spec(finding, cfg, common_args, workload, port=8099, rounds=3, repetit
     return spec
 
 
-def propose(diagnosis_path, finding_id, cfg, workload, out_path, common_args=None, port=8099, rounds=3, repetitions=2, warmup=1, n_predict=None):
+def check_output_path(out_path, force=False):
+    """A spec is written to a new .json file: never over an existing file unless forced, and never over a local config."""
+    out = Path(out_path)
+    if out.suffix.lower() != ".json":
+        raise ValueError("the spec path must end in .json (got %s)" % out.name)
+    if out.name.lower().endswith(".local.json"):
+        raise ValueError("refusing to write a spec over %s: *.local.json files are local configuration" % out.name)
+    if out.exists() and not force:
+        raise ValueError("%s already exists; choose another path (or pass --force from the CLI to replace it)" % out.name)
+    return out
+
+
+def propose(diagnosis_path, finding_id, cfg, workload, out_path, common_args=None, port=8099, rounds=3, repetitions=2, warmup=1, n_predict=None, force=False):
+    out = check_output_path(out_path, force)
     d = load_record(diagnosis_path)
     findings = {f["id"]: f for f in d.get("findings", [])}
     if finding_id is None:
@@ -98,7 +120,6 @@ def propose(diagnosis_path, finding_id, cfg, workload, out_path, common_args=Non
     spec = build_spec(findings[finding_id], cfg, _strip_launch_prefix(args), workload, port=port, rounds=rounds, repetitions=repetitions, warmup=warmup, n_predict=n_predict)
     spec["provenance"]["common_args_source"] = source
     spec["provenance"]["diagnosis"] = Path(diagnosis_path).name
-    out = Path(out_path)
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(spec, indent=2) + "\n", encoding="utf-8")
     return spec, source

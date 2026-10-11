@@ -29,12 +29,16 @@ def apply_request_override(body, override):
 
 
 def _schema_of(body):
-    """The JSON schema a request asks the server to enforce, or None."""
-    rf = body.get("response_format") or {}
+    """The JSON schema (a dict) a request asks the server to enforce, or None."""
+    rf = body.get("response_format")
+    rf = rf if isinstance(rf, dict) else {}
     if rf.get("type") == "json_schema":
-        return ((rf.get("json_schema") or {}).get("schema")) or {}
-    if body.get("json_schema"):
-        return body["json_schema"] or {}
+        js = rf.get("json_schema")
+        s = js.get("schema") if isinstance(js, dict) else None
+        return s if isinstance(s, dict) else {}
+    s = body.get("json_schema")
+    if isinstance(s, dict) and s:
+        return s
     return None
 
 
@@ -52,44 +56,121 @@ def schema_validator():
         return None
 
 
+SCHEMA_VALIDATION_MODES = ("auto", "full", "required-keys")
+INSTALL_HINT = 'install the optional validator with: pip install "hotpath[schema]"   (or: pip install jsonschema)'
+
+
+def require_schema_validation(mode):
+    """Honor an explicit schema_validation request before any server is launched or request sent.
+    "full" without the validator is an error with an install hint, never a silent downgrade."""
+    if mode not in SCHEMA_VALIDATION_MODES:
+        raise SystemExit("error: schema_validation must be one of %s, got %r" % (", ".join(SCHEMA_VALIDATION_MODES), mode))
+    if mode == "full" and schema_validator() is None:
+        raise SystemExit("error: schema_validation is \"full\" but the jsonschema package is not installed; " + INSTALL_HINT +
+                         ". Use \"auto\" to fall back to required-key checks (records then say so), or \"required-keys\" to choose that explicitly.")
+
+
 VALIDATION_LEVEL_FULL = "full (jsonschema Draft 2020-12)"
 VALIDATION_LEVEL_SUBSET = "required top-level keys only (install hotpath[schema] for full validation)"
+VALIDATION_LEVEL_CHOSEN_SUBSET = "required top-level keys only (schema_validation: required-keys)"
+
+# Keywords a plain Draft 2020-12 validation does not assert (format is an annotation by default; content* are annotations;
+# a $ref that is not a local fragment would need network or file resolution). A schema using them is validated for
+# everything else and the record lists what was not enforced.
+_UNASSERTED = ("format", "contentEncoding", "contentMediaType", "contentSchema")
 
 
-def _validity(content, schema):
-    """How an output relates to the schema the application asked for.
+def _walk(schema):
+    if isinstance(schema, dict):
+        yield schema
+        for v in schema.values():
+            yield from _walk(v)
+    elif isinstance(schema, list):
+        for v in schema:
+            yield from _walk(v)
+
+
+def _unchecked_keywords(schema):
+    found = set()
+    for node in _walk(schema):
+        for k in _UNASSERTED:
+            if k in node and not (k == "format" and isinstance(node.get("format"), dict)):
+                found.add(k)
+        ref = node.get("$ref")
+        if isinstance(ref, str) and not ref.startswith("#"):
+            found.add("$ref (non-local)")
+    return sorted(found)
+
+
+def _declared_keys(schema):
+    keys = set()
+    for node in _walk(schema):
+        props = node.get("properties")
+        if isinstance(props, dict):
+            keys.update(str(k) for k in props)
+        for k in ("required", "dependentRequired"):
+            v = node.get(k)
+            if isinstance(v, list):
+                keys.update(x for x in v if isinstance(x, str))
+    return keys
+
+
+def _safe_path(error, declared):
+    """JSON path of a schema error with every object key the schema did not declare replaced by `*`: keys of the model's
+    output are output text and must not enter a record. Array indexes and declared property names are kept."""
+    parts = ["$"]
+    for seg in error.absolute_path:
+        parts.append("[%d]" % seg if isinstance(seg, int) else (".%s" % seg if str(seg) in declared else ".*"))
+    return "".join(parts)[:160]
+
+
+def _validity(content, schema, mode="auto"):
+    """How an output relates to the schema the application asked for, at separate levels.
 
     valid_json: parses as JSON. schema_required_present: the schema's required top-level keys are present (always
-    checked; the subset a plain install can do). schema_valid: the output satisfies the whole schema (nested types,
-    enums, arrays, bounds, additionalProperties) when the optional validator is installed; None when it is not.
-    validation_level names what was actually checked. Error entries carry the failing keyword and JSON path only,
-    never output text. None everywhere when the request asked for no schema."""
+    checked). schema_valid: the output satisfies the whole schema (nested types, enums, arrays, bounds,
+    additionalProperties) by jsonschema Draft 2020-12; None when that check was not run (validator absent, or
+    mode "required-keys") or could not run (the validator rejected the schema). validation_level names what was
+    actually checked; schema_unchecked_keywords lists schema keywords present but not enforced. Error entries carry the
+    failing keyword and a path in which undeclared object keys are masked: never output text. None everywhere when
+    the request asked for no schema."""
     if schema is None:
         return {"valid_json": None, "schema_required_present": None, "schema_valid": None, "validation_level": None}
-    required = schema.get("required") or []
+    required = schema.get("required") if isinstance(schema, dict) else None
+    required = required if isinstance(required, list) else []
+    V = schema_validator() if mode != "required-keys" else None
+    subset_level = VALIDATION_LEVEL_CHOSEN_SUBSET if mode == "required-keys" else VALIDATION_LEVEL_SUBSET
     try:
         obj = json.loads(content)
     except (ValueError, TypeError):
-        return {"valid_json": False, "schema_required_present": False, "schema_valid": False if schema_validator() else None,
-                "validation_level": VALIDATION_LEVEL_FULL if schema_validator() else VALIDATION_LEVEL_SUBSET}
+        return {"valid_json": False, "schema_required_present": False, "schema_valid": False if V else None,
+                "validation_level": VALIDATION_LEVEL_FULL if V else subset_level}
     present = isinstance(obj, dict) and all(k in obj for k in required)
-    V = schema_validator()
     if V is None:
-        return {"valid_json": True, "schema_required_present": present, "schema_valid": None, "validation_level": VALIDATION_LEVEL_SUBSET}
+        return {"valid_json": True, "schema_required_present": present, "schema_valid": None, "validation_level": subset_level}
     try:
-        errors = sorted(V(schema).iter_errors(obj), key=lambda e: str(e.json_path))
+        declared = _declared_keys(schema)
+        errors = sorted(V(schema).iter_errors(obj), key=lambda e: _safe_path(e, declared))
+        out = {"valid_json": True, "schema_required_present": present, "schema_valid": not errors, "validation_level": VALIDATION_LEVEL_FULL,
+               "schema_errors": [{"keyword": e.validator, "path": _safe_path(e, declared)} for e in errors[:5]]}
+        unchecked = _unchecked_keywords(schema)
+        if unchecked:
+            out["schema_unchecked_keywords"] = unchecked
+        return out
     except Exception as e:  # noqa: BLE001 - a schema the validator cannot process is reported, not fatal
-        return {"valid_json": True, "schema_required_present": present, "schema_valid": None, "validation_level": "validator error: %s" % type(e).__name__}
-    return {"valid_json": True, "schema_required_present": present, "schema_valid": not errors, "validation_level": VALIDATION_LEVEL_FULL,
-            "schema_errors": [{"keyword": e.validator, "path": e.json_path} for e in errors[:5]]}
+        return {"valid_json": True, "schema_required_present": present, "schema_valid": None, "validation_level": "validator could not run: %s" % type(e).__name__}
 
 
 def cache_state(timings):
-    """What the server itself says about this request's prompt cache: cold when it reused no tokens."""
-    cn = timings.get("cache_n")
-    if cn is None:
+    """What the server itself says about this request's prompt cache: cold when it reused no tokens, warm when it
+    reused some. Anything else (field missing, null, non-numeric, negative, NaN) is "unknown": missing or malformed
+    evidence is never read as zero reuse."""
+    cn = timings.get("cache_n") if isinstance(timings, dict) else None
+    if isinstance(cn, bool) or not isinstance(cn, (int, float)):
         return "unknown"
-    return "cold" if int(cn) == 0 else "warm"
+    if cn != cn or cn < 0 or (isinstance(cn, float) and cn != int(cn)):
+        return "unknown"
+    return "cold" if cn == 0 else "warm"
 
 
 def _content(resp):
@@ -114,17 +195,21 @@ CACHE_MODES = ("cold", "warm", "as-is")
 def run_requests_workload(base, workload, repetitions=3, warmup=1, request_override=None, store_outputs=False, slot_id=0, pid=None, progress=None):
     """Application-shaped requests under an explicit cache mode.
 
-    cold  (default): every pass over the items starts from an empty slot. Isolation is slot erase when the server
-                     supports it; otherwise `cache_prompt: false` is set on every request (same in every arm). Each
-                     request's state is then read back from the server's own `cache_n`, not assumed.
+    cold  (default): `cache_prompt: false` is set on every request in every arm (overriding the application's own
+                     value, which is what makes the state cold), and the slot is erased before each pass when the
+                     server honors slot erase. Erase alone is not trusted: the host prompt cache can restore an
+                     erased prompt. Each request's state is read back from the server's own `cache_n`.
     warm           : no isolation; items follow each other as in the application and repetitions reuse the slot.
                      Reuse is intentional and both arms see the same sequence.
-    as-is          : no intervention and no fallback; states are recorded from `cache_n` and a verdict treats
-                     prefill as unverified.
-    Within a pass the items are sent in order, so item-to-item reuse is the application's in every mode."""
+    as-is          : no intervention; states are recorded from `cache_n` and a verdict compares prefill-side numbers
+                     only if both arms verifiably ended up in the same state.
+    Items are sent in order. In cold mode nothing is reused, not even between consecutive items; in warm and as-is
+    mode item-to-item reuse is whatever the server does."""
     mode = workload.get("cache_mode", "cold")
     if mode not in CACHE_MODES:
         raise ValueError("cache_mode must be one of %s" % (CACHE_MODES,))
+    schema_mode = workload.get("schema_validation", "auto")
+    require_schema_validation(schema_mode)
     out = {"requests": [], "warmup_requests": [], "gpu_snapshots": [], "slot_erase_error": None,
            "cache": {"mode": mode, "isolation": "none", "slot_erase_supported": None}}
     # Cold isolation is cache_prompt=false on every request, in every arm. Slot erase alone is not enough: llama-server's
@@ -160,7 +245,7 @@ def run_requests_workload(base, workload, repetitions=3, warmup=1, request_overr
                    "output_text": content if store_outputs else None, "gpu_before": before, "gpu_after": after}
             # validity is judged against the application's own request (the workload item), not the arm's edited body:
             # an arm that drops the schema is still measured on whether its output satisfies what the application requires
-            rec.update(_validity(content, _schema_of(it["body"])))
+            rec.update(_validity(content, _schema_of(it["body"]), schema_mode))
             rec["validity_schema_from"] = "workload item" if _schema_of(it["body"]) is not None else None
             (out["warmup_requests"] if phase == "warmup" else out["requests"]).append(rec)
             if progress:
@@ -174,9 +259,14 @@ def run_requests_workload(base, workload, repetitions=3, warmup=1, request_overr
     return out
 
 
-def run_workload(base, workload, repetitions=3, warmup=1, erase_between=True, store_prompts=False, store_outputs=True,
+def run_workload(base, workload, repetitions=3, warmup=1, erase_between=True, store_prompts=False, store_outputs=False,
                  slot_id=0, pid=None, progress=None, request_override=None):
-    """Returns a list of per-request records plus per-repetition GPU snapshots."""
+    """Returns a list of per-request records plus per-repetition GPU snapshots.
+
+    Generated text is NOT stored unless store_outputs=True (spec key "store_outputs"): records keep token ids (needed for
+    the equivalence check), an output hash and lengths."""
+    if workload.get("store_outputs"):
+        store_outputs = True
     if workload.get("kind") == "requests":
         return run_requests_workload(base, workload, repetitions=repetitions, warmup=warmup, request_override=request_override,
                                      store_outputs=bool(workload.get("store_outputs", False)), slot_id=slot_id, pid=pid, progress=progress)
@@ -218,8 +308,8 @@ def run_workload(base, workload, repetitions=3, warmup=1, erase_between=True, st
                 "predicted_n": t.get("predicted_n"), "predicted_ms": t.get("predicted_ms"), "predicted_tps": t.get("predicted_per_second"),
                 "wall_ms": resp.get("_wall_ms"),
                 "stop_type": resp.get("stop_type"),
-                "tokens": resp.get("tokens") if store_outputs else None,
-                "output_sha256": hashlib.sha256(content.encode("utf-8")).hexdigest()[:16],
+                "tokens": resp.get("tokens"),
+                "output_sha256": hashlib.sha256(content.encode("utf-8")).hexdigest()[:16], "output_chars": len(content),
                 "output_text": content if store_outputs else None,
                 "gpu_before": before, "gpu_after": after,
             }
@@ -237,27 +327,33 @@ def run_workload(base, workload, repetitions=3, warmup=1, erase_between=True, st
 
 
 def summarize_requests(reqs):
+    g = lambda k: [r.get(k) for r in reqs]
+    cache_vals = [r.get("cache_n") for r in reqs if cache_state({"cache_n": r.get("cache_n")}) != "unknown"]
     s = {
         "n": len(reqs),
-        "prompt_n": percentiles([r["prompt_n"] for r in reqs]),
-        "cache_n_max": max([r["cache_n"] or 0 for r in reqs]) if reqs else None,
-        "cache_n": percentiles([r.get("cache_n") for r in reqs]),
-        "prefill_tps": percentiles([r["prompt_tps"] for r in reqs]),
-        "decode_tps": percentiles([r["predicted_tps"] for r in reqs]),
-        "prompt_ms": percentiles([r["prompt_ms"] for r in reqs]),
-        "predicted_ms": percentiles([r["predicted_ms"] for r in reqs]),
-        "wall_ms": percentiles([r["wall_ms"] for r in reqs]),
-        "predicted_n": percentiles([r["predicted_n"] for r in reqs]),
-        "stop_types": sorted({str(r["stop_type"]) for r in reqs}),
+        "prompt_n": percentiles(g("prompt_n")),
+        "cache_n_max": max(cache_vals) if cache_vals else None,
+        "cache_n": percentiles(cache_vals),
+        "prefill_tps": percentiles(g("prompt_tps")),
+        "decode_tps": percentiles(g("predicted_tps")),
+        "prompt_ms": percentiles(g("prompt_ms")),
+        "predicted_ms": percentiles(g("predicted_ms")),
+        "wall_ms": percentiles(g("wall_ms")),
+        "predicted_n": percentiles(g("predicted_n")),
+        "stop_types": sorted({str(r.get("stop_type")) for r in reqs}),
     }
     judged = [r for r in reqs if r.get("valid_json") is not None]
     if judged:
         full = [r for r in judged if r.get("schema_valid") is not None]
+        levels = sorted({str(r.get("validation_level")) for r in judged})
+        unchecked = sorted({k for r in judged for k in (r.get("schema_unchecked_keywords") or [])})
         s["validity"] = {"judged": len(judged), "valid_json": sum(1 for r in judged if r["valid_json"]),
                          "schema_required_present": sum(1 for r in judged if r.get("schema_required_present")),
+                         "schema_checked": len(full),   # requests that got the full-schema check
                          "schema_valid": sum(1 for r in full if r["schema_valid"]) if full else None,
-                         "validation_level": judged[0].get("validation_level")}
-    states = [r.get("cache_state") for r in reqs if r.get("cache_state")]
+                         "validation_level": levels[0] if len(levels) == 1 else "mixed: " + "; ".join(levels),
+                         "schema_unchecked_keywords": unchecked}
+    states = [cache_state({"cache_n": r.get("cache_n")}) if not r.get("cache_state") else r["cache_state"] for r in reqs]
     if states:
         s["cache_states"] = {k: states.count(k) for k in ("cold", "warm", "unknown") if states.count(k)}
     return s
@@ -276,7 +372,9 @@ def measure(cfg, base, workload, repetitions, warmup, owned, background_seconds=
                      workload=workload_identity(workload),
                      gpu=gpu_mod.gpu_static(),
                      background_before=gpu_mod.sample_background(seconds=background_seconds, interval=1.0),
-                     settings={"repetitions": repetitions, "warmup": warmup, "cache_prompt": False, "erase_slot_between_requests": True,
+                     settings={"repetitions": repetitions, "warmup": warmup,
+                               "cache_mode": workload.get("cache_mode", "cold"),
+                               "cache_prompt": "as sent by the workload items" if workload.get("kind") == "requests" and workload.get("cache_mode") in ("warm", "as-is") else False,
                                "ignore_eos": bool(workload.get("ignore_eos", True)), "greedy": workload.get("temperature", 0.0) == 0.0})
     t0 = time.time()
     res = run_workload(base, workload, repetitions=repetitions, warmup=warmup, pid=pid, store_prompts=store_prompts,

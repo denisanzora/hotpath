@@ -58,6 +58,21 @@ def _inside_cwd(value, what):
     return str(p)
 
 
+def _loopback(url, what="server"):
+    """Read-only tools may only talk to a local server: an agent-supplied URL must not make hotpath issue requests elsewhere."""
+    from urllib.parse import urlparse
+    host = (urlparse(url).hostname or "").lower()
+    if host not in ("127.0.0.1", "localhost", "::1"):
+        raise ValueError("%s must be a loopback URL (127.0.0.1, localhost or ::1), got host %r" % (what, host))
+    return url
+
+
+def _no_local_config_name(value, what):
+    if str(value).lower().replace("\\", "/").rsplit("/", 1)[-1].endswith(".local.json"):
+        raise ValueError("%s must not be a *.local.json file: those hold local configuration" % what)
+    return value
+
+
 def _s(props, required=()):
     return {"type": "object", "properties": props, "required": list(required), "additionalProperties": False}
 
@@ -97,7 +112,7 @@ def _gguf(a):
 def _observe(a):
     argv = ["observe"]
     if a.get("server"):
-        argv += ["--server", a["server"]]
+        argv += ["--server", _loopback(a["server"], "server")]
     if a.get("log"):
         argv += ["--log", a["log"]]  # read-only; may live outside the working directory
     if a.get("sample_seconds") is not None:
@@ -126,7 +141,8 @@ def _diagnose(a):
 @tool("hotpath_propose", "Write an experiment spec for a diagnosis finding (one variable between arms, baseline = the diagnosed configuration) and print its dry-run plan. Launches nothing; the spec is run with hotpath_experiment_run after the user agrees.",
       _s({"diagnosis": _STR, "finding": _STR, "out": _STR, "workload": _STR, "rounds": _INT, "repetitions": _INT, "n_predict": _INT, "port": _INT}, ["diagnosis", "out"]))
 def _propose(a):
-    argv = ["propose", _inside_cwd(a["diagnosis"], "diagnosis"), "--out", _inside_cwd(a["out"], "out")]
+    # --force is deliberately not exposed: an agent can write a new spec file, never replace an existing file
+    argv = ["propose", _inside_cwd(a["diagnosis"], "diagnosis"), "--out", _no_local_config_name(_inside_cwd(a["out"], "out"), "out")]
     if a.get("finding"):
         argv += ["--finding", a["finding"]]
     if a.get("workload"):
@@ -147,7 +163,7 @@ def _compare(a):
       _s({"out_file": _STR, "n_prompts": _INT, "words": {"type": "array", "items": _INT}, "n_predict": _INT, "format": {"type": "string", "enum": ["chatml", "raw"]},
           "from_requests": _STR, "limit": _INT}, ["out_file"]))
 def _workload(a):
-    argv = ["workload", _inside_cwd(a["out_file"], "out_file")]
+    argv = ["workload", _no_local_config_name(_inside_cwd(a["out_file"], "out_file"), "out_file")]
     if a.get("from_requests"):
         argv += ["--from-requests", _inside_cwd(a["from_requests"], "from_requests")]
         if a.get("limit"):
@@ -175,10 +191,62 @@ def _list(a):
     return None  # handled in-process, no child needed
 
 
-@tool("hotpath_experiment_run", "ACTIVE: launch the spec's arms as separate llama-server processes on the spec's port, interleaved, and record results. Uses the GPU for minutes to hours. Requires confirm=true and HOTPATH_MCP_ALLOW_ACTIVE=1.",
+# Spec contents an agent may have written. The spec file is the one input that decides WHAT gets launched, so its fields are
+# checked here (not only its path): programs and models must come from the operator's hotpath.local.json via ${key}
+# references, environment overrides are limited to the variables that tune the runtime, and server arguments that move the
+# server off loopback, fetch a model from the network, or choose another model are refused.
+_SPEC_ENV_PREFIXES = ("GGML_", "LLAMA_", "CUDA_")
+_SPEC_FORBIDDEN_FLAGS = {"--host", "--hf-repo", "-hf", "--hf-file", "-hff", "--model-url", "-mu", "--model", "-m", "--api-key", "--api-key-file",
+                         "--ssl-key-file", "--ssl-cert-file", "--webui-config-file", "--path", "--media-path"}
+
+
+def _is_ref(v):
+    return isinstance(v, str) and len(v) > 3 and v.startswith("${") and v.endswith("}")
+
+
+def check_spec_for_agent(path):
+    """Raise ValueError if the spec would let an agent-authored file launch something other than the operator's configured runtime."""
+    with open(path, "r", encoding="utf-8") as f:
+        spec = json.load(f)
+    if not isinstance(spec, dict) or not isinstance(spec.get("arms"), list):
+        raise ValueError("spec is not an experiment spec (needs an `arms` list)")
+    problems = []
+
+    def fields(where, d):
+        for k in ("binary", "model"):
+            if k in d and not _is_ref(d[k]):
+                problems.append("%s: `%s` must be a ${key} reference into hotpath.local.json, not a path" % (where, k))
+        if "path_prepend" in d and not (_is_ref(d["path_prepend"]) or d["path_prepend"] in ([], None)):
+            problems.append("%s: `path_prepend` must be a ${key} reference" % where)
+        for envkey in ("env", "env_override"):
+            for k in (d.get(envkey) or {}):
+                if not str(k).startswith(_SPEC_ENV_PREFIXES):
+                    problems.append("%s: environment variable %s is not a GGML_/LLAMA_/CUDA_ runtime setting" % (where, k))
+        for k in (d.get("args_override") or {}):
+            if k in _SPEC_FORBIDDEN_FLAGS:
+                problems.append("%s: server argument %s is not allowed in agent-run specs" % (where, k))
+    fields("spec", spec)
+    for a in spec["arms"]:
+        fields("arm %s" % a.get("name"), a)
+    for tok in spec.get("common_args") or []:
+        if tok in _SPEC_FORBIDDEN_FLAGS:
+            problems.append("common_args: server argument %s is not allowed in agent-run specs" % tok)
+    ssp = spec.get("slot_save_path", False)
+    if isinstance(ssp, str) and ssp != "auto":
+        _inside_cwd(ssp, "slot_save_path")
+    if spec.get("workload"):
+        _inside_cwd(spec["workload"], "workload")
+    if problems:
+        raise ValueError("spec refused for an agent-run experiment: " + "; ".join(problems[:6]) +
+                         ". Put machine-specific values in hotpath.local.json and reference them as ${key}; the operator can run this spec from the CLI.")
+
+
+@tool("hotpath_experiment_run", "ACTIVE: launch the spec's arms as separate llama-server processes on the spec's port, interleaved, and record results. Uses the GPU for minutes to hours. Requires confirm=true and HOTPATH_MCP_ALLOW_ACTIVE=1. The spec's contents are checked: binary/model must be ${key} references to the operator's config.",
       _s({"spec": _STR, "wait_s": _INT, "confirm": _CONFIRM, "timeout_s": _TIMEOUT}, ["spec", "confirm"]), active=True)
 def _run(a):
-    argv = ["experiment", _inside_cwd(a["spec"], "spec")]
+    spec = _inside_cwd(a["spec"], "spec")
+    check_spec_for_agent(spec)
+    argv = ["experiment", spec]
     if a.get("wait_s"):
         argv += ["--wait-s", str(a["wait_s"])]
     return argv

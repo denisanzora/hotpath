@@ -90,8 +90,8 @@ def plan(spec):
              "Common args: %s" % " ".join(redact_args(spec.get("common_args", []))), "Env: %s" % (spec.get("env") or {}),
              "Workload: %s, n_predict %s, repetitions %s, warmup %s" % (redact_path(spec["workload"]), spec.get("n_predict"), spec.get("repetitions", 2), spec.get("warmup", 1)),
              "Preconditions: %s" % (spec.get("preconditions") or {}), ""]
-    lines.insert(-1, "Cache mode: %s; slot-save-path for hotpath-owned servers: %s" % (
-        spec.get("cache_mode", "cold (workload default)"), spec.get("slot_save_path") or "off"))
+    lines.insert(-1, "Cache mode: %s; slot-save-path for hotpath-owned servers: %s; schema validation: %s" % (
+        spec.get("cache_mode", "cold (workload default)"), spec.get("slot_save_path") or "off", spec.get("schema_validation", "auto")))
     for a in arms:
         cmd, env, port = arm_launch(spec, a)
         shown = [redact_path(cmd[0]), "--model", redact_path(cmd[2])] + redact_args(cmd[3:])
@@ -171,6 +171,16 @@ def run(spec, out_dir, dry_run=False, wait_for_preconditions_s=0):
             workload["store_outputs"] = True
         if spec.get("cache_mode"):
             workload["cache_mode"] = spec["cache_mode"]
+        if spec.get("schema_validation"):
+            workload["schema_validation"] = spec["schema_validation"]
+    if workload.get("kind") != "requests" and any(a.get("request_override") for a in spec["arms"]):
+        raise SystemExit("error: an arm sets request_override, which only applies to `requests` workloads (hotpath workload --from-requests); "
+                         "with this workload the arms would run identical requests")
+    if workload.get("kind") == "requests":
+        from hotpath.measure import CACHE_MODES, require_schema_validation
+        if workload.get("cache_mode", "cold") not in CACHE_MODES:
+            raise SystemExit("error: cache_mode must be one of %s, got %r" % (", ".join(CACHE_MODES), workload.get("cache_mode")))
+        require_schema_validation(workload.get("schema_validation", "auto"))   # fails before any server is launched
     ssp = slot_save_path_for(spec, None, out_dir)
     if ssp:
         Path(ssp).mkdir(parents=True, exist_ok=True)

@@ -1,6 +1,6 @@
 ---
 name: hotpath
-description: Profile and benchmark local llama.cpp-family GPU inference with the hotpath CLI or MCP server. Use when the user wants to find inference bottlenecks, compare runtime flags/builds/models with controlled experiments, check greedy-output equivalence between configurations, or inspect a llama-server deployment. Not for training, non-llama.cpp runtimes, or non-NVIDIA GPUs.
+description: Diagnose why local llama.cpp-family GPU inference is slow and test fixes with the hotpath CLI or MCP server. Use when the user wants to find inference bottlenecks from a llama-server log or measurements, get ranked findings with confidence levels, generate and run controlled experiments (runtime flags, builds, models, request shape), verify cache state and output validity, or inspect a llama-server deployment. Not for training, non-llama.cpp runtimes, or non-NVIDIA GPUs.
 license: MIT
 compatibility: Requires Python 3.10+ and a llama.cpp-family llama-server; GPU features need NVIDIA drivers (nvidia-smi). Validated on Windows 11 with one NVIDIA GPU only.
 metadata:
@@ -13,16 +13,18 @@ hotpath is a CLI (and optional MCP server) that wraps `llama-server`, `llama-ben
 
 ## Ground rules
 
-1. **Passive first.** `hotpath tools`, `hotpath gguf`, `hotpath observe`, `hotpath triage` and `hotpath experiment --dry-run` do not submit inference or use the GPU for long. Run these before anything active.
-2. **Ask before active commands.** `experiment` (without `--dry-run`), `measure`, `bench`, `profile` and `kernels` launch servers or benchmarks and occupy the GPU for minutes to hours. Tell the user what will run, how long it may take, and that the GPU must be otherwise idle, and get agreement first.
-3. **Never touch the user's day-to-day server.** Experiments launch their own server on the spec's port. `measure` only targets servers listed in `owned_servers`; never pass `--i-own-this-server` unless the user explicitly says the server is theirs to load-test.
-4. **Do not publish results.** Records are local (`results/local/`). Server logs and `.nsys-rep` captures contain raw paths. Do not paste or commit them without the user's say-so.
-5. **Do not overclaim.** Report medians with spread, the evidence class, and any "not directly comparable" notice. A single round is a smoke test, not a speedup.
+1. **Passive first.** `hotpath tools`, `gguf`, `observe`, `triage`, `diagnose`, `propose` and `experiment --dry-run` do not submit inference or launch servers (`propose` writes a spec file and never overwrites an existing one). Run these before anything active.
+2. **Ask before active commands.** `experiment` (without `--dry-run`), `measure`, `bench`, `profile` and `kernels` launch servers or benchmarks and occupy the GPU for minutes to hours. Tell the user what will run, how long it may take, and that the GPU must be otherwise idle, and get agreement first. Never retry a refused active call with different arguments, and never look for another tool to do the same thing: a refusal means the operator has not enabled it.
+3. **Never touch the user's day-to-day server.** Experiments launch their own server on the spec's port. `measure` sends real requests to the server you name and clears its prompt-cache slot, so it only targets servers listed in `owned_servers`; do not use it on a server that is serving live traffic, and never pass `--i-own-this-server` unless the user explicitly says the server is theirs to load-test.
+4. **Do not publish results.** Records are local (`results/local/`). Server logs and `.nsys-rep` captures contain raw paths; workload files built from captured requests contain the user's prompts. Do not paste or commit them without the user's say-so.
+5. **Do not overclaim, and do not invent.** Report medians with spread, the evidence class, the confidence level and any "not comparable" notice. Never present a `hypothesis` as a cause, a single round as a speedup, or a number that is not in a record. If a command fails or a tool is refused, report the error text as it is.
+6. **Specs come from `propose`.** Do not hand-write specs containing paths, program names or environment settings; machine-specific values belong in `hotpath.local.json` and are referenced as `${key}`. MCP-launched experiments refuse specs that do otherwise.
 
 ## Setup
 
 ```
 pip install git+https://github.com/denisanzora/hotpath    # or: pip install . from a clone
+pip install jsonschema    # optional: full JSON Schema validation of request-shape outputs (hotpath[schema])
 hotpath init            # writes hotpath.local.json; fill in model_path, runtime_binary, runtime_bin_dir, build_dir
 hotpath tools           # verify GPU, config and external tools
 ```
@@ -43,8 +45,8 @@ On Windows, if a server or `llama-bench` exits immediately with no output, a CUD
 
 ## MCP
 
-`hotpath mcp` (or `hotpath-mcp`) serves the same commands over stdio. Active tools are disabled unless the operator set `HOTPATH_MCP_ALLOW_ACTIVE=1`, and each active call needs `confirm=true`; passing `confirm=true` without the operator flag is refused by the server, and no read-only tool can launch a server or benchmark. Validated with Claude Code (`claude -p --mcp-config`); see `docs/agents.md` for the exact status per client.
+`hotpath mcp` (or `hotpath-mcp`) serves the same commands over stdio. Active tools are disabled unless the operator set `HOTPATH_MCP_ALLOW_ACTIVE=1`, and each active call needs `confirm=true`; passing `confirm=true` without the operator flag is refused by the server, and no read-only tool can launch a server or benchmark. Spec files are checked before an MCP-launched experiment (programs and models must be `${key}` references, environment overrides limited to `GGML_`/`LLAMA_`/`CUDA_`), and the tools only talk to loopback servers when read-only, write only inside the working directory, and never touch `*.local.json`. Validated with Claude Code and OpenCode on one machine; see `docs/agents.md` for the exact status per client.
 
 ## Limits
 
-llama.cpp-family servers only; NVIDIA only; hotpath does not measure logit divergence or perplexity (use `llama-perplexity`). If asked for something outside this, say so.
+llama.cpp-family servers only; NVIDIA only; hotpath does not measure logit divergence or perplexity (use `llama-perplexity`) and does not check what the user's application decides from an output (identity and schema validity are separate from that). If asked for something outside this, say so.

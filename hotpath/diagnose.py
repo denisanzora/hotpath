@@ -235,8 +235,9 @@ def rule_phase(ev, label, arm):
         title = "Workload is %s (prefill %.0f%%, decode %.0f%% of the server's prompt+generation time; overhead outside them is not in a log)" % (shape, 100 * pf, 100 * dc)
         note = ("Computed from the server log's per-request prompt and generation timings (session %s). A server log has no client wall time, so the per-request overhead "
                 "outside these two phases (HTTP, cache saves, checkpoints) is unknown here; `hotpath measure` against your own server is the single measurement that adds it." % arm.get("session"))
-    meas = {"arm": label, "time_basis": sp["basis"], "requests": sp["n"], "prompt_tokens_median": _med(sp["prompt_n"]), "prompt_tokens_p10_p90": [sp["prompt_n"]["p10"], sp["prompt_n"]["p90"]],
-            "generated_tokens_median": _med(sp["predicted_n"]), "generated_tokens_p10_p90": [sp["predicted_n"]["p10"], sp["predicted_n"]["p90"]],
+    band = lambda p: [p["p10"], p["p90"]] if p else None
+    meas = {"arm": label, "time_basis": sp["basis"], "requests": sp["n"], "prompt_tokens_median": _med(sp["prompt_n"]), "prompt_tokens_p10_p90": band(sp["prompt_n"]),
+            "generated_tokens_median": _med(sp["predicted_n"]), "generated_tokens_p10_p90": band(sp["predicted_n"]),
             "request_ms_median": _med(sp["wall_ms"]), "prefill_share_median": round(pf, 3), "decode_share_median": round(dc, 3),
             "residual_share_median": round(rs, 3) if rs is not None else None,
             "shares_p10_p90": {"prefill": [sp["prefill_share"]["p10"], sp["prefill_share"]["p90"]], "decode": [sp["decode_share"]["p10"], sp["decode_share"]["p90"]]}}
@@ -653,10 +654,36 @@ COLD_FRACTION_VERIFIED = 0.9   # an arm counts as cold when at least this share 
 WARM_FRACTION = 0.5            # and as warm when at least this share reused tokens
 
 
+def request_cache_state(r):
+    """State of one request, always re-derived from the server's own cache_n (a stored label is not trusted): missing,
+    null, non-numeric or negative values are "unknown", never cold."""
+    from hotpath.measure import cache_state
+    return cache_state({"cache_n": r.get("cache_n")})
+
+
+def _verified(reqs, state):
+    """Only the requests whose own state matches the comparison basis; the rest are excluded, not averaged in."""
+    keep = [r for r in reqs if request_cache_state(r) == state]
+    return keep, len(reqs) - len(keep)
+
+
+def prompt_reuse_differs(base_reqs, cand_reqs, tolerance=0.10):
+    """Warm comparisons: arms must reuse about the same number of cached tokens per prompt, or the difference in reuse,
+    not the change under test, drives prefill and wall time. Returns the prompt ids whose median cache_n differs."""
+    def med(reqs):
+        out = {}
+        for r in reqs:
+            if request_cache_state(r) == "warm":
+                out.setdefault(r.get("prompt_id"), []).append(float(r["cache_n"]))
+        return {k: percentiles(v)["median"] for k, v in out.items()}
+    a, b = med(base_reqs), med(cand_reqs)
+    return sorted(p for p in a if p in b and a[p] and abs(b[p] - a[p]) / a[p] > tolerance)
+
+
 def arm_cache_evidence(arm):
     """What the server's own cache_n said about an arm's requests, plus how isolation was attempted."""
     reqs = arm.get("requests") or []
-    states = [r.get("cache_state") or ("cold" if r.get("cache_n") == 0 else ("warm" if r.get("cache_n") else "unknown")) for r in reqs]
+    states = [request_cache_state(r) for r in reqs]
     n = len(states)
     cold = states.count("cold")
     warm = states.count("warm")
@@ -683,6 +710,8 @@ def cache_comparability(base_ev, cand_ev):
             base_ev["cold"], base_ev["requests"], cand_ev["cold"], cand_ev["requests"], base_ev.get("isolation"))}
     if b == "warm" and c == "warm" and base_ev.get("mode") == cand_ev.get("mode") == "warm":
         return {"comparable": True, "basis": "warm", "detail": "both arms warm by design (cache_mode warm, same request sequence): prefill numbers describe reuse behavior, not cold processing"}
+    if b == "unknown" and c == "unknown":
+        return {"comparable": False, "basis": "unknown", "detail": "the server reported no usable cache_n in either arm; cache state unverified (missing evidence is not read as zero reuse)"}
     if b == "unknown" or c == "unknown":
         return {"comparable": False, "basis": "unknown", "detail": "the server reported no cache_n; cache state unverified"}
     if b == c == "warm" and "cold" in (base_ev.get("mode"), cand_ev.get("mode")):
@@ -712,10 +741,37 @@ def experiment_verdict(rec):
         comp = cache_comparability(base_cache, cand_cache)
         row = {"arm": lab, "vs": labels[0], "metrics": {}, "failures": len(cand.get("failures") or []),
                "cache": {"baseline": base_cache, "candidate": cand_cache, "comparability": comp}}
+        base_reqs, cand_reqs = base.get("requests") or [], cand.get("requests") or []
+        # Cache-sensitive metrics are paired on VERIFIED requests only: a request whose own cache_n does not match the
+        # comparison basis is excluded (and counted), and a prompt needs verified requests in BOTH arms to be compared.
+        # Arm-level percentages alone cannot hide a contaminated prompt.
+        sensitive = ("prefill_tps", "residual_ms", "wall_ms")
+        excl = {"baseline": 0, "candidate": 0, "dropped_prompts": []}
+        if comp["comparable"]:
+            vb, eb = _verified(base_reqs, comp["basis"])
+            vc, ec = _verified(cand_reqs, comp["basis"])
+            excl["baseline"], excl["candidate"] = eb, ec
+            before = set(_per_prompt(base_reqs, "wall_ms")) & set(_per_prompt(cand_reqs, "wall_ms"))
+            after = set(_per_prompt(vb, "wall_ms")) & set(_per_prompt(vc, "wall_ms"))
+            excl["dropped_prompts"] = sorted(str(p) for p in before - after)
+            if comp["basis"] == "warm":
+                differs = prompt_reuse_differs(vb, vc)
+                if differs:
+                    comp = {"comparable": False, "basis": "warm reuse differs",
+                            "detail": "both arms warm, but they reused a different number of cached tokens on prompt(s) %s (> 10%% apart): the change in reuse, not the change under test, drives prefill and wall time" % differs[:5]}
+                    row["cache"]["comparability"] = comp
+            if comp["comparable"] and len(after) < 2:
+                comp = {"comparable": False, "basis": "too few verified prompts",
+                        "detail": "after excluding requests whose cache state did not match (%d baseline, %d candidate), only %d prompt(s) have verified requests in both arms" % (eb, ec, len(after))}
+                row["cache"]["comparability"] = comp
+        row["cache"]["excluded"] = excl
         for metric, better in VERDICT_METRICS:
-            m = paired_metric(base.get("requests") or [], cand.get("requests") or [], metric, better)
+            if metric in sensitive and comp["comparable"]:
+                m = paired_metric(vb, vc, metric, better)
+            else:
+                m = paired_metric(base_reqs, cand_reqs, metric, better)
             if m:
-                if not comp["comparable"] and metric in ("prefill_tps", "residual_ms", "wall_ms"):
+                if not comp["comparable"] and metric in sensitive:
                     m["call"] = "not comparable (cache state %s)" % comp["basis"]
                 elif comp["basis"] == "warm" and metric == "prefill_tps":
                     m["call"] += " [warm cache: reuse behavior, not cold prefill]"
@@ -737,10 +793,18 @@ def experiment_verdict(rec):
         bv = _sr(base.get("requests") or []).get("validity") or {}
         cv = _sr(cand.get("requests") or []).get("validity") or {}
         if bv or cv:
-            full = bv.get("schema_valid") is not None and cv.get("schema_valid") is not None
+            # decide on the full-schema check only if EVERY judged request in both arms got it; otherwise on required keys,
+            # and say so. Rates, not counts: an arm with fewer requests (a failed round) is not "less valid".
+            full = bool(bv and cv and bv.get("schema_checked") == bv.get("judged") and cv.get("schema_checked") == cv.get("judged"))
             key = "schema_valid" if full else "schema_required_present"
+            rate = lambda v, k: (v.get(k) or 0) / v["judged"] if v and v.get("judged") else None
+            rb, rc = rate(bv, key), rate(cv, key)
+            jb, jc = rate(bv, "valid_json"), rate(cv, "valid_json")
+            eps = 1e-9
+            dropped = bool((rb is not None and rc is not None and rc < rb - eps) or (jb is not None and jc is not None and jc < jb - eps) or (bv and not cv))
             row["validity"] = {"baseline": bv, "candidate": cv, "level": (bv.get("validation_level") or cv.get("validation_level")), "decided_on": key,
-                               "dropped": bool(bv and cv and (cv.get(key, 0) < bv.get(key, 0) or cv.get("valid_json", 0) < bv.get("valid_json", 0)))}
+                               "downgraded_from_full": (not full) and any((v.get("schema_checked") or 0) > 0 for v in (bv, cv)),
+                               "dropped": dropped}
         w = row["metrics"].get("wall_ms", {})
         n_prompts = w.get("prompts") or 0
         n_rounds = int((rec.get("spec_redacted") or {}).get("rounds") or 1)
@@ -751,8 +815,9 @@ def experiment_verdict(rec):
             verdict = "reject: launch failures in this arm"
         elif row.get("validity", {}).get("dropped"):
             key = row["validity"]["decided_on"]
-            verdict = "reject: output validity dropped on %s (%s -> %s of %s): a decision-level difference, whatever the speed" % (
-                "full schema validation" if key == "schema_valid" else "required-key check", bv.get(key), cv.get(key), cv.get("judged"))
+            verdict = "reject: output validity dropped on %s (%s/%s -> %s/%s): a decision-level difference, whatever the speed" % (
+                "full schema validation" if key == "schema_valid" else "the required-key check (not full schema validation)",
+                bv.get(key), bv.get("judged"), cv.get(key), cv.get("judged"))
         elif not comp["comparable"]:
             verdict = "inconclusive %s: %s; only decode and validity are comparable here" % (scope, comp["detail"])
         elif w.get("call") == "improvement" and all_identical:
@@ -770,6 +835,15 @@ def experiment_verdict(rec):
             verdict = "no measurable difference %s" % scope
         if comp["comparable"] and comp["basis"] == "warm" and verdict.startswith("keep"):
             verdict += " [warm-cache comparison: prefill reflects reuse, not cold processing]"
+        if verdict.startswith("keep") and (excl["baseline"] or excl["candidate"] or excl["dropped_prompts"]):
+            verdict += " [cache-sensitive metrics exclude %d baseline / %d candidate unverified requests%s]" % (
+                excl["baseline"], excl["candidate"], "; prompts dropped: %s" % excl["dropped_prompts"][:5] if excl["dropped_prompts"] else "")
+        if verdict.startswith("keep") and not row.get("validity"):
+            verdict += " [no schema in the requests: output validity was not checked]"
+        if verdict.startswith("keep") and row.get("validity", {}).get("downgraded_from_full"):
+            verdict += " [validity decided on required keys only: not every request got full schema validation]"
+        if verdict.startswith("keep"):
+            verdict += " [output identity and application-level decision agreement are separate checks; neither implies the other]"
         row["verdict"] = verdict
         if base.get("slot_erase_error") or cand.get("slot_erase_error"):
             row["slot_erase_note"] = "slot erase unsupported on this server (%s); isolation used: %s" % (
@@ -910,6 +984,10 @@ def diagnosis_markdown(d):
             cc = row.get("cache") or {}
             if cc:
                 lines.append("  - cache state: %s" % cc["comparability"]["detail"])
+                ex_ = cc.get("excluded") or {}
+                if ex_.get("baseline") or ex_.get("candidate") or ex_.get("dropped_prompts"):
+                    lines.append("  - excluded from cache-sensitive metrics as unverified: %d baseline / %d candidate requests; prompts dropped: %s" % (
+                        ex_.get("baseline", 0), ex_.get("candidate", 0), ex_.get("dropped_prompts") or "none"))
             if row.get("slot_erase_note"):
                 lines.append("  - note: %s" % row["slot_erase_note"])
             if row.get("validity"):
@@ -918,6 +996,11 @@ def diagnosis_markdown(d):
                 lines.append("  - validity: valid JSON %s/%s -> %s/%s; required keys present %s/%s -> %s/%s%s%s" % (
                     b.get("valid_json"), b.get("judged"), c.get("valid_json"), c.get("judged"), b.get("schema_required_present"), b.get("judged"), c.get("schema_required_present"), c.get("judged"),
                     full, " (DROPPED)" if row["validity"]["dropped"] else ""))
+                unchecked = sorted(set(b.get("schema_unchecked_keywords") or []) | set(c.get("schema_unchecked_keywords") or []))
+                if unchecked:
+                    lines.append("  - schema keywords present but not enforced by the validator: %s" % ", ".join(unchecked))
+                if row["validity"].get("downgraded_from_full"):
+                    lines.append("  - note: not every request got full schema validation; the verdict used the required-key check")
         if v.get("production_gate"):
             lines.append("- production gate: %s" % v["production_gate"])
         for c in v.get("caveats") or []:
