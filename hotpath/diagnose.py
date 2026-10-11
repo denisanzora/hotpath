@@ -179,7 +179,7 @@ def _passive_arm_from_log(ev):
         settings = {"n_ubatch": _f(sess.get("n_ubatch")), "n_batch": _f(sess.get("n_batch")), "env_ggml": (ev.get("launch") or {}).get("launcher_env") or {},
                     "settings_source": "server log, session %s" % sid}
         label = "%s/session-%s" % (log.get("source") or "log", sid)
-        return label, {"requests": reqs, "evidence_class": "passive", "settings": settings, "vram": {"gpu_after": [(ev.get("launch") or {}).get("gpu_now") or {}]},
+        return label, {"requests": reqs, "evidence_class": "passive", "settings": settings, "vram": {},
                        "failures": [], "time_basis": "server prompt+generation time from the log; no client wall time", "session": sid}
     return None, None
 
@@ -649,9 +649,54 @@ def paired_metric(base_reqs, cand_reqs, metric, better):
             "baseline_median": percentiles([r["baseline_median"] for r in rows])["median"], "candidate_median": percentiles([r["candidate_median"] for r in rows])["median"]}
 
 
+COLD_FRACTION_VERIFIED = 0.9   # an arm counts as cold when at least this share of its requests reused no tokens
+WARM_FRACTION = 0.5            # and as warm when at least this share reused tokens
+
+
+def arm_cache_evidence(arm):
+    """What the server's own cache_n said about an arm's requests, plus how isolation was attempted."""
+    reqs = arm.get("requests") or []
+    states = [r.get("cache_state") or ("cold" if r.get("cache_n") == 0 else ("warm" if r.get("cache_n") else "unknown")) for r in reqs]
+    n = len(states)
+    cold = states.count("cold")
+    warm = states.count("warm")
+    info = arm.get("cache") or {}
+    if n == 0:
+        state = "unknown"
+    elif cold / n >= COLD_FRACTION_VERIFIED:
+        state = "cold"
+    elif warm / n >= WARM_FRACTION:
+        state = "warm"
+    elif states.count("unknown") == n:
+        state = "unknown"
+    else:
+        state = "mixed"
+    return {"mode": info.get("mode"), "isolation": info.get("isolation"), "slot_erase_supported": info.get("slot_erase_supported"),
+            "requests": n, "cold": cold, "warm": warm, "unknown": states.count("unknown"), "state": state}
+
+
+def cache_comparability(base_ev, cand_ev):
+    """Whether prefill-side numbers of two arms may be compared, and on what footing."""
+    b, c = base_ev["state"], cand_ev["state"]
+    if b == "cold" and c == "cold":
+        return {"comparable": True, "basis": "cold", "detail": "both arms cold: cache_n = 0 on %d/%d and %d/%d requests (isolation: %s)" % (
+            base_ev["cold"], base_ev["requests"], cand_ev["cold"], cand_ev["requests"], base_ev.get("isolation"))}
+    if b == "warm" and c == "warm" and base_ev.get("mode") == cand_ev.get("mode") == "warm":
+        return {"comparable": True, "basis": "warm", "detail": "both arms warm by design (cache_mode warm, same request sequence): prefill numbers describe reuse behavior, not cold processing"}
+    if b == "unknown" or c == "unknown":
+        return {"comparable": False, "basis": "unknown", "detail": "the server reported no cache_n; cache state unverified"}
+    if b == c == "warm" and "cold" in (base_ev.get("mode"), cand_ev.get("mode")):
+        return {"comparable": False, "basis": "not cold", "detail": "cold was requested but requests reused cached prompt tokens (cache_n > 0 on %d/%d and %d/%d; isolation: %s): "
+                "prefill, residual and wall time describe warm behavior that was not intended" % (base_ev["warm"], base_ev["requests"], cand_ev["warm"], cand_ev["requests"], base_ev.get("isolation"))}
+    if b == c == "warm":
+        return {"comparable": False, "basis": "unintended warm", "detail": "both arms reused cached prompt tokens without cache_mode warm (mode %s): warm state was not controlled" % base_ev.get("mode")}
+    return {"comparable": False, "basis": "mismatch", "detail": "cache states differ or are mixed (baseline %s: cold %d/%d; candidate %s: cold %d/%d): prefill, residual and wall time are contaminated by cache state" % (
+        b, base_ev["cold"], base_ev["requests"], c, cand_ev["cold"], cand_ev["requests"])}
+
+
 def experiment_verdict(rec):
     """What a finished experiment showed: paired per-prompt ratios for prefill, decode, the per-request residual and
-    wall time; VRAM delta; greedy-output equivalence; a keep/reject/inconclusive call."""
+    wall time; cache-state comparability; VRAM delta; output equivalence; output validity; a keep/reject/inconclusive call."""
     from hotpath import compare as compare_mod
     rep = rec.get("comparison") or compare_mod.compare([rec])
     arms = rec["arms"]
@@ -659,13 +704,21 @@ def experiment_verdict(rec):
     if len(labels) < 2:
         return None
     base = arms[labels[0]]
+    base_cache = arm_cache_evidence(base)
     rows = []
     for lab in labels[1:]:
         cand = arms[lab]
-        row = {"arm": lab, "vs": labels[0], "metrics": {}, "failures": len(cand.get("failures") or [])}
+        cand_cache = arm_cache_evidence(cand)
+        comp = cache_comparability(base_cache, cand_cache)
+        row = {"arm": lab, "vs": labels[0], "metrics": {}, "failures": len(cand.get("failures") or []),
+               "cache": {"baseline": base_cache, "candidate": cand_cache, "comparability": comp}}
         for metric, better in VERDICT_METRICS:
             m = paired_metric(base.get("requests") or [], cand.get("requests") or [], metric, better)
             if m:
+                if not comp["comparable"] and metric in ("prefill_tps", "residual_ms", "wall_ms"):
+                    m["call"] = "not comparable (cache state %s)" % comp["basis"]
+                elif comp["basis"] == "warm" and metric == "prefill_tps":
+                    m["call"] += " [warm cache: reuse behavior, not cold prefill]"
                 row["metrics"][metric] = m
         bd = [x.get("process_counters_after", {}).get("dedicated_mib") for x in base.get("launch_facts") or []]
         cd = [x.get("process_counters_after", {}).get("dedicated_mib") for x in cand.get("launch_facts") or []]
@@ -678,14 +731,16 @@ def experiment_verdict(rec):
         basis = next((e.get("basis") for e in oe.values() if full in e), None)
         row["outputs"] = {"prompts_compared": len(ident), "identical": sum(1 for x in ident if x), "basis": basis,
                           "first_divergence_indices": [e[full].get("first_divergence_index") for e in oe.values() if full in e and not e[full].get("identical")]}
-        # validity (application-shaped requests with a schema): a decision-level property, judged apart from speed and from token identity
-        bv, cv = (base.get("summary") or {}).get("validity"), (cand.get("summary") or {}).get("validity")
+        # validity (application-shaped requests with a schema): judged apart from speed and from output identity, on the
+        # strongest level that was actually checked (full schema when the validator is installed, else required keys)
+        from hotpath.measure import summarize_requests as _sr
+        bv = _sr(base.get("requests") or []).get("validity") or {}
+        cv = _sr(cand.get("requests") or []).get("validity") or {}
         if bv or cv:
-            from hotpath.measure import summarize_requests as _sr
-            bv = bv or _sr(base.get("requests") or []).get("validity") or {}
-            cv = cv or _sr(cand.get("requests") or []).get("validity") or {}
-            row["validity"] = {"baseline": bv, "candidate": cv,
-                               "dropped": bool(bv and cv and (cv.get("schema_required_present", 0) < bv.get("schema_required_present", 0) or cv.get("valid_json", 0) < bv.get("valid_json", 0)))}
+            full = bv.get("schema_valid") is not None and cv.get("schema_valid") is not None
+            key = "schema_valid" if full else "schema_required_present"
+            row["validity"] = {"baseline": bv, "candidate": cv, "level": (bv.get("validation_level") or cv.get("validation_level")), "decided_on": key,
+                               "dropped": bool(bv and cv and (cv.get(key, 0) < bv.get(key, 0) or cv.get("valid_json", 0) < bv.get("valid_json", 0)))}
         w = row["metrics"].get("wall_ms", {})
         n_prompts = w.get("prompts") or 0
         n_rounds = int((rec.get("spec_redacted") or {}).get("rounds") or 1)
@@ -695,8 +750,11 @@ def experiment_verdict(rec):
         if row["failures"]:
             verdict = "reject: launch failures in this arm"
         elif row.get("validity", {}).get("dropped"):
-            verdict = "reject: output validity dropped (%s -> %s schema-conformant of %s): a decision-level difference, whatever the speed" % (
-                bv.get("schema_required_present"), cv.get("schema_required_present"), cv.get("judged"))
+            key = row["validity"]["decided_on"]
+            verdict = "reject: output validity dropped on %s (%s -> %s of %s): a decision-level difference, whatever the speed" % (
+                "full schema validation" if key == "schema_valid" else "required-key check", bv.get(key), cv.get(key), cv.get("judged"))
+        elif not comp["comparable"]:
+            verdict = "inconclusive %s: %s; only decode and validity are comparable here" % (scope, comp["detail"])
         elif w.get("call") == "improvement" and all_identical:
             verdict = "keep %s: %.1f%% wall improvement, same direction on %d/%d prompts, identical outputs (%s)" % (scope, 100 * (1 - w["ratio"]), w["consistent_direction"], w["prompts"], basis)
         elif w.get("call") == "improvement":
@@ -710,10 +768,12 @@ def experiment_verdict(rec):
             verdict = "inconclusive %s: a small improvement within the within-prompt noise; more rounds would decide" % scope
         else:
             verdict = "no measurable difference %s" % scope
+        if comp["comparable"] and comp["basis"] == "warm" and verdict.startswith("keep"):
+            verdict += " [warm-cache comparison: prefill reflects reuse, not cold processing]"
         row["verdict"] = verdict
         if base.get("slot_erase_error") or cand.get("slot_erase_error"):
-            row["warm_cache_note"] = ("the server does not implement slot erase (%s): repetitions after the first ran with a warm prompt cache, so prefill and cache_n describe "
-                                      "warm-cache behavior; decode and validity are unaffected" % (base.get("slot_erase_error") or cand.get("slot_erase_error")))
+            row["slot_erase_note"] = "slot erase unsupported on this server (%s); isolation used: %s" % (
+                base.get("slot_erase_error") or cand.get("slot_erase_error"), base_cache.get("isolation") or cand_cache.get("isolation"))
         rows.append(row)
     return {"experiment": rec.get("name"), "evidence_class": rep.get("evidence_class"), "comparability_issues": rep.get("comparability_issues"), "arms": rows,
             "scope_note": "A verdict describes this workload on this machine; it is not a property of the runtime in general."}
@@ -847,13 +907,17 @@ def diagnosis_markdown(d):
                     m, x["call"], x["ratio"], x["baseline_median"], x["candidate_median"], x["consistent_direction"], x["prompts"], 100 * x["baseline_within_prompt_spread_median"]))
             lines.append("  - outputs identical %d/%d by %s%s; VRAM delta %s MiB; failures %d" % (row["outputs"]["identical"], row["outputs"]["prompts_compared"], row["outputs"].get("basis"),
                          "" if not row["outputs"]["first_divergence_indices"] or row["outputs"]["first_divergence_indices"] == [-1] * len(row["outputs"]["first_divergence_indices"]) else " (first divergence at %s)" % row["outputs"]["first_divergence_indices"], row.get("vram_delta_mib"), row["failures"]))
-            if row.get("warm_cache_note"):
-                lines.append("  - note: %s" % row["warm_cache_note"])
+            cc = row.get("cache") or {}
+            if cc:
+                lines.append("  - cache state: %s" % cc["comparability"]["detail"])
+            if row.get("slot_erase_note"):
+                lines.append("  - note: %s" % row["slot_erase_note"])
             if row.get("validity"):
                 b, c = row["validity"]["baseline"], row["validity"]["candidate"]
-                lines.append("  - validity: valid JSON %s/%s -> %s/%s; schema keys present %s/%s -> %s/%s%s" % (
+                full = "; full schema valid %s/%s -> %s/%s" % (b.get("schema_valid"), b.get("judged"), c.get("schema_valid"), c.get("judged")) if b.get("schema_valid") is not None else "; full schema validation not run (%s)" % row["validity"].get("level")
+                lines.append("  - validity: valid JSON %s/%s -> %s/%s; required keys present %s/%s -> %s/%s%s%s" % (
                     b.get("valid_json"), b.get("judged"), c.get("valid_json"), c.get("judged"), b.get("schema_required_present"), b.get("judged"), c.get("schema_required_present"), c.get("judged"),
-                    " (DROPPED)" if row["validity"]["dropped"] else ""))
+                    full, " (DROPPED)" if row["validity"]["dropped"] else ""))
         if v.get("production_gate"):
             lines.append("- production gate: %s" % v["production_gate"])
         for c in v.get("caveats") or []:

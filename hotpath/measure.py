@@ -28,25 +28,68 @@ def apply_request_override(body, override):
     return b
 
 
-def _schema_required(body):
+def _schema_of(body):
+    """The JSON schema a request asks the server to enforce, or None."""
     rf = body.get("response_format") or {}
     if rf.get("type") == "json_schema":
-        return ((rf.get("json_schema") or {}).get("schema") or {}).get("required") or []
+        return ((rf.get("json_schema") or {}).get("schema")) or {}
     if body.get("json_schema"):
-        return (body["json_schema"] or {}).get("required") or []
+        return body["json_schema"] or {}
     return None
 
 
-def _validity(content, required):
-    """JSON validity and presence of the schema's required top-level keys; None when the request asked for no schema."""
-    if required is None:
-        return {"valid_json": None, "schema_required_present": None}
+def _schema_required(body):
+    s = _schema_of(body)
+    return None if s is None else (s.get("required") or [])
+
+
+def schema_validator():
+    """The optional full validator (jsonschema, Draft 2020-12). None when not installed: `pip install "hotpath[schema]"`."""
+    try:
+        from jsonschema import Draft202012Validator
+        return Draft202012Validator
+    except ImportError:
+        return None
+
+
+VALIDATION_LEVEL_FULL = "full (jsonschema Draft 2020-12)"
+VALIDATION_LEVEL_SUBSET = "required top-level keys only (install hotpath[schema] for full validation)"
+
+
+def _validity(content, schema):
+    """How an output relates to the schema the application asked for.
+
+    valid_json: parses as JSON. schema_required_present: the schema's required top-level keys are present (always
+    checked; the subset a plain install can do). schema_valid: the output satisfies the whole schema (nested types,
+    enums, arrays, bounds, additionalProperties) when the optional validator is installed; None when it is not.
+    validation_level names what was actually checked. Error entries carry the failing keyword and JSON path only,
+    never output text. None everywhere when the request asked for no schema."""
+    if schema is None:
+        return {"valid_json": None, "schema_required_present": None, "schema_valid": None, "validation_level": None}
+    required = schema.get("required") or []
     try:
         obj = json.loads(content)
     except (ValueError, TypeError):
-        return {"valid_json": False, "schema_required_present": False}
-    ok = isinstance(obj, dict) and all(k in obj for k in required)
-    return {"valid_json": True, "schema_required_present": ok}
+        return {"valid_json": False, "schema_required_present": False, "schema_valid": False if schema_validator() else None,
+                "validation_level": VALIDATION_LEVEL_FULL if schema_validator() else VALIDATION_LEVEL_SUBSET}
+    present = isinstance(obj, dict) and all(k in obj for k in required)
+    V = schema_validator()
+    if V is None:
+        return {"valid_json": True, "schema_required_present": present, "schema_valid": None, "validation_level": VALIDATION_LEVEL_SUBSET}
+    try:
+        errors = sorted(V(schema).iter_errors(obj), key=lambda e: str(e.json_path))
+    except Exception as e:  # noqa: BLE001 - a schema the validator cannot process is reported, not fatal
+        return {"valid_json": True, "schema_required_present": present, "schema_valid": None, "validation_level": "validator error: %s" % type(e).__name__}
+    return {"valid_json": True, "schema_required_present": present, "schema_valid": not errors, "validation_level": VALIDATION_LEVEL_FULL,
+            "schema_errors": [{"keyword": e.validator, "path": e.json_path} for e in errors[:5]]}
+
+
+def cache_state(timings):
+    """What the server itself says about this request's prompt cache: cold when it reused no tokens."""
+    cn = timings.get("cache_n")
+    if cn is None:
+        return "unknown"
+    return "cold" if int(cn) == 0 else "warm"
 
 
 def _content(resp):
@@ -56,50 +99,74 @@ def _content(resp):
     return resp.get("content", ""), resp.get("stop_type")
 
 
-def run_requests_workload(base, workload, repetitions=3, warmup=1, request_override=None, store_outputs=False, slot_id=0, pid=None, progress=None):
-    """Application-shaped requests: each item is sent as-is (plus the arm's override), in order, without erasing the
-    slot between items unless the workload says so, so prompt-cache behavior is the application's."""
-    out = {"requests": [], "warmup_requests": [], "gpu_snapshots": [], "slot_erase_error": None}
-    # "repetition" (default): the slot is cleared before each pass over the items, so every pass starts cold and the
-    # items warm each other as the application's sequence would; "item": cleared before every request; false: never.
-    # Some servers do not implement slot erase (HTTP 501): then repetitions after the first run warm, the record says so,
-    # and prefill figures must be read as warm-cache numbers.
-    erase = workload.get("erase_between", "repetition")
+def probe_slot_erase(base, slot_id=0):
+    """Does this server honor slot erase? llama-server needs --slot-save-path for slot actions; without it the call
+    returns HTTP 501. Probing before any request costs nothing and decides how cold state can be obtained."""
+    r = srv.erase_slot(base, slot_id)
+    if isinstance(r, dict) and r.get("error"):
+        return False, r["error"]
+    return True, None
 
-    def _erase():
-        r = srv.erase_slot(base, slot_id)
-        if isinstance(r, dict) and r.get("error") and not out["slot_erase_error"]:
-            out["slot_erase_error"] = r["error"]
-            if progress:
-                progress("warning: slot erase unavailable (%s); prompt cache stays warm between repetitions" % r["error"])
+
+CACHE_MODES = ("cold", "warm", "as-is")
+
+
+def run_requests_workload(base, workload, repetitions=3, warmup=1, request_override=None, store_outputs=False, slot_id=0, pid=None, progress=None):
+    """Application-shaped requests under an explicit cache mode.
+
+    cold  (default): every pass over the items starts from an empty slot. Isolation is slot erase when the server
+                     supports it; otherwise `cache_prompt: false` is set on every request (same in every arm). Each
+                     request's state is then read back from the server's own `cache_n`, not assumed.
+    warm           : no isolation; items follow each other as in the application and repetitions reuse the slot.
+                     Reuse is intentional and both arms see the same sequence.
+    as-is          : no intervention and no fallback; states are recorded from `cache_n` and a verdict treats
+                     prefill as unverified.
+    Within a pass the items are sent in order, so item-to-item reuse is the application's in every mode."""
+    mode = workload.get("cache_mode", "cold")
+    if mode not in CACHE_MODES:
+        raise ValueError("cache_mode must be one of %s" % (CACHE_MODES,))
+    out = {"requests": [], "warmup_requests": [], "gpu_snapshots": [], "slot_erase_error": None,
+           "cache": {"mode": mode, "isolation": "none", "slot_erase_supported": None}}
+    # Cold isolation is cache_prompt=false on every request, in every arm. Slot erase alone is not enough: llama-server's
+    # host prompt cache (--cache-ram) can restore an erased prompt on the next request (observed: slot erase honored,
+    # yet every request reused its prompt). Erase is still issued when the server honors it, and the state of every
+    # request is verified from the server's cache_n either way.
+    force_cold_requests = mode == "cold"
+    if mode == "cold":
+        ok, err = probe_slot_erase(base, slot_id)
+        out["cache"]["slot_erase_supported"] = ok
+        out["cache"]["isolation"] = "cache_prompt=false on every request" + (" + slot erase before each pass" if ok else " (slot erase unsupported: %s)" % err)
+        if not ok:
+            out["slot_erase_error"] = err
     seq = [("warmup", r) for r in range(warmup)] + [("rep", r) for r in range(repetitions)]
     for phase, rep in seq:
-        if erase == "repetition":
-            _erase()
+        if mode == "cold" and out["cache"]["slot_erase_supported"]:
+            srv.erase_slot(base, slot_id)
         for it in workload["items"]:
-            if erase == "item" or erase is True:
-                _erase()
             body = apply_request_override(it["body"], request_override)
+            if force_cold_requests:
+                body["cache_prompt"] = False
             before = gpu_mod.gpu_dynamic()
             resp = srv.request(base, it["endpoint"], body)
             after = gpu_mod.gpu_dynamic()
             t = resp.get("timings", {})
             content, stop = _content(resp)
             rec = {"phase": phase, "rep": rep, "prompt_id": it["id"], "prompt_sha256": it["sha256"], "endpoint": it["endpoint"],
-                   "prompt_n": t.get("prompt_n"), "cache_n": t.get("cache_n"),
+                   "prompt_n": t.get("prompt_n"), "cache_n": t.get("cache_n"), "cache_state": cache_state(t),
                    "prompt_ms": t.get("prompt_ms"), "prompt_tps": t.get("prompt_per_second"),
                    "predicted_n": t.get("predicted_n"), "predicted_ms": t.get("predicted_ms"), "predicted_tps": t.get("predicted_per_second"),
                    "wall_ms": resp.get("_wall_ms"), "stop_type": stop, "tokens": None,
                    "output_sha256": hashlib.sha256(content.encode("utf-8")).hexdigest()[:16], "output_chars": len(content),
                    "output_text": content if store_outputs else None, "gpu_before": before, "gpu_after": after}
             # validity is judged against the application's own request (the workload item), not the arm's edited body:
-            # an arm that drops the schema is still measured on whether its output has what the application requires
-            rec.update(_validity(content, _schema_required(it["body"])))
-            rec["validity_schema_from"] = "workload item" if _schema_required(it["body"]) is not None else None
+            # an arm that drops the schema is still measured on whether its output satisfies what the application requires
+            rec.update(_validity(content, _schema_of(it["body"])))
+            rec["validity_schema_from"] = "workload item" if _schema_of(it["body"]) is not None else None
             (out["warmup_requests"] if phase == "warmup" else out["requests"]).append(rec)
             if progress:
-                progress("%s rep %d %s: prompt_n=%s cache_n=%s pp=%s t/s tg=%s t/s (%s tok) wall=%s ms valid_json=%s" % (
-                    phase, rep, it["id"], rec["prompt_n"], rec["cache_n"], rec["prompt_tps"], rec["predicted_tps"], rec["predicted_n"], rec["wall_ms"], rec["valid_json"]))
+                progress("%s rep %d %s: prompt_n=%s cache_n=%s (%s) pp=%s t/s tg=%s t/s (%s tok) wall=%s ms valid_json=%s schema_valid=%s" % (
+                    phase, rep, it["id"], rec["prompt_n"], rec["cache_n"], rec["cache_state"], rec["prompt_tps"], rec["predicted_tps"], rec["predicted_n"], rec["wall_ms"],
+                    rec["valid_json"], rec.get("schema_valid")))
         snap = {"phase": phase, "rep": rep, "gpu": gpu_mod.gpu_dynamic()}
         if pid:
             snap["process"] = gpu_mod.windows_process_gpu_counters(pid)
@@ -113,7 +180,20 @@ def run_workload(base, workload, repetitions=3, warmup=1, erase_between=True, st
     if workload.get("kind") == "requests":
         return run_requests_workload(base, workload, repetitions=repetitions, warmup=warmup, request_override=request_override,
                                      store_outputs=bool(workload.get("store_outputs", False)), slot_id=slot_id, pid=pid, progress=progress)
-    out = {"requests": [], "warmup_requests": [], "gpu_snapshots": []}
+    # erase_between=True means "if the server supports it"; cold state comes from cache_prompt=false regardless
+    # hotpath's own workloads are cold by construction: cache_prompt=false on every request (the server then processes
+    # the whole prompt), plus a slot erase before each request when the server supports it. The state is still read
+    # back per request from the server's cache_n.
+    out = {"requests": [], "warmup_requests": [], "gpu_snapshots": [], "slot_erase_error": None,
+           "cache": {"mode": "cold", "isolation": "cache_prompt=false on every request", "slot_erase_supported": None}}
+    if erase_between:
+        ok, err = probe_slot_erase(base, slot_id)
+        out["cache"]["slot_erase_supported"] = ok
+        if ok:
+            out["cache"]["isolation"] += " + slot erase before each request"
+        else:
+            out["slot_erase_error"] = err
+            erase_between = False
     n_predict = workload["n_predict"]
     temp = workload.get("temperature", 0.0)
     ignore_eos = bool(workload.get("ignore_eos", True))
@@ -133,7 +213,7 @@ def run_workload(base, workload, repetitions=3, warmup=1, erase_between=True, st
             content = resp.get("content", "")
             rec = {
                 "phase": phase, "rep": rep, "prompt_id": p["id"], "prompt_sha256": p["sha256"],
-                "prompt_n": t.get("prompt_n"), "cache_n": t.get("cache_n"),
+                "prompt_n": t.get("prompt_n"), "cache_n": t.get("cache_n"), "cache_state": cache_state(t),
                 "prompt_ms": t.get("prompt_ms"), "prompt_tps": t.get("prompt_per_second"),
                 "predicted_n": t.get("predicted_n"), "predicted_ms": t.get("predicted_ms"), "predicted_tps": t.get("predicted_per_second"),
                 "wall_ms": resp.get("_wall_ms"),
@@ -172,8 +252,14 @@ def summarize_requests(reqs):
     }
     judged = [r for r in reqs if r.get("valid_json") is not None]
     if judged:
+        full = [r for r in judged if r.get("schema_valid") is not None]
         s["validity"] = {"judged": len(judged), "valid_json": sum(1 for r in judged if r["valid_json"]),
-                         "schema_required_present": sum(1 for r in judged if r.get("schema_required_present"))}
+                         "schema_required_present": sum(1 for r in judged if r.get("schema_required_present")),
+                         "schema_valid": sum(1 for r in full if r["schema_valid"]) if full else None,
+                         "validation_level": judged[0].get("validation_level")}
+    states = [r.get("cache_state") for r in reqs if r.get("cache_state")]
+    if states:
+        s["cache_states"] = {k: states.count(k) for k in ("cold", "warm", "unknown") if states.count(k)}
     return s
 
 
@@ -199,6 +285,9 @@ def measure(cfg, base, workload, repetitions, warmup, owned, background_seconds=
     rec["requests"] = res["requests"]
     rec["warmup_requests"] = res["warmup_requests"]
     rec["gpu_snapshots"] = res["gpu_snapshots"]
+    rec["cache"] = res.get("cache")
+    if res.get("slot_erase_error"):
+        rec["slot_erase_error"] = res["slot_erase_error"]
     rec["summary"] = summarize_requests(res["requests"])
     rec["background_after"] = gpu_mod.sample_background(seconds=min(background_seconds, 5.0), interval=1.0)
     return rec

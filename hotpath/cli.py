@@ -230,6 +230,9 @@ def cmd_tools(args):
     st = adapters.all_status(bin_dir=cfg.get("runtime_bin_dir"), build_dir=_build_dir(cfg))
     for s in st:
         print("%-18s found=%-5s %s" % (s["tool"], s["found"], s["path"] or s["install_hint"]))
+    from hotpath.measure import schema_validator
+    print("%-18s found=%-5s %s" % ("jsonschema", bool(schema_validator()),
+                                   "full JSON Schema validation of request-shape outputs" if schema_validator() else "optional: pip install \"hotpath[schema]\" (otherwise only required top-level keys are checked)"))
     return 0
 
 

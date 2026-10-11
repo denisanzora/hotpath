@@ -141,17 +141,22 @@ def compare_markdown(rep):
     lines = ["# Comparison  [%s]" % rep["evidence_class"], ""]
     if rep["comparability_issues"]:
         lines += ["**Not directly comparable:**"] + ["- " + i for i in rep["comparability_issues"]] + [""]
-    lines += ["| arm | n | prompt_n med | prefill t/s med (p10-p90) | decode t/s med (p10-p90) | gen tok med | wall ms med | valid JSON / schema keys | proc dedicated MiB | proc shared MiB | failures |",
-              "|---|---|---|---|---|---|---|---|---|---|---|"]
+    lines += ["| arm | n | prompt_n med | cache states | prefill t/s med (p10-p90) | decode t/s med (p10-p90) | gen tok med | wall ms med | valid JSON / req. keys / schema | proc dedicated MiB | proc shared MiB | failures |",
+              "|---|---|---|---|---|---|---|---|---|---|---|---|"]
     for lab, r in rep["arms"].items():
         pf = r.get("prefill_tps") or {}
         dc = r.get("decode_tps") or {}
         v = r.get("validity")
-        vtxt = "%s/%s / %s/%s" % (v["valid_json"], v["judged"], v["schema_required_present"], v["judged"]) if v else "n/a"
-        lines.append("| %s | %s | %s | %s (%s-%s) | %s (%s-%s) | %s | %s | %s | %s | %s | %s |" % (
-            lab, r["n"], (r.get("prompt_n") or {}).get("median"), pf.get("median"), pf.get("p10"), pf.get("p90"),
+        vtxt = "%s/%s / %s/%s / %s" % (v["valid_json"], v["judged"], v["schema_required_present"], v["judged"],
+                                       ("%s/%s" % (v["schema_valid"], v["judged"])) if v.get("schema_valid") is not None else "n/a") if v else "n/a"
+        lines.append("| %s | %s | %s | %s | %s (%s-%s) | %s (%s-%s) | %s | %s | %s | %s | %s | %s |" % (
+            lab, r["n"], (r.get("prompt_n") or {}).get("median"), r.get("cache_states") or "n/a", pf.get("median"), pf.get("p10"), pf.get("p90"),
             dc.get("median"), dc.get("p10"), dc.get("p90"), (r.get("predicted_n") or {}).get("median"), (r.get("wall_ms") or {}).get("median"), vtxt,
             r.get("process_dedicated_mib"), r.get("process_shared_mib"), len(r.get("failures") or [])))
+    lvl = next((r["validity"].get("validation_level") for r in rep["arms"].values() if r.get("validity")), None)
+    if lvl:
+        lines.append("")
+        lines.append("schema validation level: %s" % lvl)
     lines.append("")
     for k, v in rep["median_ratios"].items():
         lines.append("- %s: %s" % (k, v))

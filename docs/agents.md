@@ -59,7 +59,7 @@ If the client cannot find the command, use the absolute path to `hotpath-mcp` in
 3. `hotpath_diagnose` with those records — ranked findings; read the confidence level and the "cannot establish" list before anything else.
 4. `hotpath_propose` with the diagnosis — a one-variable spec and its dry-run plan; show the plan to the user.
 5. With agreement: `hotpath_experiment_run` on the spec (active; interleaved rounds, own port).
-6. `hotpath_diagnose` with the experiment record — the keep/reject/inconclusive verdict, output equivalence and VRAM delta; explain it to the user in those terms.
+6. `hotpath_diagnose` with the experiment record — the keep/reject/inconclusive verdict, the verified cache state of each arm, output identity, output validity (and the level it was checked at) and VRAM delta; explain it to the user in those terms, keeping speed, identity, validity and cache comparability separate.
 
 ## Agent skill
 

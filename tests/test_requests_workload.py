@@ -48,25 +48,30 @@ class OverrideAndValidityTests(unittest.TestCase):
         self.assertIn("response_format", BODY)  # original untouched
 
     def test_validity_judgement(self):
-        req = ms._schema_required(BODY)
-        self.assertEqual(req, ["a", "b"])
-        self.assertEqual(ms._validity('{"a": 1, "b": "x"}', req), {"valid_json": True, "schema_required_present": True})
-        self.assertEqual(ms._validity('{"a": 1}', req), {"valid_json": True, "schema_required_present": False})
-        self.assertEqual(ms._validity('not json', req), {"valid_json": False, "schema_required_present": False})
-        self.assertEqual(ms._validity("anything", None), {"valid_json": None, "schema_required_present": None})
+        schema = ms._schema_of(BODY)
+        self.assertEqual(ms._schema_required(BODY), ["a", "b"])
+        pick = lambda d: (d["valid_json"], d["schema_required_present"])
+        self.assertEqual(pick(ms._validity('{"a": 1, "b": "x"}', schema)), (True, True))
+        self.assertEqual(pick(ms._validity('{"a": 1}', schema)), (True, False))
+        self.assertEqual(pick(ms._validity('not json', schema)), (False, False))
+        self.assertEqual(pick(ms._validity("anything", None)), (None, None))
+        if ms.schema_validator():
+            self.assertTrue(ms._validity('{"a": 1, "b": "x"}', schema)["schema_valid"])
+            self.assertFalse(ms._validity('{"a": "one", "b": "x"}', schema)["schema_valid"])   # wrong nested type
 
     def test_validity_judged_against_original_item_schema(self):
-        # an arm that removes the schema is still judged on the application's required keys
-        item_required = ms._schema_required(BODY)
+        # an arm that removes the schema is still judged on the application's schema
+        item_schema = ms._schema_of(BODY)
         overridden = ms.apply_request_override(BODY, {"remove": ["response_format"]})
-        self.assertIsNone(ms._schema_required(overridden))
-        self.assertEqual(ms._validity('{"draft": "x"}', item_required), {"valid_json": True, "schema_required_present": False})
+        self.assertIsNone(ms._schema_of(overridden))
+        self.assertFalse(ms._validity('{"draft": "x"}', item_schema)["schema_required_present"])
 
     def test_summary_counts_validity(self):
         reqs = [{"prompt_n": 10, "cache_n": 0, "prompt_tps": 1, "predicted_tps": 1, "prompt_ms": 1, "predicted_ms": 1, "wall_ms": 3, "predicted_n": 1, "stop_type": "stop",
-                 "valid_json": v, "schema_required_present": s} for v, s in ((True, True), (True, False), (False, False))]
+                 "valid_json": v, "schema_required_present": s, "schema_valid": f, "validation_level": ms.VALIDATION_LEVEL_FULL}
+                for v, s, f in ((True, True, True), (True, False, False), (False, False, False))]
         s = ms.summarize_requests(reqs)
-        self.assertEqual(s["validity"], {"judged": 3, "valid_json": 2, "schema_required_present": 1})
+        self.assertEqual(s["validity"], {"judged": 3, "valid_json": 2, "schema_required_present": 1, "schema_valid": 1, "validation_level": ms.VALIDATION_LEVEL_FULL})
 
 
 class RunnerTests(unittest.TestCase):

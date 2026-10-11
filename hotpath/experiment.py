@@ -40,7 +40,19 @@ def load_spec(path, local_cfg):
     return resolve(spec)
 
 
-def arm_launch(spec, arm):
+def slot_save_path_for(spec, arm, out_dir):
+    """Optional --slot-save-path for hotpath-owned launches ("slot_save_path": "auto" or a directory), so the server
+    honors slot erase (llama-server returns HTTP 501 for slot actions without it). Off by default: cold isolation
+    does not depend on it (see measure.run_requests_workload), and the launched command line stays the user's own."""
+    cfg = spec.get("slot_save_path", False)
+    if not cfg:
+        return None
+    if isinstance(cfg, str) and cfg != "auto":
+        return cfg
+    return str(Path(out_dir) / "slot-cache" / spec["name"])
+
+
+def arm_launch(spec, arm, out_dir=None):
     binary = arm.get("binary") or spec["binary"]
     args = list(spec.get("common_args", []))
     for k, v in (arm.get("args_override") or {}).items():
@@ -53,6 +65,9 @@ def arm_launch(spec, arm):
         if k in args:
             i = args.index(k)
             del args[i:i + 2]
+    ssp = slot_save_path_for(spec, arm, out_dir or "results/local")
+    if ssp and "--slot-save-path" not in args:
+        args += ["--slot-save-path", ssp]
     env = dict(os.environ)
     # directories to put first on PATH (e.g. the CUDA runtime DLLs a native build needs); values resolve via the local config
     if spec.get("path_prepend"):
@@ -75,6 +90,8 @@ def plan(spec):
              "Common args: %s" % " ".join(redact_args(spec.get("common_args", []))), "Env: %s" % (spec.get("env") or {}),
              "Workload: %s, n_predict %s, repetitions %s, warmup %s" % (redact_path(spec["workload"]), spec.get("n_predict"), spec.get("repetitions", 2), spec.get("warmup", 1)),
              "Preconditions: %s" % (spec.get("preconditions") or {}), ""]
+    lines.insert(-1, "Cache mode: %s; slot-save-path for hotpath-owned servers: %s" % (
+        spec.get("cache_mode", "cold (workload default)"), spec.get("slot_save_path") or "off"))
     for a in arms:
         cmd, env, port = arm_launch(spec, a)
         shown = [redact_path(cmd[0]), "--model", redact_path(cmd[2])] + redact_args(cmd[3:])
@@ -149,8 +166,14 @@ def run(spec, out_dir, dry_run=False, wait_for_preconditions_s=0):
             workload["n_predict"] = int(spec["n_predict"])
         if "ignore_eos" in spec:
             workload["ignore_eos"] = bool(spec["ignore_eos"])
-    elif spec.get("store_outputs"):
-        workload["store_outputs"] = True
+    else:
+        if spec.get("store_outputs"):
+            workload["store_outputs"] = True
+        if spec.get("cache_mode"):
+            workload["cache_mode"] = spec["cache_mode"]
+    ssp = slot_save_path_for(spec, None, out_dir)
+    if ssp:
+        Path(ssp).mkdir(parents=True, exist_ok=True)
     rounds = int(spec.get("rounds", 3))
     rec = new_record("experiment", "controlled", name=spec["name"], spec_redacted=json.loads(plan_json(spec)),
                      preconditions_result=pc, workload=workload_identity(workload),
@@ -160,9 +183,10 @@ def run(spec, out_dir, dry_run=False, wait_for_preconditions_s=0):
     out.mkdir(parents=True, exist_ok=True)
     for a in spec["arms"]:
         rec["arms"][a["name"]] = {"requests": [], "warmup_requests": [], "gpu_snapshots": [], "launches": 0, "launch_facts": [], "failures": []}
+    rec["cache_mode"] = workload.get("cache_mode", "cold")
     for rnd in range(rounds):
         for a in spec["arms"]:
-            cmd, env, port = arm_launch(spec, a)
+            cmd, env, port = arm_launch(spec, a, out_dir)
             base = "http://127.0.0.1:%d" % port
             log_path = out / ("server-%s-%s-r%d.log" % (spec["name"], a["name"], rnd))
             print("[round %d] launching arm %s" % (rnd, a["name"]))
@@ -194,6 +218,8 @@ def run(spec, out_dir, dry_run=False, wait_for_preconditions_s=0):
                 arm_rec["warmup_requests"] += res["warmup_requests"]
                 if res.get("slot_erase_error"):
                     arm_rec["slot_erase_error"] = res["slot_erase_error"]
+                if res.get("cache"):
+                    arm_rec["cache"] = res["cache"]
                 arm_rec["gpu_snapshots"] += [dict(s, round=rnd) for s in res["gpu_snapshots"]]
                 arm_rec["launch_facts"].append({"round": rnd, "load_s": load_s, "props": snap.get("props"),
                                                 "process_counters_after": gpu_mod.windows_process_gpu_counters(pid),
