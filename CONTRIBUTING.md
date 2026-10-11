@@ -13,7 +13,12 @@ Thanks for helping. Hotpath is small on purpose: standard-library Python, no run
 
 1. Fork, create a branch, make a focused change.
 2. Verify by running the real CLI workflow your change touches against a llama.cpp server you own (see the README quickstart). End-to-end runs are preferred over unit tests here; include the commands you ran and their outcome in the PR description.
-3. Open a pull request describing what changed and how you verified it.
+3. Run the unit tests: `python -m unittest discover -s tests`. They cover the diagnosis and proposal logic on synthetic record structures (shapes and arithmetic, never performance claims).
+4. Open a pull request describing what changed and how you verified it.
+
+## Diagnosis rules
+
+Rules in `hotpath/diagnose.py` must be relative (shares of a request, ratios between the user's own measurements, fractions of a ceiling computed from their model and GPU), never thresholds tied to one GPU, model or build. Every finding names the measurement it rests on, states a confidence level (`confirmed`, `likely`, `hypothesis`, `insufficient`), and either proposes a controlled experiment or says what evidence is missing. If `propose` can build the experiment, the finding's `experiment.arms` must be a list of arm dicts in the spec's vocabulary (`args_override`, `env_override`, `env_remove`, `args_remove`); otherwise describe the procedure in prose.
 
 ## MCP server and skill
 

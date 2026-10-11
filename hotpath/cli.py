@@ -1,4 +1,4 @@
-"""Command line: init, tools, observe, triage, gguf, workload, measure, experiment, compare, bench, profile, kernels."""
+"""Command line: init, tools, observe, triage, diagnose, propose, gguf, workload, measure, experiment, compare, bench, profile, kernels."""
 import argparse
 import json
 import os
@@ -60,6 +60,50 @@ def cmd_triage(args):
     md = triage_mod.triage_markdown(rep)
     print(md)
     _write(rec, args, "triage", md)
+    return 0
+
+
+def cmd_diagnose(args):
+    """Ranked bottleneck findings from any mix of records; verdicts for finished experiments."""
+    from hotpath import diagnose as diag_mod
+    recs = [load_record(p) for p in args.records]
+    cfg = load_local(args.local)
+    d = diag_mod.diagnose(recs, bandwidth_gbs=args.bandwidth_gbs, cfg=None if cfg.get("_missing") else cfg)
+    d["source_files"] = [Path(p).name for p in args.records]
+    md = diag_mod.diagnosis_markdown(d)
+    print(md)
+    _write(d, args, "diagnosis", md)
+    return 0
+
+
+def cmd_propose(args):
+    """Write an experiment spec for a diagnosis finding (one variable between arms), then show its dry-run plan."""
+    from hotpath import propose as prop_mod
+    cfg = load_local(args.local)
+    workload = args.workload or cfg.get("workload")
+    if not workload:
+        workload = str(Path("workloads") / "hotpath-default.json")
+        if not Path(workload).exists():
+            w = wl_mod.build_workload("hotpath-default", 3, [450, 900, 1300], seed=1, n_predict=64, fmt="chatml")
+            wl_mod.save_workload(w, workload)
+            print("no workload given; wrote a default synthetic one: %s (3 ChatML prompts of 450/900/1300 words, n_predict 64)" % workload)
+    try:
+        spec, source = prop_mod.propose(args.diagnosis, args.finding, cfg, workload, args.out, common_args=args.common_args, port=args.port,
+                                        rounds=args.rounds, repetitions=args.repetitions, warmup=args.warmup, n_predict=args.n_predict)
+    except ValueError as e:
+        raise SystemExit("error: %s" % e)
+    print("wrote %s (baseline arguments from: %s)" % (args.out, source))
+    print("")
+    if cfg.get("_missing"):
+        print("hotpath.local.json not found: the spec references ${runtime_binary} and ${model_path}; create the config before running it.")
+        return 0
+    try:
+        resolved = exp_mod.load_spec(args.out, cfg)
+        print(exp_mod.plan(resolved))
+    except SystemExit as e:
+        print("dry run not possible yet: %s" % e)
+    print("")
+    print("Next: review the plan, then `hotpath experiment %s` (ACTIVE: launches servers), then `hotpath diagnose results/local/experiment-%s-*.json`." % (args.out, spec["name"]))
     return 0
 
 
@@ -256,6 +300,20 @@ def build_parser():
     s = sub.add_parser("triage", help="attribution report from an observation record")
     s.add_argument("observation"); s.add_argument("--bandwidth-gbs", type=float)
     s.set_defaults(fn=cmd_triage)
+
+    s = sub.add_parser("diagnose", help="ranked bottleneck findings (with confidence, measurements, opportunity, confirming experiment) from any records; verdicts for finished experiments")
+    s.add_argument("records", nargs="+", help="observation, measurement, experiment, bench and/or profile records")
+    s.add_argument("--bandwidth-gbs", type=float, help="GPU peak memory bandwidth if not in the built-in table")
+    s.set_defaults(fn=cmd_diagnose)
+
+    s = sub.add_parser("propose", help="write an experiment spec (one variable between arms) for a diagnosis finding, then print its dry-run plan")
+    s.add_argument("diagnosis"); s.add_argument("--finding", help="finding id (default: the diagnosis's recommended experiment)")
+    s.add_argument("--out", required=True, help="where to write the spec JSON")
+    s.add_argument("--workload", help="workload file (default: 'workload' in the local config, else a generated synthetic one)")
+    s.add_argument("--common-args", nargs="+", help="baseline llama-server arguments (default: server_args in the local config, else the diagnosed experiment's, else hotpath defaults)")
+    s.add_argument("--port", type=int, default=8099); s.add_argument("--rounds", type=int, default=3); s.add_argument("--repetitions", type=int, default=2)
+    s.add_argument("--warmup", type=int, default=1); s.add_argument("--n-predict", type=int)
+    s.set_defaults(fn=cmd_propose)
 
     s = sub.add_parser("gguf", help="model header summary: shapes, types, bytes per decode token")
     s.add_argument("path"); s.add_argument("--tensors", action="store_true"); s.add_argument("--bandwidth-gbs", type=float)

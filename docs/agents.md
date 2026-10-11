@@ -31,6 +31,8 @@ If the client cannot find the command, use the absolute path to `hotpath-mcp` in
 | `hotpath_gguf_summary` | read-only | `hotpath gguf` |
 | `hotpath_observe` | read-only (no inference) | `hotpath observe` |
 | `hotpath_triage` | read-only | `hotpath triage` |
+| `hotpath_diagnose` | read-only | `hotpath diagnose` |
+| `hotpath_propose` | writes a spec file; launches nothing | `hotpath propose` |
 | `hotpath_compare` | read-only | `hotpath compare` |
 | `hotpath_workload` | writes a workload file | `hotpath workload` |
 | `hotpath_experiment_plan` | read-only dry run | `hotpath experiment --dry-run` |
@@ -50,6 +52,15 @@ If the client cannot find the command, use the absolute path to `hotpath-mcp` in
 - Each call runs as a child process with a timeout (300 s read-only, 1800 s active by default, per-call `timeout_s`, capped by `HOTPATH_MCP_MAX_TIMEOUT_S`, default 7200). On expiry the whole process tree is killed.
 - Outputs are returned to the agent as text, including local paths from tool output. Do not connect this server to a client you do not trust with that information.
 
+### The agent workflow
+
+1. `hotpath_tools` — is the environment supported (GPU, config, external tools)?
+2. Evidence: `hotpath_observe` for a running server, or (active, with agreement) `hotpath_bench` and `hotpath_measure` against a server listed in `owned_servers`.
+3. `hotpath_diagnose` with those records — ranked findings; read the confidence level and the "cannot establish" list before anything else.
+4. `hotpath_propose` with the diagnosis — a one-variable spec and its dry-run plan; show the plan to the user.
+5. With agreement: `hotpath_experiment_run` on the spec (active; interleaved rounds, own port).
+6. `hotpath_diagnose` with the experiment record — the keep/reject/inconclusive verdict, output equivalence and VRAM delta; explain it to the user in those terms.
+
 ## Agent skill
 
 `skills/hotpath/SKILL.md` follows the [Agent Skills](https://agentskills.io) format (`name`, `description`, instructions in Markdown). It teaches an agent the install steps, the passive-first workflow, when to ask before active commands, and how to read results.
@@ -61,6 +72,7 @@ To use it, copy the `skills/hotpath` directory into your agent's skills director
 | Item | Status |
 |---|---|
 | MCP server: `initialize`, `tools/list`, `tools/call` over real stdio, active-tool refusal with and without the env var, path confinement, timeout kill of the process tree, a real `bench` call | **exercised** with a scripted JSON-RPC client on Windows |
+| `hotpath_diagnose` and `hotpath_propose` over stdio on real measurement and bench records (findings returned, spec written inside the working directory, out-of-directory record refused) | **exercised** with a scripted JSON-RPC client on Windows |
 | MCP server in a specific agent (Claude Code, OpenCode, Cursor, ...) | **not yet validated**; the configuration above is the standard stdio shape |
 | SKILL.md frontmatter against the Agent Skills field rules (name format, description length) | checked with a script |
 | SKILL.md loaded by a specific agent (Claude Code, OpenCode, ...) | **not yet validated** |

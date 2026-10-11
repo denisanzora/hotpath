@@ -114,6 +114,29 @@ def _triage(a):
     return argv
 
 
+@tool("hotpath_diagnose", "Ranked bottleneck findings from any mix of hotpath records (observation, measurement, experiment, bench, profile): each with confidence level, the measurements it rests on, why it matters, an opportunity bound where defensible, the controlled experiment that would confirm it, and risks. Finished experiments get a keep/reject/inconclusive verdict. Writes results/local/diagnosis-*.json. Read-only.",
+      _s({"records": {"type": "array", "items": _STR, "minItems": 1}, "bandwidth_gbs": {"type": "number"}}, ["records"]))
+def _diagnose(a):
+    argv = ["diagnose"] + [_inside_cwd(r, "record") for r in a["records"]]
+    if a.get("bandwidth_gbs"):
+        argv += ["--bandwidth-gbs", str(a["bandwidth_gbs"])]
+    return argv
+
+
+@tool("hotpath_propose", "Write an experiment spec for a diagnosis finding (one variable between arms, baseline = the diagnosed configuration) and print its dry-run plan. Launches nothing; the spec is run with hotpath_experiment_run after the user agrees.",
+      _s({"diagnosis": _STR, "finding": _STR, "out": _STR, "workload": _STR, "rounds": _INT, "repetitions": _INT, "n_predict": _INT, "port": _INT}, ["diagnosis", "out"]))
+def _propose(a):
+    argv = ["propose", _inside_cwd(a["diagnosis"], "diagnosis"), "--out", _inside_cwd(a["out"], "out")]
+    if a.get("finding"):
+        argv += ["--finding", a["finding"]]
+    if a.get("workload"):
+        argv += ["--workload", _inside_cwd(a["workload"], "workload")]
+    for k in ("rounds", "repetitions", "n_predict", "port"):
+        if a.get(k) is not None:
+            argv += ["--" + k.replace("_", "-"), str(a[k])]
+    return argv
+
+
 @tool("hotpath_compare", "Compare experiment/measurement/kernel records: medians with spread, ratios, comparability issues, greedy-output equivalence.",
       _s({"records": {"type": "array", "items": _STR, "minItems": 1}}, ["records"]))
 def _compare(a):

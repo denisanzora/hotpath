@@ -29,6 +29,8 @@ This is an early (0.1) release by a single developer. What has actually been run
 | Runtime | CUDA builds of a llama.cpp-derived `llama-server` / `llama-bench` / `test-backend-ops` |
 | Profilers | Nsight Systems 2024.6, Nsight Compute 2025.1 |
 
+| Diagnose → propose → experiment → verdict loop | one real run on the setup above (0.2.0): `bench` + `measure` of a 3-prompt workload → `diagnose` ranked a 194 ms (5%) per-request residual first → `propose` wrote a 3-arm spec (default, `--cache-ram 0`, `--ctx-checkpoints 0`) → `experiment` ran 9 interleaved launches → `diagnose` on the record: both candidates −4.2…4.4% wall, consistent on 3/3 prompts, greedy outputs identical, VRAM unchanged, with the finding's caveat (prefix reuse lost) attached |
+
 Not validated: Linux, macOS, AMD or Intel GPUs, multi-GPU systems, upstream `llama.cpp` releases other than the one above, other runtimes (vLLM, TensorRT-LLM, Ollama, ...). The code avoids Windows-only assumptions where it can (`nvidia-smi`, `lsof`, standard install locations for Nsight on Linux), but those paths are untested; please report what you find. The per-process GPU memory counters (`windows_process_gpu_counters`) are Windows-only and are simply absent elsewhere.
 
 ## Requirements
@@ -115,6 +117,34 @@ hotpath compare results/local/experiment-<name>-<timestamp>.json
 
 An experiment prints its comparison when it finishes; `compare` re-renders it, or compares several measurement/kernel records.
 
+## From "it is slow" to a measured bottleneck: diagnose and propose
+
+`compare` tells you the numbers; `diagnose` says what they mean and what to test next, and `propose` turns that into a spec the experiment runner accepts.
+
+```
+hotpath bench --ub 256 --pp 512 --tg 128                      # ACTIVE: the runtime alone, same model
+hotpath measure --server URL --workload workloads/w.json --label baseline   # ACTIVE: the served model, your workload
+hotpath diagnose results/local/measurement-baseline-*.json results/local/bench-*.json
+hotpath propose results/local/diagnosis-*.json --out experiments/next.json   # writes a one-variable experiment and prints its plan
+hotpath experiment experiments/next.json                       # ACTIVE
+hotpath diagnose results/local/experiment-<name>-*.json        # verdict: keep / reject / inconclusive, with the evidence
+```
+
+`diagnose` reads any mix of records (observation, measurement, experiment, bench, profile) and produces ranked findings. Each finding carries the measurements it rests on, a confidence level, why it matters for end-to-end latency, an opportunity bound when the measured shares allow one, the controlled experiment that would confirm or reject it, and the risks of the candidate change. The confidence levels are:
+
+| Level | Meaning |
+|---|---|
+| `confirmed` | the records contain a controlled comparison that shows it |
+| `likely` | direct measurements point at it; no controlled comparison yet |
+| `hypothesis` | consistent with the evidence; the named experiment would decide |
+| `insufficient` | the records cannot establish it; the finding says what to collect |
+
+What it looks at today: the per-request split into prompt processing, generation and everything else (prefill-bound vs decode-bound vs overhead); the residual per-request overhead and the server flags that affect it; the microbatch size against the prefill share; decode against the memory-bandwidth ceiling for your model and GPU, and whether CUDA graphs are disabled; the served prefill/decode against `llama-bench` on the same model (the gap is server-side work); VRAM headroom and system-memory spill signs; kernel-class shares from a profile; and, for finished experiments, a per-arm verdict that combines the wall-time ratio, whether the p10-p90 spreads overlap, the VRAM delta and the greedy-output equivalence. It ends with the list of things the given records cannot establish.
+
+`propose` keeps the comparison fair by construction: one variable differs between arms; the baseline arm is your current configuration (`server_args` in the local config, or the diagnosed experiment's own arguments, or `--common-args`); binary and model are `${...}` references into `hotpath.local.json`; rounds are interleaved by the runner. It prints the dry-run plan and never launches anything.
+
+Diagnoses are not results. A `hypothesis` finding is an argument for an experiment; the experiment's verdict is what you act on.
+
 ## Use it from an AI coding agent
 
 `hotpath mcp` (also installed as `hotpath-mcp`) serves the commands as MCP tools over local stdio, with active tools (experiments, benchmarks, profiling) disabled unless you start it with `HOTPATH_MCP_ALLOW_ACTIVE=1`. `skills/hotpath/SKILL.md` is a portable Agent Skill that teaches an agent the workflow. Both reuse the CLI. The protocol behavior has been exercised with a scripted client; the integration with specific agents has **not** been validated yet. Details and the exact validation status are in [docs/agents.md](docs/agents.md).
@@ -123,6 +153,8 @@ An experiment prints its comparison when it finishes; `compare` re-renders it, o
 
 | Command | What it does |
 |---|---|
+| `hotpath diagnose RECORD...` | ranked bottleneck findings with confidence, measurements, opportunity bound, confirming experiment and risks; keep/reject/inconclusive verdicts for finished experiments |
+| `hotpath propose DIAGNOSIS --out SPEC` | one-variable experiment spec for a finding (default: the diagnosis's recommended one) plus its dry-run plan; launches nothing |
 | `hotpath measure --server URL --workload W --i-own-this-server` | ACTIVE: run a workload against a server you own and record timings (refuses servers not in `owned_servers` unless the flag is given) |
 | `hotpath bench` | ACTIVE: `llama-bench` prefill/decode with repetitions; refuses to run while something else is using the GPU |
 | `hotpath profile --label L --pp 0 --tg 64` | ACTIVE: Nsight Systems kernel-share profile of a decode-only (`--pp 0`) or prefill-only (`--tg 0`) `llama-bench` run |
@@ -173,8 +205,10 @@ Practical guidance:
 - NVIDIA only. The built-in bandwidth table lists published peak memory bandwidth for a handful of GPUs; only the RTX 2080 SUPER entry has been checked against a real run. Use `--bandwidth-gbs` to override.
 - The experiment runner launches whole servers per arm, which is slow for large models but isolates arms properly.
 - MCP server and agent skill are new and unvalidated in real agents (see docs/agents.md).
-- No automated test suite yet; changes have been verified by running the actual workflows (see CONTRIBUTING).
-- `hotpath profile` and `hotpath kernels` are thin wrappers: they run the underlying tool and summarize its output, they do not interpret what to optimize.
+- The test suite covers the diagnosis and proposal logic on synthetic record structures (`python -m unittest discover -s tests`); the commands that drive servers and profilers are verified by running the actual workflows (see CONTRIBUTING).
+- `diagnose` reasons from the measurements hotpath itself collects. Its rules are relative (shares, ratios, fractions of a ceiling) and were checked on one GPU/model/runtime; a finding is only as good as the records behind it, and it says `insufficient` rather than guess. It cannot see prefix-cache effectiveness (hotpath workloads disable the cache on purpose), request-level CPU costs inside the client, or anything a kernel profile has not been run for.
+- `propose` covers the experiment kinds `diagnose` emits as arm lists (microbatch sweep, CUDA-graph toggle, prompt-cache/checkpoint flags); findings whose confirmation is a procedure (a profile, a client-side request-shape comparison) are described, not generated.
+- `hotpath profile` and `hotpath kernels` are thin wrappers: they run the underlying tool and summarize its output; `diagnose` ranks a profile's kernel classes but does not interpret individual kernels.
 
 ## Troubleshooting
 
