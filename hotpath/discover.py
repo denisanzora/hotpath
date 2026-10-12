@@ -279,8 +279,9 @@ def probe_http(base):
         res["metrics"] = parse_metrics(_get(base + "/metrics", text=True))
         res["metrics_enabled"] = True
     except urllib.error.HTTPError as e:
-        res["metrics_enabled"] = False
-        res["metrics_note"] = "HTTP %d: start llama-server with --metrics to expose aggregate prompt/generation counters" % e.code
+        res["metrics_enabled"] = None if e.code == 401 else False
+        res["metrics_note"] = ("HTTP 401: the server requires an API key; hotpath does not send one, so /metrics is unknown" if e.code == 401 else
+                               "HTTP %d: start llama-server with --metrics to expose aggregate prompt/generation counters" % e.code)
     except (urllib.error.URLError, OSError, ValueError) as e:
         res["metrics_enabled"] = False
         res["metrics_note"] = str(e)[:120]
@@ -958,6 +959,10 @@ def unknowns(rec):
     return u
 
 
+def _metrics_state(h):
+    return {True: "on", False: "off"}.get(h.get("metrics_enabled"), "unknown (API key required)" if "401" in str(h.get("metrics_note")) else "unknown")
+
+
 def discovery_brief(rec):
     """A few lines for `inspect`: the setup and its problems. The full report is the discovery .md file."""
     L = ["# Setup"]
@@ -971,7 +976,7 @@ def discovery_brief(rec):
         L.append("- llama-server pid %s on port %s%s: model %s; %s; log %s; /metrics %s" % (
             s.get("pid"), s.get("port"), " (a hotpath experiment's own server)" if s.get("launched_by_hotpath") else "",
             Path(st.get("model") or ((h.get("props") or {}).get("model_path") or "?")).name, launch.describe(st),
-            Path(st["log_file"]).name if st.get("log_file") else "none", "on" if h.get("metrics_enabled") else "off"))
+            Path(st["log_file"]).name if st.get("log_file") else "none", _metrics_state(h)))
     if not rec["servers"]:
         L.append("- no running llama-server")
     ok = sum(1 for i in rec["installs"] if (i.get("version_check") or {}).get("starts") or i.get("needs_path_prepend"))
@@ -1035,7 +1040,7 @@ def discovery_markdown(rec):
             st = s["settings"]
             L.append("  - model: %s" % (st.get("model") or p.get("model_path") or ("-hf %s" % st["hf_repo"] if st.get("hf_repo") else "?")))
             L.append("  - launch: %s" % launch.describe(st))
-            L.append("  - log file: %s; /metrics: %s; build: %s" % (st.get("log_file") or "none", "on" if h.get("metrics_enabled") else "off", p.get("build_info")))
+            L.append("  - log file: %s; /metrics: %s; build: %s" % (st.get("log_file") or "none", _metrics_state(h), p.get("build_info")))
     for e in rec["endpoints"]:
         L.append("- %s answers (no matching process visible): build %s" % (e["base_url"], (e.get("props") or {}).get("build_info")))
     L += ["", "## llama-server installations", ""]

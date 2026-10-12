@@ -301,6 +301,12 @@ def cmd_inspect(args):
     print(disc.discovery_brief(rec))
     live = disc.healthy_user_servers(rec)
     base = args.server or cfg.get("server_url") or (live[0]["base_url"] if len(live) == 1 else None)
+    if not args.server and cfg.get("server_url") and len(live) == 1 and cfg["server_url"].rstrip("/") != live[0]["base_url"]:
+        from hotpath import server as srv_mod
+        if srv_mod.health(cfg["server_url"].rstrip("/")).get("status") == "unreachable":
+            print("\nserver_url in the config (%s) does not answer; inspecting the running server %s instead (`hotpath init --update` does not change "
+                  "existing values: edit server_url, or pass --server)." % (cfg["server_url"], live[0]["base_url"]))
+            base = live[0]["base_url"]
     if not base and len(live) > 1:
         raise SystemExit("several llama-servers are running (%s); choose one with --server" % ", ".join(s["base_url"] for s in live))
     if not (base or args.log or cfg.get("server_log")):
