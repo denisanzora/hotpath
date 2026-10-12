@@ -219,12 +219,15 @@ def run(spec, out_dir, dry_run=False, wait_for_preconditions_s=0):
     for a in spec["arms"]:
         rec["arms"][a["name"]] = {"requests": [], "warmup_requests": [], "gpu_snapshots": [], "launches": 0, "launch_facts": [], "failures": []}
     rec["cache_mode"] = workload.get("cache_mode", "cold")
+    n_items = len(workload.get("items") or workload.get("prompts") or [])
+    total = rounds * len(spec["arms"])
+    print("running %d launches, %d requests" % (total, total * n_items * (int(spec.get("warmup", 1)) + int(spec.get("repetitions", 2)))), flush=True)
     for rnd in range(rounds):
         for a in spec["arms"]:
             cmd, env, port = arm_launch(spec, a, out_dir)
             base = "http://127.0.0.1:%d" % port
             log_path = out / ("server-%s-%s-r%d.log" % (spec["name"], a["name"], rnd))
-            print("[round %d] launching arm %s" % (rnd, a["name"]))
+            print("[round %d] launching arm %s (launch %d/%d)" % (rnd, a["name"], len(rec["launches"]) + 1, total), flush=True)
             t0 = time.time()
             proc, log = _launch(cmd, env, log_path)
             arm_rec = rec["arms"][a["name"]]

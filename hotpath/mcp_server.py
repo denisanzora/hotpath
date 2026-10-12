@@ -476,6 +476,13 @@ class Job:
         head = "%s %s: %s after %.0f s (`hotpath %s`)" % (self.id, self.tool, self.state(), elapsed, " ".join(self.argv))
         if not self.done.is_set():
             lines = self._read(self.out_path).splitlines()
+            import re
+            totals = next((re.search(r"running (\d+) launches, (\d+) requests", ln) for ln in lines if ln.startswith("running ")), None)
+            launches = [re.search(r"\(launch (\d+)/(\d+)\)", ln) for ln in lines if "launching arm" in ln]
+            done_requests = sum(1 for ln in lines if ln.strip().startswith(("warmup rep", "rep rep")))
+            if totals:
+                head += "\nprogress: launch %s of %s, %d of %s requests done" % (
+                    launches[-1].group(1) if launches and launches[-1] else "0", totals.group(1), done_requests, totals.group(2))
             return head + "\nlatest output:\n" + "\n".join(lines[-tail_lines:]) + \
                 "\n\nStill running. Poll with hotpath_job_status(job_id=%r, wait_s=45); stop with hotpath_job_cancel." % self.id, False
         body = _format(self._read(self.out_path), self._read(self.err_path), self.proc.returncode, elapsed, self.timed_out, self.cancelled)
@@ -541,6 +548,14 @@ def call_tool(name, args):
         raise ValueError("unknown tool %s" % name)
     _desc, _schema, active, builder = TOOLS[name]
     args = args or {}
+    # agents guess argument names; say exactly what this tool takes instead of failing on a missing key later
+    unknown = sorted(set(args) - set(_schema.get("properties") or {}))
+    missing = [k for k in _schema.get("required") or [] if k not in args and k != "confirm"]    # confirm has its own refusal below
+    if unknown or missing:
+        return ("error: %s%s%s. Arguments of %s: %s (required: %s)." % (
+            "unknown argument(s) %s" % ", ".join(unknown) if unknown else "", "; " if unknown and missing else "",
+            "missing required argument(s) %s" % ", ".join(missing) if missing else "", name,
+            ", ".join(sorted(_schema.get("properties") or {})) or "none", ", ".join(_schema.get("required") or []) or "none")), True
     if active:
         if args.get("confirm") is not True:
             return "refused: %s is an active tool; pass confirm=true after the user has agreed to it." % name, True

@@ -100,6 +100,34 @@ class OffloadAndRankingTests(unittest.TestCase):
             self.assertIn("differ", src)
 
 
+class ImproveLoopTests(unittest.TestCase):
+    def _exp(self, cand_wall):
+        def reqs(wall, dec_ms):
+            return [{"prompt_id": "p%d" % (i % 3), "prompt_n": 1000, "prompt_ms": 2000, "prompt_tps": 500, "predicted_n": 64, "predicted_ms": dec_ms,
+                     "predicted_tps": 64000.0 / dec_ms, "wall_ms": wall + i, "cache_n": 0, "tokens": [1, 2, 3]} for i in range(9)]
+        arm = lambda ngl, r: {"requests": r, "args": ["llama-server", "--model", "m.gguf", "--host", "127.0.0.1", "--port", "8099", "-c", "4096", "--gpu-layers", str(ngl)],
+                              "env_ggml": {}, "failures": [], "launch_facts": [], "cache": {"mode": "cold"}}
+        return {"kind": "experiment", "evidence_class": "controlled", "created": "t", "name": "gl", "spec_redacted": {"rounds": 3, "provenance": {"finding": "gpu_offload_partial"}},
+                "gpu": {"memory.total": "8192", "bandwidth_gbs_known": 500.0}, "workload": {"set_hash": "s", "n_predict": 64},
+                "model": {"summary": {"n_layer": 64, "total_bytes": 6 << 30, "weight_bytes_streamed_per_decode_token": 6 << 30}},
+                "arms": {"ngl56": arm(56, reqs(10000, 7800)), "ngl65": arm(65, reqs(cand_wall, 1300))}}
+
+    def test_next_diagnosis_and_baseline_build_on_the_faster_arm(self):
+        d = dg.diagnose([self._exp(3500)])
+        self.assertEqual(d["diagnosed_arm"], "gl/ngl65")
+        self.assertFalse(any(f["id"] == "gpu_offload_partial" for f in d["findings"]))     # fixed on the candidate
+        self.assertEqual(d["experiment_verdicts"][0]["tests_finding"], "gpu_offload_partial")
+        args, src = pp.baseline_args(d, {"server_args": ["-ngl", "56"]})
+        args, _removed = pp.strip_runner_owned(pp._strip_launch_prefix(args))
+        self.assertEqual(args, ["-c", "4096", "--gpu-layers", "65"])
+        self.assertIn("faster", src)
+
+    def test_a_slower_candidate_leaves_the_baseline_in_place(self):
+        d = dg.diagnose([self._exp(14000)])
+        self.assertEqual(d["diagnosed_arm"], "gl/ngl56")
+        self.assertIsNone(d["baseline_from_verdict"])
+
+
 class DiscoveryBoundsTests(unittest.TestCase):
     def test_drive_roots_are_refused_and_walk_is_bounded(self):
         with self.assertRaises(ValueError):

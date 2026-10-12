@@ -32,11 +32,15 @@ def _speed_settings(args):
 
 def baseline_args(diagnosis_record, cfg, override=None):
     """Common arguments for the spec, so the baseline arm is the configuration that was diagnosed:
-    explicit override > the diagnosed server's observed command line (or server_args in the config when it matches it, since
+    explicit override > the arm the last verdict found faster > the diagnosed server's observed command line (or server_args in the config when it matches it, since
     the config keeps full paths) > server_args > the diagnosed experiment's arm args > defaults."""
     if override:
         return list(override), "command line"
-    obs = (diagnosis_record or {}).get("observed_launch") or {}
+    d = diagnosis_record or {}
+    if d.get("baseline_from_verdict") and d.get("baseline_args"):
+        # the improve step: the next experiment starts from the configuration the last verdict found faster
+        return list(d["baseline_args"]), d["baseline_from_verdict"]
+    obs = d.get("observed_launch") or {}
     if obs.get("args_redacted"):
         from hotpath import launch
         if cfg.get("server_args") and _speed_settings(cfg["server_args"]) == _speed_settings(obs["args_redacted"]):

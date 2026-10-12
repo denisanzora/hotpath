@@ -531,12 +531,14 @@ def rule_microbatch(ev, label, arm):
     if (arm or {}).get("metrics") and pf_tps is None:
         pf_tps, pf_share = arm["metrics"].get("prefill_tps"), arm["metrics"].get("prefill_share_of_server_time")
     obs = ev.get("observed_launch") or {}
-    if ub is None and obs and obs.get("n_ubatch") is None and (arm or {}).get("evidence_class") != "controlled":
-        # the command line was read and does not set it: the build default applies (512 in current llama.cpp)
+    full_args = (arm or {}).get("evidence_class") == "controlled" and (arm or {}).get("args")
+    if ub is None and (full_args or (obs and obs.get("n_ubatch") is None and (arm or {}).get("evidence_class") != "controlled")):
+        # the command line is known and does not set it: the build default applies (512 in current llama.cpp)
+        where = "the arm's command line (launched by hotpath)" if full_args else obs.get("settings_source")
         return _finding("microbatch_default", "Microbatch not set on the command line: the build's default applies", "info", "likely", "passive",
-                        {"source": obs.get("settings_source"), "prefill_tps": pf_tps},
+                        {"source": where, "prefill_tps": pf_tps},
                         "llama-server's default microbatch (512 in current llama.cpp) is already in the range where prompt processing is batched GEMM work.",
-                        known=["%s has no -ub/--ubatch-size" % obs.get("settings_source")],
+                        known=["%s has no -ub/--ubatch-size" % where],
                         notes=["A LLAMA_ARG_UBATCH environment variable would override the default and is not visible in a command line."])
     if ub is None:
         # an older session's value is not this session's value: report it, do not diagnose from it
@@ -794,9 +796,17 @@ def rule_decode_ceiling(ev, label, arm, bandwidth_gbs=None):
                         "Batch-1 generation is bound by streaming the weights; what remains is kernel efficiency and launch overhead, worth a kernel-level profile only if decode dominates the request.",
                         experiment={"kind": "profile_decode", "variable": "none (profiling run)", "arms": "hotpath profile --pp 0 --tg 64", "metric": "GPU time share by kernel class"})
     sev = "high" if frac < DECODE_CEILING_LOW else "medium"
-    exp = {"kind": "cuda_graphs", "variable": "GGML_CUDA_DISABLE_GRAPHS",
-           "arms": [{"name": "graphs-on", "env_remove": ["GGML_CUDA_DISABLE_GRAPHS"]}, {"name": "graphs-off", "env_override": {"GGML_CUDA_DISABLE_GRAPHS": "1"}}],
-           "metric": "decode t/s median; outputs equivalent", "note": "Whether the build enables graphs on this GPU architecture is decided by the runtime; the experiment shows the effect either way."}
+    if graphs_off:
+        # the current configuration (graphs off) is the baseline arm; the candidate turns them on
+        exp = {"kind": "cuda_graphs", "variable": "GGML_CUDA_DISABLE_GRAPHS",
+               "arms": [{"name": "graphs-off", "env_override": {"GGML_CUDA_DISABLE_GRAPHS": "1"}}, {"name": "graphs-on", "env_remove": ["GGML_CUDA_DISABLE_GRAPHS"]}],
+               "metric": "decode t/s median; outputs equivalent", "note": "Whether the build enables graphs on this GPU architecture is decided by the runtime; the experiment shows the effect either way."}
+    else:
+        # graphs are not disabled, so toggling them could only confirm the current state: what decides the next lever is where decode time goes
+        exp = {"kind": "profile_decode", "variable": "none (profiling run)",
+               "arms": "hotpath profile --label decode --pp 0 --tg 64 (ACTIVE, Nsight Systems): GPU time by kernel class and the share of tiny kernels; with CUDA graphs already on, "
+                       "the remaining levers are kernel efficiency for this quantization and the number of kernels per token",
+               "metric": "GPU time share by kernel class; kernel launches under 20 us"}
     why = ("Achieved decode is well below what streaming the weights alone would allow. The usual causes, in order of how often they decide it: per-kernel launch overhead "
            "(hundreds of small kernels per token; CUDA graphs remove most of it), mat-vec kernels that do not reach bandwidth for this quantization type, extra passes for "
            "non-attention layers, and CPU-side per-token work in the server.")
@@ -810,7 +820,7 @@ def rule_decode_ceiling(ev, label, arm, bandwidth_gbs=None):
                     known=["decode %.1f t/s; %.3f GB of weights per token at %.0f GB/s peak gives a %.0f t/s ceiling" % (dc_tps, model["weight_bytes_streamed_per_decode_token"] / 1e9, bw, ceiling)] +
                           (["the launch environment sets GGML_CUDA_DISABLE_GRAPHS=1"] if graphs_off else []),
                     hypothesis="Per-kernel launch overhead is the largest part of the gap and CUDA graphs remove it" if graphs_off else
-                               "Some of the gap is launch overhead or kernel efficiency; which part needs a decode profile or the graphs experiment")
+                               "Some of the gap is kernel efficiency for this quantization or the number of kernels per token; only a decode profile tells which")
 
 
 def rule_vram(ev, label, arm):
@@ -866,9 +876,14 @@ def rule_profile(ev):
         if any(k.startswith("cublas_bf16_fallback") for k, _ in top):
             notes.append("A BF16 cuBLAS fallback GEMM is among the top classes: on GPUs without native BF16 tensor cores the runtime converts and multiplies in a slower path; a build-level fix, not a flag.")
         if mode == "decode" and total_inst and small / total_inst > 0.7:
-            notes.append("Most kernel launches are under 20 us: decode is launch-count sensitive; CUDA graphs (if not already on) and kernel fusion are the levers.")
-            exp = {"kind": "cuda_graphs", "variable": "GGML_CUDA_DISABLE_GRAPHS", "arms": [{"name": "graphs-on", "env_remove": ["GGML_CUDA_DISABLE_GRAPHS"]}, {"name": "graphs-off", "env_override": {"GGML_CUDA_DISABLE_GRAPHS": "1"}}],
-                   "metric": "decode t/s median"}
+            env = (ev.get("launch") or {}).get("launcher_env") or {}
+            if str(env.get("GGML_CUDA_DISABLE_GRAPHS", "")) == "1":
+                notes.append("Most kernel launches are under 20 us and the launch environment disables CUDA graphs: graphs are the first lever.")
+                exp = {"kind": "cuda_graphs", "variable": "GGML_CUDA_DISABLE_GRAPHS",
+                       "arms": [{"name": "graphs-off", "env_override": {"GGML_CUDA_DISABLE_GRAPHS": "1"}}, {"name": "graphs-on", "env_remove": ["GGML_CUDA_DISABLE_GRAPHS"]}],
+                       "metric": "decode t/s median"}
+            else:
+                notes.append("Most kernel launches are under 20 us: decode is launch-count sensitive; with CUDA graphs on, fewer kernels per token (fusion, in the runtime) is the lever.")
         out.append(_finding("kernel_time_share_%s" % mode, "%s GPU time: %s" % (mode.capitalize(), ", ".join("%s %.0f%%" % (k, v) for k, v in top)), "info", "confirmed", "active", meas,
                             "Kernel-class shares say where a kernel-level optimization would have to land to matter; a class under 10%% cannot give more than 10%% of that phase.",
                             experiment=exp, notes=notes or None))
@@ -1249,10 +1264,8 @@ def rank_key(f):
     return (2, -(b or 0) * CONFIDENCE_WEIGHT.get(f["confidence"], 0.2), SEVERITY_RANK.get(f["severity"], 9))
 
 
-def diagnose(records, bandwidth_gbs=None, cfg=None):
-    conditions = cache_conditions(records)
-    ev = apply_local_config(collect(records), cfg)
-    label, arm = _baseline_arm(ev)
+def run_rules(ev, label, arm, bandwidth_gbs=None):
+    """Every rule on one arm; findings annotated with impact and ranked."""
     findings = []
     f = rule_coverage(ev)
     if f:
@@ -1287,6 +1300,24 @@ def diagnose(records, bandwidth_gbs=None, cfg=None):
         if imp:
             f["impact"] = imp
     findings.sort(key=rank_key)
+    return findings, shares
+
+
+def _winner(rec, verdict):
+    """The candidate arm a verdict found faster: a `keep`, else a `faster ... outputs differ` (which assumes the user
+    accepts the difference). None when no candidate improved."""
+    rows = [r for r in verdict["arms"] if r["verdict"].startswith(("keep", "faster"))]
+    if not rows:
+        return None
+    rows.sort(key=lambda r: (not r["verdict"].startswith("keep"), (r["metrics"].get("wall_ms") or {}).get("ratio", 1.0)))
+    return rows[0]
+
+
+def diagnose(records, bandwidth_gbs=None, cfg=None):
+    conditions = cache_conditions(records)
+    ev = apply_local_config(collect(records), cfg)
+    label, arm = _baseline_arm(ev)
+    base_findings, shares = run_rules(ev, label, arm, bandwidth_gbs)
     verdicts = []
     for r in ev["experiments"]:
         v = experiment_verdict(r)
@@ -1294,9 +1325,10 @@ def diagnose(records, bandwidth_gbs=None, cfg=None):
             continue
         # an experiment written by `propose` names the finding it tests; carry that finding's risks as caveats
         prov = ((r.get("spec_redacted") or {}).get("provenance") or {})
-        origin = next((f for f in findings if f["id"] == prov.get("finding")), None)
+        if prov.get("finding"):
+            v["tests_finding"] = prov["finding"]
+        origin = next((f for f in base_findings if f["id"] == prov.get("finding")), None)
         if origin:
-            v["tests_finding"] = origin["id"]
             v["caveats"] = list(origin.get("risks") or [])
         # a flag that trades prefix reuse for per-request overhead: its production applicability depends on real traffic's reuse pattern
         if prov.get("experiment_kind") == "server_overhead_flags" or any("--cache-ram" in str(a.get("args_override")) or "--ctx-checkpoints" in str(a.get("args_override"))
@@ -1313,6 +1345,20 @@ def diagnose(records, bandwidth_gbs=None, cfg=None):
                 if row["verdict"].startswith("keep"):
                     row["verdict"] += " - " + gate
         verdicts.append(v)
+    # what remains: after an experiment whose candidate was faster, the remaining findings describe that candidate, so the
+    # next proposal builds on the improvement instead of re-diagnosing the configuration it replaced
+    findings, diagnosed_why, baseline_from = base_findings, None, None
+    newest = ev["experiments"][-1] if ev["experiments"] else None
+    v_new = next((v for v in verdicts if newest is not None and v["experiment"] == newest.get("name")), None)
+    win = _winner(newest, v_new) if v_new else None
+    if win and "%s/%s" % (newest["name"], win["arm"]) in ev["arms"]:
+        label = "%s/%s" % (newest["name"], win["arm"])
+        arm = ev["arms"][label]
+        findings, shares = run_rules(ev, label, arm, bandwidth_gbs)
+        diagnosed_why = ("the candidate the verdict found faster (%s); the replaced configuration %s is described by the verdict%s" % (
+            win["arm"], win["vs"], "" if win["verdict"].startswith("keep") else
+            ". This assumes you accept the output differences the verdict reports; otherwise the replaced configuration still stands"))
+        baseline_from = "experiment arm %s (faster than %s in the verdict)" % (label, win["vs"])
     # a finding whose experiment has been run in these records is settled by its verdict: do not recommend it again
     tested = {v["tests_finding"]: v for v in verdicts if v.get("tests_finding")}
     for f in findings:
@@ -1329,15 +1375,18 @@ def diagnose(records, bandwidth_gbs=None, cfg=None):
                         and isinstance(f["experiment"].get("arms"), list) and f["severity"] in ("high", "medium")), None)
     obs = ev.get("observed_launch") or {}
     return {"kind": "diagnosis", "evidence_class": "hypothesis" if not ev["experiments"] else "controlled", "sources": ev["sources"], "diagnosed_arm": label,
-            "cache_conditions": conditions, "phase_shares": shares, "rank_basis": RANK_BASIS,
+            "diagnosed_arm_reason": diagnosed_why, "cache_conditions": conditions, "phase_shares": shares, "rank_basis": RANK_BASIS,
             "observed_launch": {"args_redacted": obs.get("argv_redacted"), "source": obs.get("settings_source"), "describe": obs.get("describe")} if obs else None,
-            "baseline_args": (arm or {}).get("args"), "findings": findings, "experiment_verdicts": verdicts, "insufficient_evidence": insufficiencies(ev, arm),
+            "baseline_args": (arm or {}).get("args"), "baseline_from_verdict": baseline_from,
+            "findings": findings, "experiment_verdicts": verdicts, "insufficient_evidence": insufficiencies(ev, arm),
             "recommended_next_experiment": {"finding": recommended["id"], **recommended["experiment"]} if recommended else None}
 
 
 def diagnosis_brief(d, path=None, discovery=None, top=5):
     """The short form `inspect` prints: the top problems with what is known and what is not, and the exact next step."""
     L = ["# Diagnosis of %s" % d.get("diagnosed_arm")]
+    if d.get("diagnosed_arm_reason"):
+        L.append("(%s)" % d["diagnosed_arm_reason"])
     if d.get("phase_shares"):
         p = d["phase_shares"]
         L.append("Time split: prefill %s, decode %s, other %s (%s)" % tuple(
@@ -1366,6 +1415,9 @@ def diagnosis_brief(d, path=None, discovery=None, top=5):
         L += ["", "Not established by this evidence:"] + ["- %s" % g for g in gaps[:3]]
     rec = d.get("recommended_next_experiment")
     L += ["", "Next:"]
+    top = shown[0] if shown else None
+    if top and isinstance((top.get("experiment") or {}).get("arms"), str) and (not rec or rec["finding"] != top["id"]):
+        L.append("- for the top finding (%s): %s" % (top["id"], top["experiment"]["arms"]))
     if rec:
         out = "experiments/%s.json" % rec.get("kind", "next")
         n = 2
@@ -1387,7 +1439,8 @@ def diagnosis_brief(d, path=None, discovery=None, top=5):
 
 
 def diagnosis_markdown(d):
-    lines = ["# Diagnosis", "", "Sources: %s" % ", ".join(d["sources"]), "Diagnosed arm: %s" % d.get("diagnosed_arm"), ""]
+    lines = ["# Diagnosis", "", "Sources: %s" % ", ".join(d["sources"]), "Diagnosed arm: %s%s" % (
+        d.get("diagnosed_arm"), " - %s; the findings below are what remains on it" % d["diagnosed_arm_reason"] if d.get("diagnosed_arm_reason") else ""), ""]
     if d.get("cache_conditions"):
         lines += ["## Cache conditions of the measured requests", ""]
         for c in d["cache_conditions"]:
