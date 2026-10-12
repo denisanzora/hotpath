@@ -365,6 +365,10 @@ def improve(cfg, start_records, workload, out_dir, runner, max_experiments=3, ma
             vest = prop.estimate_minutes({"workload": vw, "arms": [{}, {}], "rounds": rounds, "repetitions": repetitions, "warmup": warmup, "cooldown_s": 5},
                                          diag.get("rates"), load_s=_measured_load_s(records))
             report["validation_estimate_minutes"] = vest["minutes"] if vest else None
+            report["plan_queue"] = [{"finding": x["id"], "title": x.get("title")} for x in diag.get("findings") or []
+                                    if x["id"] != f["id"] and executable(x, requests_wl) is None]
+            report["not_run_unattended"] = [{"finding": x["id"], "title": x.get("title"), "why": executable(x, requests_wl)}
+                                            for x in diag.get("findings") or [] if x.get("severity") in ("high", "medium") and executable(x, requests_wl)]
             stopped = "dry run: nothing launched"
             break
         log("step %d of at most %d: %s -> %s (%s; %.0f of %.0f budget minutes used)" % (
@@ -846,10 +850,13 @@ def improvement_markdown(rec):
               "   - arms: %s; variable: %s" % (", ".join(ns["arms"]), ns.get("variable")),
               "   - free VRAM needed: %s MiB; about %s min (rough: model loads and speeds are estimates)" % (
                   ns.get("min_free_vram_mib"), "%.0f" % ns["estimated_minutes"] if ns.get("estimated_minutes") else "?"),
-              "2. Then the next finding on whatever was adopted, up to the budget.",
+              "2. Then, re-diagnosed on whatever is adopted and within the budget: %s." % (
+                  "; ".join("%s (%s)" % (q["finding"], q["title"]) for q in rec.get("plan_queue") or []) or "no other finding is testable unattended now"),
               "3. If anything was adopted: a validation run of your original launch against the improved one on a broader workload%s." % (
                   " (about %.0f min)" % rec["validation_estimate_minutes"] if rec.get("validation_estimate_minutes") else ""),
-              "", "Safety: experiments run on hotpath's own llama-server (port %s); your server must be stopped by you if it holds the GPU; nothing is "
+              ""] + (["Not run unattended (they need a profile or your evidence, not a launch change):"] +
+                     ["- %s: %s" % (q["finding"], q["why"]) for q in rec.get("not_run_unattended") or []] + [""] if rec.get("not_run_unattended") else []) + [
+              "Safety: experiments run on hotpath's own llama-server (port %s); your server must be stopped by you if it holds the GPU; nothing is "
                   "applied to it." % ns.get("port", 8099), ""]
     if rec["steps"]:
         L += ["## What was tested", ""]
