@@ -408,6 +408,7 @@ def improve(cfg, start_records, workload, out_dir, runner, max_experiments=3, ma
             a = arm_of.get(r["arm"]) or {}
             if judged[r["arm"]][2]:
                 report["decisions"].append({"step": n, "arm": r["arm"], "change": _change_text(a), "verdict": r["verdict"],
+                                            "change_spec": {k: a.get(k) or ({} if k.endswith("override") else []) for k in ("args_override", "args_remove", "env_override", "env_remove")},
                                             "needs": judged[r["arm"]][1].replace("not adopted: ", ""), "fidelity": (r.get("fidelity") or {}).get("class"),
                                             "measured": _metric_line(r), "decomposition": decomposition(rows, arm_of, r["arm"])})
         if not row:
@@ -415,7 +416,10 @@ def improve(cfg, start_records, workload, out_dir, runner, max_experiments=3, ma
         else:
             step.update({"adopted": ok, "candidate": row["arm"], "verdict": row["verdict"], "why": why, "measured": _metric_line(row),
                          "fidelity": (row.get("fidelity") or {}).get("class"), "caveats": verdict.get("caveats") or [],
-                         "other_arms": [{"arm": r["arm"], "verdict": r["verdict"].split(":")[0], "why": judged[r["arm"]][1]} for r in rows if r is not row]})
+                         "other_arms": [{"arm": r["arm"], "verdict": r["verdict"].split(":")[0],
+                                         "why": ("control arm (%s): wall ratio %s, outputs %s" % (arm_of[r["arm"]]["control"], ((r.get("metrics") or {}).get("wall_ms") or {}).get("ratio"),
+                                                                                                  (r.get("fidelity") or {}).get("class")))
+                                         if (arm_of.get(r["arm"]) or {}).get("control") else judged[r["arm"]][1]} for r in rows if r is not row]})
             if ok:
                 arm = arm_of[row["arm"]]
                 best["args"], best["env"] = materialize(spec["common_args"], spec.get("env"), arm)
@@ -450,8 +454,13 @@ def improve(cfg, start_records, workload, out_dir, runner, max_experiments=3, ma
                                runner, dry_run, bandwidth_gbs, log, report, shape)
     report["minutes_used"] = round(budget.minutes, 1)
     validated = report["result"].get("validated")
+    if validated and report.get("validated_steps") and len(report["validated_steps"]) < len(adopted_steps):
+        ch = _cum_change([st for st in adopted_steps if st["experiment"] in report["validated_steps"]])
+        cum = {"args": dict(ch["args_override"]), "args_remove": set(ch["args_remove"]), "env": dict(ch["env_override"]), "env_remove": set(ch["env_remove"])}
     report["recommended"] = recommended_launch(observed or args0, cum if validated else {"args": {}, "args_remove": set(), "env": {}, "env_remove": set()},
                                                bool(observed), validated=validated, adopted=bool(adopted_steps))
+    if not dry_run and budget.experiments:
+        validate_decisions(cfg, original, report, records, port, rounds, repetitions, warmup, n_predict, budget, sdir, session, runner, log, shape)
     report["remaining"] = [{"id": f["id"], "title": f.get("title"), "confidence": f.get("confidence"), "next": (f.get("measured") or {}).get("how")}
                            for f in diag.get("findings") or [] if f.get("severity") in ("high", "medium") and f["id"] not in attempted][:5]
     rec = new_record("improvement", "controlled" if budget.experiments else "hypothesis", **report)
@@ -630,67 +639,131 @@ def _result(cfg, original, cum, adopted_steps, records, workload, port, rounds, 
     if not adopted_steps:
         return {"verdict": "no change adopted: the configuration you started from stands", "measured_by": None, "validated": None}
     # every adopted change is validated in one paired run of the original launch against the improved one, on a broader
-    # workload than the steps used; only that run supports a recommendation
+    # workload than the steps used; only such a run supports a recommendation. When the full set fails and it has more than
+    # one change, each change is validated alone (largest step gain first) while the budget allows, and the first that passes
+    # is recommended instead; every failed set that was faster is offered as a decision
+    # the original launch's own speed bounds every validation run (step 1's first arm is the original launch)
+    s1 = ((report.get("steps") or [{}])[0].get("measured") or {})
+    original = dict(original, rates={"prefill_tps": (s1.get("prefill_tps") or {}).get("baseline"), "decode_tps": (s1.get("decode_tps") or {}).get("baseline"),
+                                     "basis": "the original launch in step 1"})
+    candidates = [("all adopted changes", adopted_steps)]
+    if len(adopted_steps) > 1:
+        gain = lambda st: ((st.get("measured") or {}).get("wall_ms") or {}).get("ratio") or 1.0
+        candidates += [("only %s" % st["finding"], [st]) for st in sorted(adopted_steps, key=gain)]
+    tried = []
+    for k, (label, steps_) in enumerate(candidates):
+        out = _validate(cfg, original, steps_, records, port, rounds, repetitions, warmup, n_predict, budget, sdir, session, runner, log, shape,
+                        "%s-confirm" % session if k == 0 else "%s-confirm-%d" % (session, k + 1))
+        out["label"] = label
+        tried.append(out)
+        if out.get("validated") or out.get("stop"):
+            break
+        if out.get("row") and (out["row"].get("verdict") or "").startswith(("faster", "keep")):
+            report["decisions"].append({"step": "validation", "arm": label, "change": _change_text(_cum_change(steps_)), "verdict": out["row"]["verdict"],
+                                        "needs": out["why"].replace("not adopted: ", ""), "fidelity": (out["row"].get("fidelity") or {}).get("class"),
+                                        "measured": _metric_line(out["row"]), "decomposition": None})
+    report["validations"] = [{k: v for k, v in t.items() if k not in ("row", "steps")} for t in tried]
+    last = tried[-1]
+    report["confirmation"] = (last if last.get("validated") else tried[0]).get("confirmation")
+    if last.get("validated"):
+        kept = last["steps"]
+        report["validated_steps"] = [st["experiment"] for st in kept]
+        if len(kept) < len(adopted_steps):
+            last["verdict"] += " (validated without %s, which did not pass alone or together)" % ", ".join(st["finding"] for st in adopted_steps if st not in kept)
+        return {"verdict": last["verdict"], "measured_by": last["measured_by"], "measured": last.get("measured"), "validated": True,
+                "validated_changes": [st["finding"] for st in kept], "basis": last["basis"]}
+    first = tried[0]
+    return {"verdict": "not validated: %s; your original launch stays the recommendation%s" % (
+                first["why"].replace("not adopted: ", ""), ". Validation run: %s" % first["row"]["verdict"] if first.get("row") else ""),
+            "measured_by": first.get("measured_by"), "measured": first.get("measured"), "validated": False}
+
+
+def validate_decisions(cfg, original, report, records, port, rounds, repetitions, warmup, n_predict, budget, sdir, session, runner, log, shape):
+    """A step-level decision (a smaller context) was measured on the step workload only; validate the fastest such option
+    against the original launch on the same broad workload the adopted changes faced, so the user decides on evidence of
+    the same standard. Within the time budget; the result is attached to the decision, nothing is adopted."""
+    cands = [d for d in report.get("decisions") or [] if isinstance(d.get("step"), int) and d.get("change_spec") and "context" in (d.get("needs") or "")]
+    if not cands:
+        return
+    cands.sort(key=lambda d: (((d.get("measured") or {}).get("wall_ms") or {}).get("ratio") or 1.0))
+    d = cands[0]
+    s1 = ((report.get("steps") or [{}])[0].get("measured") or {})
+    orig = dict(original, rates={"prefill_tps": (s1.get("prefill_tps") or {}).get("baseline"), "decode_tps": (s1.get("decode_tps") or {}).get("baseline"),
+                                 "basis": "the original launch in step 1"})
+    pseudo = {"finding": "option %s" % d["arm"], "step": d["step"], "experiment": d["arm"], "change": d["change_spec"], "measured": d.get("measured")}
+    out = _validate(cfg, orig, [pseudo], records, port, rounds, repetitions, warmup, n_predict, budget, sdir, session, runner, log, shape,
+                    "%s-option-%s" % (session, d["arm"]))
+    row = out.get("row")
+    fid = (row.get("fidelity") or {}) if row else {}
+    d["validation"] = {"run": out.get("measured_by"), "verdict": out.get("verdict"), "measured": out.get("measured"), "fidelity": fid.get("class"),
+                       "fidelity_why": fid.get("why"),
+                       "summary": ("validated on the broad workload: %s" % out["verdict"].split(" [")[0]) if row else out.get("verdict")}
+
+
+def _cum_change(steps_):
+    c = {"args_override": {}, "args_remove": [], "env_override": {}, "env_remove": []}
+    for st in steps_:
+        ch = st.get("change") or {}
+        c["args_override"].update(ch.get("args_override") or {})
+        c["args_remove"] += [x for x in ch.get("args_remove") or [] if x not in c["args_remove"]]
+        c["env_override"].update(ch.get("env_override") or {})
+        c["env_remove"] += [x for x in ch.get("env_remove") or [] if x not in c["env_remove"]]
+    return c
+
+
+def _validate(cfg, original, steps_, records, port, rounds, repetitions, warmup, n_predict, budget, sdir, session, runner, log, shape, name):
+    """One validation run: the original launch against the original plus `steps_`' changes, on the broader workload."""
+    ch = _cum_change(steps_)
     improved = {"name": "improved"}
-    if cum["args"]:
-        improved["args_override"] = dict(cum["args"])
-    if cum["args_remove"]:
-        improved["args_remove"] = sorted(cum["args_remove"])
-    if cum["env"]:
-        improved["env_override"] = dict(cum["env"])
-    if cum["env_remove"]:
-        improved["env_remove"] = sorted(cum["env_remove"])
+    for k in ("args_override", "args_remove", "env_override", "env_remove"):
+        if ch[k]:
+            improved[k] = ch[k]
     imp_args = materialize(original["args"], original["env"], improved)[0]
     vw, vbasis = validation_workload(sdir, shape, min(_ctx_tokens(original["args"]), _ctx_tokens(imp_args)), n_predict)
-    name = "%s-confirm" % session
-    spec = {"name": name, "description": "Validation by hotpath improve: your original launch against the launch with every adopted change (%s), on a "
-                                         "broader workload than the steps used. Several variables differ by design; the one-variable evidence for each "
-                                         "change is in its own step." % (", ".join(s["finding"] for s in adopted_steps)),
+    spec = {"name": name, "description": "Validation by hotpath improve: your original launch against the launch with %s, on a broader workload than the "
+                                         "steps used. Several variables may differ by design; the one-variable evidence for each change is in its own step." % (
+                                             ", ".join(st["finding"] for st in steps_)),
             "binary": "${runtime_binary}", "model": "${model_path}", "port": int(port), "common_args": list(original["args"]), "env": dict(original["env"]),
             "arms": [{"name": "original"}, improved], "workload": vw, "rounds": int(rounds), "repetitions": int(repetitions), "warmup": int(warmup),
             "cooldown_s": 5, "health_timeout_s": 600,
             "preconditions": {"sample_seconds": 5, "max_gpu_util_pct": 10, "min_free_vram_mib": 2000, "ports_must_be_free": [int(port)]},
-            "provenance": {"experiment_kind": "confirmation", "improve_session": session, "adopted_steps": [s["experiment"] for s in adopted_steps],
+            "provenance": {"experiment_kind": "confirmation", "improve_session": session, "adopted_steps": [st["experiment"] for st in steps_],
                            "workload_basis": vbasis}}
     if cfg.get("path_prepend"):
         spec["path_prepend"] = "${path_prepend}"
     need = [prop.vram_needed_mib(cfg, materialize(spec["common_args"], spec["env"], a)[0]) for a in spec["arms"]]
     if need and all(x is not None for x in need):
         spec["preconditions"]["min_free_vram_mib"] = max(need)
-    first = (adopted_steps[0].get("measured") or {})
-    rates = {"prefill_tps": (first.get("prefill_tps") or {}).get("baseline"), "decode_tps": (first.get("decode_tps") or {}).get("baseline"),
-             "basis": "the original launch in step %s" % adopted_steps[0]["step"]}
+    rates = original.get("rates")
     est = prop.estimate_minutes(spec, rates, load_s=_measured_load_s(records))
+    base = {"steps": steps_, "measured_by": None, "validated": False}
     if est:
         spec["provenance"]["estimated_duration"] = est
         if est["minutes"] > budget.time_left():
-            return {"verdict": "not validated: the final original-vs-improved run needs about %.0f min and %.0f min of the budget are left; your original "
-                               "launch stays the recommendation (raise --max-minutes, or --resume this session with a larger budget)" % (
-                                   est["minutes"], max(0.0, budget.time_left())), "measured_by": None, "validated": False}
-    path = sdir / "confirm.json"
+            return dict(base, verdict="not validated: the validation run needs about %.0f min and %.0f min of the budget are left (raise --max-minutes, or "
+                                      "--resume this session with a larger budget)" % (est["minutes"], max(0.0, budget.time_left())),
+                        why="not adopted: the budget ran out before validation", stop=True)
+    path = sdir / ("%s.json" % name.replace(session + "-", ""))
     path.write_text(json.dumps(spec, indent=2) + "\n", encoding="utf-8")
-    log("validating: original vs improved (%s) on %d prompts%s" % (", ".join(s["finding"] for s in adopted_steps), 6,
-                                                                    ", about %.0f min" % est["minutes"] if est else ""))
+    log("validating: original vs %s on %d prompts%s" % (", ".join(st["finding"] for st in steps_), 6, ", about %.0f min" % est["minutes"] if est else ""))
     t0 = time.time()
     try:
         rec = runner(spec, str(path))
     except SystemExit as e:
-        return {"verdict": "not validated: %s; your original launch stays the recommendation" % e, "measured_by": None, "validated": False}
+        return dict(base, verdict="not validated: %s" % e, why="not adopted: %s" % e, stop=True)
     finally:
         budget.minutes += max((time.time() - t0) / 60.0, 0.0)
     rpath = _write_exp(rec, sdir, name)
     v = dg.experiment_verdict(rec)
     row = (v or {}).get("arms", [None])[0] if v else None
     if not row:
-        return {"verdict": "not validated: the validation run produced no comparison", "measured_by": name, "validated": False}
+        return dict(base, measured_by=name, verdict="not validated: the validation run produced no comparison", why="not adopted: no comparison")
     ok, why, _ = adoptable(row, v, improved, rec.get("arms"), "original", cfg)
-    report["confirmation"] = {"experiment": name, "record": rpath.name, "verdict": row["verdict"], "workload_basis": vbasis, "measured": _metric_line(row),
-                              "fidelity": row.get("fidelity"), "passed": ok, "why": why}
-    if not ok:
-        return {"verdict": "not validated: %s; your original launch stays the recommendation. Validation run: %s" % (why.replace("not adopted: ", ""), row["verdict"]),
-                "measured_by": name, "measured": _metric_line(row), "validated": False}
-    return {"verdict": row["verdict"], "measured_by": name, "measured": _metric_line(row), "validated": True,
-            "basis": "one paired run of your original launch against the launch with every adopted change, on a broader workload (%s)" % vbasis}
+    conf = {"experiment": name, "record": rpath.name, "verdict": row["verdict"], "workload_basis": vbasis, "measured": _metric_line(row),
+            "fidelity": row.get("fidelity"), "passed": ok, "why": why}
+    return dict(base, measured_by=name, row=row, why=why, verdict=row["verdict"], measured=_metric_line(row), validated=ok, confirmation=conf,
+                basis="one paired run of your original launch against the launch with %s, on a broader workload (%s)" % (
+                    ", ".join(st["finding"] for st in steps_), vbasis))
 
 
 def recommended_launch(user_args, cum, observed, validated=True, adopted=False):
@@ -789,7 +862,7 @@ def improvement_markdown(rec):
             if st.get("change"):
                 L.append("   - change: %s" % _change_text(st["change"]))
             for o in st.get("other_arms") or []:
-                L.append("   - other arm %s: %s" % (o["arm"], o["why"].replace("not adopted: ", "")))
+                L.append("   - %s %s: %s" % ("" if o["why"].startswith("control arm") else "other arm", o["arm"], o["why"].replace("not adopted: ", "")))
         L.append("")
     if rec.get("decisions"):
         L += ["## Needs your decision", "", "Measured faster, but not adopted because only you can accept the trade-off:", ""]
@@ -797,12 +870,19 @@ def improvement_markdown(rec):
             w = (d.get("measured") or {}).get("wall_ms") or {}
             o = (d.get("measured") or {}).get("outputs") or {}
             same = ("outputs identical on %s/%s prompts" % (o.get("identical"), o.get("prompts_compared"))) if o.get("prompts_compared") else "outputs not compared"
-            L.append("- step %d, %s (`%s`): wall %s -> %s, %s%s" % (d["step"], d["arm"], d["change"], _fmt(w.get("baseline"), "wall_ms"),
+            L.append("- %s, %s (`%s`): wall %s -> %s, %s%s" % ("step %d" % d["step"] if isinstance(d["step"], int) else d["step"], d["arm"], d["change"], _fmt(w.get("baseline"), "wall_ms"),
                                                                   _fmt(w.get("candidate"), "wall_ms"), same,
                                                                   " (%s)" % d["fidelity"] if d.get("fidelity") else ""))
             L.append("  - trade-off: %s" % d["needs"])
             if d.get("decomposition"):
                 L.append("  - %s" % d["decomposition"]["reading"])
+            if d.get("validation"):
+                v = d["validation"]
+                vw = ((v.get("measured") or {}).get("wall_ms") or {})
+                L.append("  - %s%s%s" % (v.get("summary") or "", "; wall %s -> %s" % (_fmt(vw.get("baseline"), "wall_ms"), _fmt(vw.get("candidate"), "wall_ms")) if vw else "",
+                                           "; outputs: %s" % v["fidelity"] if v.get("fidelity") else ""))
+            elif isinstance(d.get("step"), int):
+                L.append("  - measured on the step workload only (3 prompts); not validated on the broad workload (budget)")
         L += ["", "To accept one, add its change to your launch yourself; `hotpath improve` will then start from it.", ""]
     L += ["## Measured result", ""]
     if res.get("basis"):
