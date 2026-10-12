@@ -61,9 +61,13 @@ def baseline_args(diagnosis_record, cfg, override=None):
     return list(DEFAULT_COMMON_ARGS), "hotpath defaults (adapt --ctx-size and --gpu-layers to your model)"
 
 
+COMPUTE_ALLOWANCE_MIB = 512
+
+
 def vram_needed_mib(cfg, args):
-    """Free VRAM an experiment arm needs before launch: the model's weight bytes plus 10%, when the model file is
-    known; None otherwise (then the spec keeps a generic floor). The arm's real footprint is measured per arm."""
+    """Free VRAM an experiment arm needs before launch, from the GGUF header: the weights on the GPU (+10%), the KV cache at
+    the arm's context size and KV types, and a compute-buffer allowance; None when the model file is unknown (then the
+    spec keeps a generic floor). An estimate for the precondition only; the arm's real footprint is measured per arm."""
     from hotpath import gguf
     mp = cfg.get("model_path")
     if not mp or not Path(mp).is_file():
@@ -73,9 +77,18 @@ def vram_needed_mib(cfg, args):
     except (OSError, ValueError, KeyError):
         return None
     from hotpath.launch import int_or_none, get
+    from hotpath.diagnose import KV_TYPE_FACTOR
     ngl = int_or_none(get(args, "n_gpu_layers"))
     frac = 1.0 if ngl is None or not s.get("n_layer") else min(1.0, max(0, ngl) / (s["n_layer"] + 1))
-    return int(s["total_bytes"] / (1 << 20) * frac * 1.1)
+    need = s["total_bytes"] / (1 << 20) * frac * 1.1
+    ctx = int_or_none(get(args, "ctx_size")) or 4096
+    if s.get("kv_bytes_per_token_f16") and ctx > 0:
+        fk = KV_TYPE_FACTOR.get(str(get(args, "cache_type_k") or "f16").lower(), 1.0)
+        fv = KV_TYPE_FACTOR.get(str(get(args, "cache_type_v") or "f16").lower(), 1.0)
+        need += s["kv_bytes_per_token_f16"] * ctx * (fk + fv) / 2 / (1 << 20) * frac
+    if frac > 0:
+        need += COMPUTE_ALLOWANCE_MIB
+    return int(need)
 
 
 # llama-server arguments the experiment runner owns or that must never be shared with the user's own server: it adds
@@ -169,7 +182,7 @@ def build_spec(finding, cfg, common_args, workload, port=8099, rounds=3, repetit
 LAUNCH_S_ASSUMED = 30
 
 
-def estimate_minutes(spec, rates):
+def estimate_minutes(spec, rates, load_s=None):
     """Rough duration of a run from the diagnosed configuration's own prefill/decode rates and the workload's size, for
     planning (and for an agent's polling); every arm is assumed to run at the baseline's rates, so a faster candidate
     finishes sooner. Model load time is an assumption. None when rates or the workload are unknown."""
@@ -187,11 +200,13 @@ def estimate_minutes(spec, rates):
         n_predict = spec.get("n_predict") or w.get("n_predict") or 64
         sizes = [(1.2 * (p.get("words") or len(p["text"].split())) + 15, n_predict) for p in w["prompts"]]
     per_pass = sum(t / rates["prefill_tps"] + n / rates["decode_tps"] + 0.2 for t, n in sizes)
-    per_launch = (int(spec.get("warmup", 1)) + int(spec.get("repetitions", 2))) * per_pass + LAUNCH_S_ASSUMED + float(spec.get("cooldown_s", 5))
+    load = float(load_s) if load_s else LAUNCH_S_ASSUMED
+    per_launch = (int(spec.get("warmup", 1)) + int(spec.get("repetitions", 2))) * per_pass + load + float(spec.get("cooldown_s", 5))
     launches = int(spec.get("rounds", 3)) * len(spec["arms"])
     return {"minutes": round(launches * per_launch / 60.0, 1),
-            "basis": "baseline rates %.0f/%.1f t/s prefill/decode (%s) for every arm, prompt tokens estimated from the workload, %d s per model load assumed" % (
-                rates["prefill_tps"], rates["decode_tps"], rates.get("basis"), LAUNCH_S_ASSUMED)}
+            "basis": "baseline rates %.0f/%.1f t/s prefill/decode (%s) for every arm, prompt tokens estimated from the workload, %s" % (
+                rates["prefill_tps"], rates["decode_tps"], rates.get("basis"),
+                "%.0f s per model load (measured)" % load if load_s else "%d s per model load assumed" % LAUNCH_S_ASSUMED)}
 
 
 def _arm_args(common, arm):
@@ -232,7 +247,7 @@ def propose(diagnosis_path, finding_id, cfg, workload, out_path, common_args=Non
     need = [vram_needed_mib(cfg, _arm_args(args, a)) for a in spec["arms"]]
     if all(n is not None for n in need) and need:
         spec["preconditions"]["min_free_vram_mib"] = max(need)
-        spec["provenance"]["min_free_vram_basis"] = "model weights on the GPU + 10% for the largest arm (estimate from the GGUF header)"
+        spec["provenance"]["min_free_vram_basis"] = "weights on the GPU + 10%, KV cache at the arm's context and KV types, 512 MiB compute, for the largest arm (estimate from the GGUF header)"
     if removed:
         spec["provenance"]["removed_server_args"] = sorted(set(removed))
     spec["provenance"]["diagnosis"] = Path(diagnosis_path).name

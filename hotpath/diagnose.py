@@ -667,6 +667,25 @@ def memory_estimate(ev, arm, o):
             "assumptions": assumptions}
 
 
+def kv_requant_arm(est, settings, on_gpu, total):
+    """When no more layers fit with an f16 KV cache: an arm that stores K and V in q8_0 (about half the bytes) and uses the
+    freed memory for more layers, if the same estimate says at least two more then fit. None otherwise (the KV cache is
+    already quantized, too small to matter, or the freed memory is not enough)."""
+    kt, vt = str(settings.get("cache_type_k") or "f16").lower(), str(settings.get("cache_type_v") or "f16").lower()
+    if kt not in ("f16", "bf16") or vt not in ("f16", "bf16") or not est.get("kv_mib") or not total:
+        return None
+    kv_q8 = est["kv_mib"] * KV_TYPE_FACTOR["q8_0"]
+    per_layer = est["weights_mib"] / total
+    if per_layer <= 0:
+        return None
+    fit = int(max(0.0, est["free_mib"] * 0.95 - kv_q8 - est["compute_mib"]) // per_layer)
+    fit = min(fit, total)
+    if fit < on_gpu + 2:
+        return None
+    return {"name": "kvq8-ngl%d" % fit, "args_override": {"--cache-type-k": "q8_0", "--cache-type-v": "q8_0", "--flash-attn": "on", "--gpu-layers": fit},
+            "estimate": "KV cache %.0f -> %.0f MiB frees about %.0f MiB, room for %d layers instead of %d" % (est["kv_mib"], kv_q8, est["kv_mib"] - kv_q8, fit, on_gpu)}
+
+
 def rule_offload(ev, label, arm):
     o = offload_evidence(ev, arm)
     if not o:
@@ -705,13 +724,22 @@ def rule_offload(ev, label, arm):
         elif est["layers_that_fit"] and est["layers_that_fit"] > n + 1:
             arms = [current, {"name": "ngl%d" % est["layers_that_fit"], "args_override": {"--gpu-layers": est["layers_that_fit"]}}]
         else:
-            how = ("by the estimate no more layers fit (need %d MiB for all layers, about %d MiB free): free VRAM first (close other GPU programs), shrink the KV cache "
-                   "(smaller --ctx-size, or -ctk q8_0 -ctv q8_0 with flash attention), or use a smaller quantization; then compare against the current launch" % (est["need_all_layers_mib"], est["free_mib"]))
+            kvq = kv_requant_arm(est, s, n, m)
+            if kvq:
+                arms = [current, kvq]
+            else:
+                how = ("by the estimate no more layers fit (need %d MiB for all layers, about %d MiB free): free VRAM first (close other GPU programs), shrink the KV cache "
+                       "(smaller --ctx-size, or -ctk q8_0 -ctv q8_0 with flash attention), or use a smaller quantization; then compare against the current launch" % (est["need_all_layers_mib"], est["free_mib"]))
     elif o["kind"] == "vram":
         how = "read the server's log for its 'offloaded N/M layers' line (start it with --log-file), or compare an explicit --gpu-layers %s against the current launch" % (m or "N")
-    experiment = {"kind": "gpu_layers", "variable": "--gpu-layers", "arms": arms or how,
+    kv_arm = bool(arms and any("--cache-type-k" in (a.get("args_override") or {}) for a in arms))
+    experiment = {"kind": "gpu_layers", "variable": "--gpu-layers" if not kv_arm else "KV cache type and --gpu-layers (memory moved from the KV cache to model layers)",
+                  "arms": arms or how,
                   "metric": "decode and prefill t/s and wall_ms medians; per-arm dedicated and shared (system-memory) VRAM; outputs equivalent",
-                  "note": "One variable: the number of GPU layers; context, KV types and microbatch stay as launched. The memory estimate behind the candidate is in the measurements."}
+                  "note": "One variable: the number of GPU layers; context, KV types and microbatch stay as launched. The memory estimate behind the candidate is in the measurements."
+                          if not kv_arm else
+                          "Two settings change together by design: an 8-bit KV cache (with flash attention, which llama.cpp needs for a quantized V cache) frees "
+                          "the memory that the extra GPU layers use; neither helps speed alone. Context and microbatch stay as launched."}
     return _finding("gpu_offload_partial", title, "high", confidence, (arm or {}).get("evidence_class") or "passive",
                     {"offload": {k: v for k, v in o.items() if k != "session"}, "memory_estimate": est, "deliberate_cpu_tensors": deliberate},
                     "Layers left on the CPU read their weights from system memory, typically tens of GB/s on a desktop against hundreds of GB/s of VRAM, and the GPU waits for them "
@@ -722,7 +750,11 @@ def rule_offload(ev, label, arm):
                     risks=["More GPU layers need more VRAM: a launch can fail with an allocation error, or on Windows silently spill to shared system memory (watch per-arm shared MiB); "
                            "either is reported by the experiment.",
                            "If the runtime's automatic fit chose this split, forcing more layers removes the memory margin it kept for the context and compute buffers."] +
-                          (["The CPU placement looks deliberate (expert tensors kept on the CPU); tune --n-cpu-moe rather than forcing everything onto the GPU."] if deliberate else []),
+                          (["The CPU placement looks deliberate (expert tensors kept on the CPU); tune --n-cpu-moe rather than forcing everything onto the GPU."] if deliberate else []) +
+                          (["An 8-bit KV cache stores attention keys and values with less precision: outputs can differ from the f16 cache, more so at long contexts; "
+                            "the verdict's output check shows it on this workload, not on every prompt.",
+                            "`--flash-attn on` needs a build that accepts on/off/auto; an older build fails to start, which the experiment reports as a launch failure."]
+                           if kv_arm else []),
                     known=known,
                     hypothesis="The CPU-resident layers set the pace of each token; with them in VRAM, decode and prefill rise and the request gets shorter.",
                     notes=["The decode-ceiling comparison below assumes all weights in VRAM; with a partial offload it is not the first thing to fix."])
@@ -1382,7 +1414,13 @@ def _winner(rec, verdict):
     return rows[0]
 
 
-def diagnose(records, bandwidth_gbs=None, cfg=None):
+def diagnose(records, bandwidth_gbs=None, cfg=None, focus=None):
+    """Ranked findings for one configuration in the records, plus verdicts for every finished experiment.
+
+    The configuration described is, by default, the candidate the newest verdict found faster, else the newest
+    experiment's first arm, else the newest measurement or the server log. `focus` ("experiment/arm") names it
+    explicitly; the improve loop uses it for the configuration it has adopted, which is not always the newest winner
+    (a faster arm with different outputs, or a cache flag gated by real traffic, is not adopted)."""
     conditions = cache_conditions(records)
     ev = apply_local_config(collect(records), cfg)
     label, arm = _baseline_arm(ev)
@@ -1429,6 +1467,11 @@ def diagnose(records, bandwidth_gbs=None, cfg=None):
             win["arm"], win["vs"], "" if win["verdict"].startswith("keep") else
             ". This assumes you accept the output differences the verdict reports; otherwise the replaced configuration still stands"))
         baseline_from = "experiment arm %s (faster than %s in the verdict)" % (label, win["vs"])
+    if focus and focus in ev["arms"] and focus != label:
+        label, arm = focus, ev["arms"][focus]
+        findings, shares = run_rules(ev, label, arm, bandwidth_gbs)
+        diagnosed_why = "the configuration adopted so far (%s), named by the caller" % focus
+        baseline_from = "experiment arm %s (adopted)" % focus
     # a finding whose experiment has been run in these records is settled by its verdict: do not recommend it again
     tested = {v["tests_finding"]: v for v in verdicts if v.get("tests_finding")}
     for f in findings:

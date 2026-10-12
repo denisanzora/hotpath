@@ -1,6 +1,7 @@
 """Command line: init, tools, observe, triage, diagnose, propose, gguf, workload, measure, experiment, compare, bench, profile, kernels."""
 import argparse
 import json
+import shlex
 import os
 import sys
 from pathlib import Path
@@ -76,12 +77,10 @@ def cmd_diagnose(args):
     return 0
 
 
-def cmd_propose(args):
-    """Write an experiment spec for a diagnosis finding (one variable between arms), then show its dry-run plan."""
-    from hotpath import propose as prop_mod
-    cfg = load_local(args.local)
-    workload = args.workload or cfg.get("workload")
-    shape = (load_record(args.diagnosis).get("traffic_shape") or None) if not workload else None
+def choose_workload(workload, cfg, shape):
+    """The workload for an experiment: the one given, else `workload` in the config, else synthetic prompts sized like
+    the real traffic a diagnosis saw, else three default synthetic prompts. Generated files go to workloads/."""
+    workload = workload or cfg.get("workload")
     if not workload and shape:
         # synthetic prompts sized like the real traffic the diagnosis saw (p10 / median / p90 prompt tokens, median output),
         # so the experiment measures the request shape the user actually serves
@@ -99,6 +98,15 @@ def cmd_propose(args):
             w = wl_mod.build_workload("hotpath-default", 3, [450, 900, 1300], seed=1, n_predict=64, fmt="chatml")
             wl_mod.save_workload(w, workload)
             print("no workload given; wrote a default synthetic one: %s (3 ChatML prompts of 450/900/1300 words, n_predict 64)" % workload)
+    return workload
+
+
+def cmd_propose(args):
+    """Write an experiment spec for a diagnosis finding (one variable between arms), then show its dry-run plan."""
+    from hotpath import propose as prop_mod
+    cfg = load_local(args.local)
+    shape = (load_record(args.diagnosis).get("traffic_shape") or None) if not (args.workload or cfg.get("workload")) else None
+    workload = choose_workload(args.workload, cfg, shape)
     try:
         spec, source = prop_mod.propose(args.diagnosis, args.finding, cfg, workload, args.out, common_args=args.common_args, port=args.port,
                                         rounds=args.rounds, repetitions=args.repetitions, warmup=args.warmup, n_predict=args.n_predict, force=args.force)
@@ -323,6 +331,105 @@ def cmd_inspect(args):
     return 0
 
 
+def _experiment_runner(cfg, wait_s):
+    """Runs one spec file through the normal experiment runner (preconditions, own port, interleaving) and returns its
+    record with the comparison attached; server logs go next to the spec."""
+    def run(spec, spec_path):
+        resolved = exp_mod.load_spec(spec_path, cfg)
+        for k in ("binary", "model"):
+            if not resolved.get(k) or not Path(resolved[k]).exists():
+                raise SystemExit("error: %s %s does not exist; set %s in hotpath.local.json (`hotpath init --binary/--model`)" % (
+                    k, resolved.get(k), "runtime_binary" if k == "binary" else "model_path"))
+        rec = exp_mod.run(resolved, str(Path(spec_path).parent), wait_for_preconditions_s=wait_s)
+        rec["comparison"] = compare_mod.compare([rec])
+        return rec
+    return run
+
+
+def _last_observation(out, server_url, max_age_h=24):
+    """The newest observation in the results directory of the configured server that recorded its launch command line,
+    if it is less than a day old; None otherwise."""
+    import datetime as _dt
+    if not server_url:
+        return None
+    for p in sorted(Path(out).glob("observation-*.json"), reverse=True):
+        try:
+            rec = load_record(p)
+        except (OSError, ValueError):
+            continue
+        if ((rec.get("server") or {}).get("base_url") or "").rstrip("/") != server_url.rstrip("/"):
+            continue
+        if not ((rec.get("server_process") or {}).get("launch") or {}).get("available"):
+            continue
+        try:
+            age = _dt.datetime.now(_dt.timezone.utc) - _dt.datetime.fromisoformat(rec["created"])
+        except (KeyError, ValueError, TypeError):
+            continue
+        return (p, rec) if age.total_seconds() < max_age_h * 3600 else None
+    return None
+
+
+def cmd_improve(args):
+    """ACTIVE (unless --dry-run): diagnose, test the top finding with an experiment, adopt it only on a keep verdict, repeat
+    within the budget, confirm the cumulative change, and print the launch line to apply."""
+    from hotpath import diagnose as diag_mod
+    from hotpath import discover as disc
+    from hotpath import improve as imp
+    cfg = load_local(args.local)
+    if cfg.get("_missing"):
+        raise SystemExit("error: hotpath.local.json not found. Run `hotpath init` first: it finds your llama-server and model "
+                         "(`hotpath init --root DIR` when they live outside the standard locations).")
+    out = _out(args)
+    records, start = [], None
+    if args.from_records:
+        records = [load_record(p) for p in args.from_records]
+        start = "the records you named: %s" % ", ".join(Path(p).name for p in args.from_records)
+    else:
+        rec, full = _discover(args, cfg)
+        _write(full, args, "discovery", disc.discovery_markdown(rec))
+        live = disc.healthy_user_servers(rec)
+        base = args.server or cfg.get("server_url") if (args.server or cfg.get("server_url")) else (live[0]["base_url"] if len(live) == 1 else None)
+        if base and not args.server:
+            from hotpath import server as srv_mod
+            if srv_mod.health(base.rstrip("/")).get("status") == "unreachable":
+                base = live[0]["base_url"] if len(live) == 1 else None
+        if not base and len(live) > 1:
+            raise SystemExit("several llama-servers are running (%s); choose one with --server" % ", ".join(s["base_url"] for s in live))
+        saved = None if (base or args.log) else _last_observation(out, cfg.get("server_url"))
+        if saved:
+            # the usual sequence on one GPU: improve refused while the user's server held the VRAM, the user stopped it, and
+            # runs improve again; the last observation still has that server's launch command line, which a log alone lacks
+            path, obs = saved
+            records = [obs]
+            start = "the last observation of your server %s (%s, %s; it is not running now)" % (cfg.get("server_url"), path.name, obs.get("created"))
+        elif base or args.log or cfg.get("server_log"):
+            obs = observe_mod.observe(cfg, log_path=args.log, base_url=base, sample_seconds=5.0)
+            _write(obs, args, "observation", observe_mod.observation_markdown(obs))
+            records = [obs]
+            start = "your running server %s (observed passively)" % base if base else "your server log"
+            if live:
+                names = ", ".join("pid %s (%s)" % (s.get("pid"), s["base_url"]) for s in live)
+                print("note: your llama-server %s is running. Experiments run on hotpath's own server (port %d) and need the GPU memory it holds; "
+                      "hotpath never stops, restarts or reconfigures your server. Stop it yourself before the run, or pass --wait-s N." % (names, args.port))
+        else:
+            start = "no running server or log: a baseline of your configuration on hotpath's own server"
+    shape = None
+    if records and not (args.workload or cfg.get("workload")):
+        shape = diag_mod.diagnose(records, cfg=cfg).get("traffic_shape")
+    workload = choose_workload(args.workload, cfg, shape)
+    print("starting point: %s" % start)
+    rep = imp.improve(cfg, records, workload, out, _experiment_runner(cfg, args.wait_s), max_experiments=args.max_experiments,
+                      max_minutes=args.max_minutes, rounds=args.rounds, repetitions=args.repetitions, warmup=args.warmup, port=args.port,
+                      n_predict=args.n_predict, dry_run=args.dry_run, initial_args=shlex.split(args.args) if args.args else None, bandwidth_gbs=args.bandwidth_gbs,
+                      log=lambda m: print(m, flush=True))
+    print("")
+    print(imp.improvement_markdown(rep))
+    print("wrote %s" % rep["path"])
+    if args.dry_run and rep.get("next_step"):
+        print("\nNothing was launched. Run without --dry-run to start (ACTIVE: launches hotpath's own llama-server on port %d, one experiment at a time)." % args.port)
+    return 0
+
+
 def cmd_mcp(args):
     """Serve hotpath as MCP tools over stdio (see docs/agents.md)."""
     from hotpath import mcp_server
@@ -503,6 +610,24 @@ def build_parser():
     s.add_argument("--log", help="server log (default: the server's --log-file, else server_log in the config)")
     s.add_argument("--sample-seconds", type=float, default=5.0); s.add_argument("--bandwidth-gbs", type=float)
     s.set_defaults(fn=cmd_inspect)
+
+    s = sub.add_parser("improve", help="ACTIVE (unless --dry-run): test the top findings one experiment at a time on hotpath's own server, "
+                                       "adopt only keep verdicts, confirm the result, print the launch line to apply")
+    discovery_args(s)
+    s.add_argument("--from", dest="from_records", nargs="+", metavar="RECORD", help="start from these records (observation, measurement, diagnosis inputs) "
+                   "instead of observing the running server")
+    s.add_argument("--server", help="the running server to start from (default: server_url, else the only running llama-server)")
+    s.add_argument("--log", help="server log to diagnose from (default: the server's --log-file, else server_log)")
+    s.add_argument("--workload", help="workload file (default: 'workload' in the config, else synthetic prompts shaped like your observed traffic)")
+    s.add_argument("--args", help="starting llama-server arguments as one quoted string, when no server runs, e.g. --args \"-ngl 99 -c 8192\" "
+                   "(default: server_args, else defaults fitted to your GPU)")
+    s.add_argument("--max-experiments", type=int, default=3, help="experiments to run at most, not counting the baseline and the final confirmation (default 3)")
+    s.add_argument("--max-minutes", type=float, default=60, help="stop before a step whose estimated duration would exceed this (default 60)")
+    s.add_argument("--dry-run", action="store_true", help="passive: diagnose and write the first spec, launch nothing")
+    s.add_argument("--wait-s", type=int, default=0, help="wait up to this long for each experiment's preconditions (free GPU)")
+    s.add_argument("--port", type=int, default=8099); s.add_argument("--rounds", type=int, default=3); s.add_argument("--repetitions", type=int, default=2)
+    s.add_argument("--warmup", type=int, default=1); s.add_argument("--n-predict", type=int); s.add_argument("--bandwidth-gbs", type=float)
+    s.set_defaults(fn=cmd_improve)
 
     s = sub.add_parser("mcp", help="run the MCP server on stdio so AI coding agents can call hotpath (active tools are off unless HOTPATH_MCP_ALLOW_ACTIVE=1)")
     s.set_defaults(fn=cmd_mcp)

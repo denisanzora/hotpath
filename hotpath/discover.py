@@ -919,7 +919,16 @@ def suggest_config(rec, cfg, prefer=None):
         if len(working) == 1:
             out["runtime_binary"], src["runtime_binary"] = working[0]["binary"], working[0]["origin"]
         elif len(working) > 1:
-            amb["runtime_binary"] = [i["binary"] for i in working]
+            # with an NVIDIA GPU, an install whose CUDA backend starts is the one hotpath can measure on that GPU; when exactly
+            # one qualifies the choice is not a guess (Vulkan/CPU builds of the same version are alternatives, listed in the source)
+            cuda = [i for i in working if "cuda" in (i.get("backends") or [])]
+            if rec.get("gpus") and len(cuda) == 1:
+                others = [Path(i["binary"]).parent.name for i in working if i is not cuda[0]]
+                out["runtime_binary"] = cuda[0]["binary"]
+                src["runtime_binary"] = "%s; the only working install with a CUDA backend for the NVIDIA GPU (also found: %s; choose one with --binary)" % (
+                    cuda[0]["origin"], ", ".join(others))
+            else:
+                amb["runtime_binary"] = [i["binary"] for i in working]
     chosen = next((i for i in rec["installs"] if _resolved(i["binary"]) == _resolved(out.get("runtime_binary", ""))), None)
     if chosen:
         if _bin_dir_tools(chosen):

@@ -310,6 +310,59 @@ def _run(a):
     return argv
 
 
+_IMPROVE_PROPS = {
+    "max_experiments": {"type": "integer", "description": "Experiments to run at most (default 3), not counting the baseline and the final confirmation."},
+    "max_minutes": {"type": "number", "description": "Stop before a step whose estimated duration would exceed the time left (default 60)."},
+    "workload": {"type": "string", "description": "Workload file inside the working directory (default: synthetic prompts shaped like the observed traffic)."},
+    "from_records": {"type": "array", "items": _STR, "description": "Start from these records (inside the working directory) instead of observing the running server."},
+    "server": {"type": "string", "description": "The user's running server to start from (loopback URL); it is observed, never restarted or loaded."},
+    "args": {"type": "string", "description": "Starting llama-server arguments as one string, only when no server runs (default: server_args in the config, else defaults fitted to the GPU)."},
+}
+
+
+def _improve_argv(a, dry_run):
+    argv = ["improve", "--no-exec-roots"]
+    if dry_run:
+        argv.append("--dry-run")
+    if a.get("max_experiments") is not None:
+        argv += ["--max-experiments", str(int(a["max_experiments"]))]
+    if a.get("max_minutes") is not None:
+        argv += ["--max-minutes", str(float(a["max_minutes"]))]
+    if a.get("workload"):
+        argv += ["--workload", _inside_cwd(a["workload"], "workload")]
+    if a.get("from_records"):
+        argv += ["--from"] + [_inside_cwd(r, "record") for r in a["from_records"]]
+    if a.get("server"):
+        argv += ["--server", _loopback(a["server"], "server")]
+    if a.get("args"):
+        import shlex
+        bad = sorted({_flag_of(t) for t in shlex.split(a["args"]) if _flag_of(t) in _SPEC_FORBIDDEN_FLAGS})
+        if bad:
+            raise ValueError("args: %s not allowed: the runner supplies its own model, host and port, and an experiment server may not write files, "
+                             "authenticate or load other models" % ", ".join(bad))
+        argv.append("--args=" + a["args"])
+    if a.get("wait_s"):
+        argv += ["--wait-s", str(int(a["wait_s"]))]
+    return argv
+
+
+@tool("hotpath_improve_plan", "Passive dry run of hotpath_improve: diagnoses the starting point (the running server observed passively, or nothing "
+      "running) and writes the first experiment spec; reports the finding it would test, the arms, the free VRAM needed and a rough duration. "
+      "Launches nothing. Show this to the user before asking to run hotpath_improve.", _s(dict(_IMPROVE_PROPS)))
+def _improve_plan(a):
+    return _improve_argv(a, True)
+
+
+@tool("hotpath_improve", "ACTIVE, the whole loop in one job: tests the top finding with a one-variable experiment on hotpath's own llama-server "
+      "(never the user's), adopts a change only on a keep verdict (faster, consistent, identical outputs, verified cache state; cache flags "
+      "only with real-traffic evidence), repeats within the budget, confirms several adopted changes in one paired original-vs-improved run, "
+      "and reports the launch line to apply. Starts with a baseline run when no server or log exists. Uses the GPU for tens of minutes; runs as "
+      "a job (poll hotpath_job_status). Requires confirm=true and HOTPATH_MCP_ALLOW_ACTIVE=1. Changes nothing on the user's server.",
+      _s(dict(_IMPROVE_PROPS, wait_s=_INT, confirm=_CONFIRM, timeout_s=_TIMEOUT, wait_for_result_s=_RESULT_WAIT), ["confirm"]), active=True)
+def _improve(a):
+    return _improve_argv(a, False)
+
+
 @tool("hotpath_measure", "ACTIVE: run a workload against a running server that is listed in owned_servers in the local config. Requires confirm=true and HOTPATH_MCP_ALLOW_ACTIVE=1.",
       _s({"server": _STR, "workload": _STR, "repetitions": _INT, "warmup": _INT, "label": _STR, "confirm": _CONFIRM, "timeout_s": _TIMEOUT,
           "wait_for_result_s": _RESULT_WAIT}, ["server", "workload", "confirm"]), active=True)
@@ -597,7 +650,9 @@ def _instructions():
     return ("hotpath diagnoses local llama.cpp-family inference. Start with hotpath_inspect (passive: discovers the setup, observes the running "
             "server, diagnoses it and names the next step). Read-only tools are always on. Active tools (experiments, benchmarks, profiling, "
             "measure) are %s on this server%s; they need confirm=true after the user agrees, run as jobs (poll hotpath_job_status), and never "
-            "touch the user's own server: experiments launch their own llama-server on the spec's port. Specs come from hotpath_propose." % (
+            "touch the user's own server: experiments launch their own llama-server on the spec's port. When the user wants their setup "
+            "improved, show hotpath_improve_plan (passive) and, after they agree, run hotpath_improve: it runs the experiments, adopts only "
+            "keep verdicts and reports the launch line to apply. For single experiments, specs come from hotpath_propose." % (
                 "ENABLED" if _active_allowed() else "DISABLED", "" if _active_allowed() else " (the user must restart it with HOTPATH_MCP_ALLOW_ACTIVE=1)"))
 
 

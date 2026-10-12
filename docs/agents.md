@@ -53,6 +53,8 @@ If the client cannot find the command, use the absolute path to `hotpath-mcp` in
 | `hotpath_list_results` | read-only | lists `results/local` |
 | `hotpath_job_status` | read-only | state, progress and result of an active job |
 | `hotpath_job_cancel` | stops one of hotpath's own jobs | - |
+| `hotpath_improve_plan` | read-only dry run (writes the first spec) | `hotpath improve --dry-run` |
+| `hotpath_improve` | **active** (job): the whole loop | `hotpath improve` |
 | `hotpath_experiment_run` | **active** (job) | `hotpath experiment` |
 | `hotpath_measure` | **active** (job) | `hotpath measure` |
 | `hotpath_bench` | **active** (job) | `hotpath bench` |
@@ -75,6 +77,10 @@ An experiment takes minutes to hours, and clients limit how long one tool call m
 - Outputs are returned to the agent as text, including local paths from tool output. Do not connect this server to a client you do not trust with that information.
 
 ### The agent workflow
+
+When the user asks for their setup to be improved: `hotpath_improve_plan` (passive) shows the starting point, the first experiment, the free VRAM it needs and a rough duration; after the user agrees, `hotpath_improve` with `confirm=true` runs the loop as one job (poll `hotpath_job_status`). It adopts only `keep` verdicts, does not run cache-flag experiments without real-traffic reuse evidence, confirms two or more adopted changes in one paired original-vs-improved run, and ends with the launch line to apply. `args` (starting arguments when no server runs) refuses the same runner-owned and file-writing flags as agent-authored specs.
+
+Step by step:
 
 1. `hotpath_inspect`: the setup, its problems, and a ranked diagnosis of the running server with the next step. Read the confidence levels, the `known` / `hypothesis` split and "Not established by this evidence" before anything else.
 2. Optionally, with agreement: `hotpath_measure` against a server listed in `owned_servers` to add client wall time, or `hotpath_bench`.

@@ -432,7 +432,7 @@ class McpSpecGateTests(unittest.TestCase):
 
     def test_no_read_only_tool_is_active_and_every_active_tool_is_gated(self):
         for name, (_d, _s, active, _f) in mcp.TOOLS.items():
-            if name in ("hotpath_experiment_run", "hotpath_measure", "hotpath_bench", "hotpath_kernels", "hotpath_profile"):
+            if name in ("hotpath_experiment_run", "hotpath_measure", "hotpath_bench", "hotpath_kernels", "hotpath_profile", "hotpath_improve"):
                 self.assertTrue(active, name)
                 self.assertIn("confirm", _s["required"], name)
             else:

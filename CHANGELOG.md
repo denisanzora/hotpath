@@ -3,6 +3,10 @@
 ## Unreleased (0.3.0.dev0)
 
 ### Added
+- `hotpath improve`: the diagnose -> propose -> experiment -> verdict loop run for the user within a budget (`--max-experiments`, `--max-minutes` checked against each step's estimate). Each step tests the top finding with an executable experiment against the configuration adopted so far (arguments and environment), with one workload throughout; a change is adopted only on a `keep` verdict; two or more adopted changes are confirmed by one paired run of the original launch against the improved one, which is the only cumulative claim. Ends with the user's own launch line with the adopted changes; nothing is applied to the user's server. `--dry-run` is passive and shows the first experiment. With no server and no log it measures a baseline on hotpath's own server first (`server_args`, `--args`, or defaults with as many layers as the GGUF header and free VRAM allow). After a refusal because the user's server held the GPU, running it again once that server is stopped starts from the server's last observation.
+- MCP: `hotpath_improve_plan` (passive) and `hotpath_improve` (active job).
+- Diagnosis: when no more layers fit with an f16 KV cache, a candidate arm with an 8-bit KV cache and flash attention that uses the freed memory for more layers, when the estimate gives at least two; labelled as a two-setting change, with the output risk stated.
+- `init` chooses the only working install with a CUDA backend when an NVIDIA GPU is present, and names the others.
 - `hotpath discover`: the local setup without configuration, read-only and bounded. Running `llama-server` processes and their launch settings from the command line; loopback `/health`, `/props`, `/metrics`; installations (running, configured, `PATH`, standard locations, `--root` directories to a fixed depth, drive roots refused) with backends, sibling tools, and on Windows the imported DLLs that would not be found plus the CUDA toolkit directory that fixes them, verified with `--version`; GGUF headers with roles and VRAM fit; GPUs, driver CUDA version, profilers, logs, launch scripts. Lists where it looked and what it ran.
 - `hotpath init` now discovers: it writes the running server's URL, binary, model, log and launch arguments (and `path_prepend` when a build needs it), each with its source; it lists ambiguous candidates instead of guessing (`--binary`, `--model`, `--server` choose), `--update` adds keys without changing existing ones, `--template` keeps the old placeholder file.
 - `hotpath inspect`: discover + observe the running server + diagnose in one passive step, with the exact next commands and whether an experiment fits next to what runs now.
@@ -14,6 +18,9 @@
 - MCP: `hotpath_inspect` and `hotpath_discover`; active tools run as jobs (result within 45 s, or a job id), `hotpath_job_status` with progress, `hotpath_job_cancel`; concurrent request handling; running jobs are stopped when the client exits; refusals explain how to enable active tools in Claude Code and OpenCode; unknown or missing arguments get the tool's argument list.
 
 ### Changed
+- The free-VRAM precondition of proposed experiments includes the KV cache at the arm's context size and KV types and a 512 MiB compute allowance; before, it counted only the weights, so a long-context arm could start without the memory it needs.
+- Duration estimates use the model load time measured in the newest experiment instead of a fixed 30 s.
+- `diagnose` takes the configuration to describe from the caller (`focus`), used by the improve loop for the configuration it adopted.
 - Experiment preconditions that fail on VRAM, load or ports name the running `llama-server` processes and state that hotpath will not stop them.
 - Argument overrides in the runner and in `propose` match all spellings of an argument (`-ngl`/`--gpu-layers`/`--n-gpu-layers`, `-ub`/`--ubatch-size`, ...), so exactly one value reaches the server.
 - A decode-ceiling gap proposes a CUDA-graphs experiment only when the launch disables graphs, with the current state as the baseline arm; otherwise a decode profile.
@@ -26,6 +33,8 @@
 
 ### Validation
 Windows 11, RTX 2080 SUPER, a llama.cpp-derived CUDA build, one 27B ternary GGUF; a `llama-server` started by hand with `-ngl 56` of 65 layers as the user's server. Discovery, init and inspect found and diagnosed it; the proposed `-ngl 65` experiment refused to start while that server held the VRAM; after it was stopped, three runs (CLI, Claude Code through MCP, OpenCode through MCP) measured wall time per request 5.0 → 1.4 s (small workload) and 11.3–11.8 → 3.3 s (default workload), decode 7.7–8.5 → 48.1 t/s, +796–804 MiB, no shared-memory spill; outputs identical on the small workload and diverging deterministically on one of three prompts at token 51 of 64 on the default workload. On prompts shaped like the server's observed traffic: wall 7.24 → 1.92 s per request, outputs identical 3/3, verdict keep. Details in the README and docs/agents.md.
+
+`hotpath improve` on the same machine and model, with a user's server started by hand at `-c 49152 -ngl 40 -ub 128` and given 25 application-like requests: refused while that server held the GPU, then (server stopped) adopted an 8-bit KV cache with 57 GPU layers (keep, −58.9% wall) and `-ub 512` (keep, −5.9%), left `--cache-ram 0` (inconclusive) out, and confirmed the result in one paired run: wall 17.3 → 6.6 s per request (−61.5%), generation 3.4 → 9.0 t/s, +958 MiB, outputs identical 3/3. From nothing running: a baseline and one experiment whose 4.7% gain was correctly not adopted for lack of real-traffic reuse evidence.
 
 ## 0.2.0
 
