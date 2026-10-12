@@ -8,6 +8,8 @@ from pathlib import Path
 
 from hotpath import __version__
 from hotpath import adapters
+from hotpath import agentgate
+from hotpath import locks
 from hotpath import gguf as gguf_mod
 from hotpath import compare as compare_mod
 from hotpath import experiment as exp_mod
@@ -175,7 +177,13 @@ def cmd_measure(args):
 
 def cmd_experiment(args):
     cfg = load_local(args.local)
-    spec = exp_mod.load_spec(args.spec, cfg)
+    raw = None
+    if agentgate.active() and not args.dry_run:
+        try:
+            raw = agentgate.check_spec_file(args.spec)      # the MCP server checked the file; check what this process reads, too
+        except ValueError as e:
+            raise SystemExit("refused: %s" % e)
+    spec = exp_mod.load_spec(args.spec, cfg, raw=raw)
     if not args.dry_run:
         _require(spec.get("binary"), "runtime binary", "'binary' in the spec", "runtime_binary")
         _require(spec.get("model"), "model file", "'model' in the spec", "model_path")
@@ -335,7 +343,15 @@ def _experiment_runner(cfg, wait_s):
     """Runs one spec file through the normal experiment runner (preconditions, own port, interleaving) and returns its
     record with the comparison attached; server logs go next to the spec."""
     def run(spec, spec_path):
-        resolved = exp_mod.load_spec(spec_path, cfg)
+        raw = None
+        if agentgate.active():
+            # started by the MCP server: whatever wrote this spec (an agent, a saved session, the loop from an observed command
+            # line), it launches only what an agent-authored spec may carry, checked on the content that is launched
+            try:
+                raw = agentgate.check_spec_file(spec_path)
+            except ValueError as e:
+                raise SystemExit("refused: %s" % e)
+        resolved = exp_mod.load_spec(spec_path, cfg, raw=raw)
         for k in ("binary", "model"):
             if not resolved.get(k) or not Path(resolved[k]).exists():
                 raise SystemExit("error: %s %s does not exist; set %s in hotpath.local.json (`hotpath init --binary/--model`)" % (
@@ -369,6 +385,21 @@ def _last_observation(out, server_url, max_age_h=24):
     return None
 
 
+class _NoLock:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+def _session_gpu(args):
+    """An active improve run holds the machine-wide GPU lock from its first launch to its report (a dry run takes nothing)."""
+    if args.dry_run:
+        return _NoLock()
+    return locks.gpu_work("improve", args.resume or "new session", wait_s=args.wait_s, log=lambda m: print(m, flush=True))
+
+
 def cmd_improve(args):
     """ACTIVE (unless --dry-run): diagnose, test the top finding with an experiment, adopt it only on a keep verdict, repeat
     within the budget, confirm the cumulative change, and print the launch line to apply."""
@@ -386,10 +417,11 @@ def cmd_improve(args):
         print("note: interrupted improve session(s) can be continued instead of starting over: %s (`hotpath improve --resume NAME`; "
               "MCP: hotpath_improve with resume=NAME)" % ", ".join("%s (%d experiment(s) recorded)" % x for x in pending[-3:]))
     if args.resume:
-        rep = imp.improve(cfg, [], args.workload or "", out, None if args.dry_run else _experiment_runner(cfg, args.wait_s), max_experiments=args.max_experiments,
-                          max_minutes=args.max_minutes, rounds=args.rounds, repetitions=args.repetitions, warmup=args.warmup, port=args.port,
-                          n_predict=args.n_predict, bandwidth_gbs=args.bandwidth_gbs, session=args.resume, resume=True, dry_run=args.dry_run,
-                          log=lambda m: print(m, flush=True))
+        with _session_gpu(args):
+            rep = imp.improve(cfg, [], args.workload or "", out, None if args.dry_run else _experiment_runner(cfg, args.wait_s), max_experiments=args.max_experiments,
+                              max_minutes=args.max_minutes, rounds=args.rounds, repetitions=args.repetitions, warmup=args.warmup, port=args.port,
+                              n_predict=args.n_predict, bandwidth_gbs=args.bandwidth_gbs, session=args.resume, resume=True, dry_run=args.dry_run,
+                              log=lambda m: print(m, flush=True))
         print("")
         print(imp.improvement_markdown(rep))
         print("wrote %s" % rep["path"])
@@ -431,10 +463,11 @@ def cmd_improve(args):
         shape = diag_mod.diagnose(records, cfg=cfg).get("traffic_shape")
     workload = choose_workload(args.workload, cfg, shape)
     print("starting point: %s" % start)
-    rep = imp.improve(cfg, records, workload, out, None if args.dry_run else _experiment_runner(cfg, args.wait_s), max_experiments=args.max_experiments,
-                      max_minutes=args.max_minutes, rounds=args.rounds, repetitions=args.repetitions, warmup=args.warmup, port=args.port,
-                      n_predict=args.n_predict, dry_run=args.dry_run, initial_args=shlex.split(args.args) if args.args else None, bandwidth_gbs=args.bandwidth_gbs,
-                      log=lambda m: print(m, flush=True))
+    with _session_gpu(args):
+        rep = imp.improve(cfg, records, workload, out, None if args.dry_run else _experiment_runner(cfg, args.wait_s), max_experiments=args.max_experiments,
+                          max_minutes=args.max_minutes, rounds=args.rounds, repetitions=args.repetitions, warmup=args.warmup, port=args.port,
+                          n_predict=args.n_predict, dry_run=args.dry_run, initial_args=shlex.split(args.args) if args.args else None, bandwidth_gbs=args.bandwidth_gbs,
+                          log=lambda m: print(m, flush=True))
     print("")
     print(imp.improvement_markdown(rep))
     print("wrote %s" % rep["path"])
@@ -680,10 +713,19 @@ def _tolerant_console():
             pass
 
 
+_GPU_COMMANDS = {"cmd_bench": "bench", "cmd_profile": "profile", "cmd_kernels": "kernels", "cmd_measure": "measure"}
+
+
 def main(argv=None):
     _tolerant_console()
     args = build_parser().parse_args(argv)
+    # started by the MCP server: stop this process's servers and exit if that server is killed outright
+    locks.watch_parent()
     try:
+        kind = _GPU_COMMANDS.get(getattr(args.fn, "__name__", ""))
+        if kind:
+            with locks.gpu_work(kind, getattr(args, "label", None) or getattr(args, "mode", None), wait_s=getattr(args, "wait_s", 0) or 0):
+                return args.fn(args)
         return args.fn(args)
     except (OSError, ValueError, KeyError) as e:
         if os.environ.get("HOTPATH_DEBUG"):

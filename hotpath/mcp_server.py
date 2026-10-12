@@ -213,7 +213,14 @@ def _compare(a):
       _s({"out_file": _STR, "n_prompts": _INT, "words": {"type": "array", "items": _INT}, "n_predict": _INT, "format": {"type": "string", "enum": ["chatml", "raw"]},
           "from_requests": _STR, "limit": _INT}, ["out_file"]))
 def _workload(a):
-    argv = ["workload", _no_local_config_name(_inside_cwd(a["out_file"], "out_file"), "out_file")]
+    out = _no_local_config_name(_inside_cwd(a["out_file"], "out_file"), "out_file")
+    # a new .json file only: an agent may write a workload, never replace an existing file (the user's captured workload,
+    # a spec, a record or anything else in the working directory)
+    if not out.lower().endswith(".json"):
+        raise ValueError("out_file must be a .json file")
+    if Path(out).exists():
+        raise ValueError("out_file %s already exists; choose a new file name (hotpath_workload never replaces a file)" % Path(out).name)
+    argv = ["workload", out]
     if a.get("from_requests"):
         argv += ["--from-requests", _inside_cwd(a["from_requests"], "from_requests")]
         if a.get("limit"):
@@ -241,16 +248,11 @@ def _list(a):
     return None  # handled in-process, no child needed
 
 
-# Spec contents an agent may have written. The spec file is the one input that decides WHAT gets launched, so its fields are
-# checked here (not only its path): programs and models must come from the operator's hotpath.local.json via ${key}
-# references, environment overrides are limited to the variables that tune the runtime, and server arguments that move the
-# server off loopback, fetch a model from the network, or choose another model are refused.
-_SPEC_ENV_PREFIXES = ("GGML_", "LLAMA_", "CUDA_")
-# llama-server arguments an agent-authored spec may not carry: they write files (a log file is truncated on open), bind
-# or authenticate on the network, fetch from the network, or change which model or adapter files load. The runner always
-# supplies --model, --host 127.0.0.1 and --port itself, and the spec's own `slot_save_path` field covers that use and is
-# confined separately. `hotpath propose` strips the same flags from the baseline it copies from the user's config.
-from hotpath.propose import RUNNER_OWNED_FLAGS as _SPEC_FORBIDDEN_FLAGS  # noqa: E402
+# Spec contents an agent may have written. The spec file is the one input that decides WHAT gets launched, so its contents
+# are checked here, and again in the child on the content it actually launches (hotpath/agentgate.py): programs and models
+# only as ${key} references to the operator's hotpath.local.json, and only allowlisted llama-server tuning arguments and
+# runtime variables. `hotpath propose` strips runner-owned flags from the baseline it copies from the user's config.
+from hotpath import agentgate  # noqa: E402
 
 
 def _flag_of(token):
@@ -258,45 +260,10 @@ def _flag_of(token):
     return str(token).split("=", 1)[0]
 
 
-def _is_ref(v):
-    return isinstance(v, str) and len(v) > 3 and v.startswith("${") and v.endswith("}")
-
-
 def check_spec_for_agent(path):
-    """Raise ValueError if the spec would let an agent-authored file launch something other than the operator's configured runtime."""
-    with open(path, "r", encoding="utf-8") as f:
-        spec = json.load(f)
-    if not isinstance(spec, dict) or not isinstance(spec.get("arms"), list):
-        raise ValueError("spec is not an experiment spec (needs an `arms` list)")
-    problems = []
-
-    def fields(where, d):
-        for k in ("binary", "model"):
-            if k in d and not _is_ref(d[k]):
-                problems.append("%s: `%s` must be a ${key} reference into hotpath.local.json, not a path" % (where, k))
-        if "path_prepend" in d and not (_is_ref(d["path_prepend"]) or d["path_prepend"] in ([], None)):
-            problems.append("%s: `path_prepend` must be a ${key} reference" % where)
-        for envkey in ("env", "env_override"):
-            for k in (d.get(envkey) or {}):
-                if not str(k).startswith(_SPEC_ENV_PREFIXES):
-                    problems.append("%s: environment variable %s is not a GGML_/LLAMA_/CUDA_ runtime setting" % (where, k))
-        for k in (d.get("args_override") or {}):
-            if _flag_of(k) in _SPEC_FORBIDDEN_FLAGS:
-                problems.append("%s: server argument %s is not allowed in agent-run specs" % (where, k))
-    fields("spec", spec)
-    for a in spec["arms"]:
-        fields("arm %s" % a.get("name"), a)
-    for tok in spec.get("common_args") or []:
-        if _flag_of(tok) in _SPEC_FORBIDDEN_FLAGS:
-            problems.append("common_args: server argument %s is not allowed in agent-run specs" % _flag_of(tok))
-    ssp = spec.get("slot_save_path", False)
-    if isinstance(ssp, str) and ssp != "auto":
-        _inside_cwd(ssp, "slot_save_path")
-    if spec.get("workload"):
-        _inside_cwd(spec["workload"], "workload")
-    if problems:
-        raise ValueError("spec refused for an agent-run experiment: " + "; ".join(problems[:6]) +
-                         ". Put machine-specific values in hotpath.local.json and reference them as ${key}; the operator can run this spec from the CLI.")
+    """Raise ValueError if the spec would let an agent-authored file launch something other than the operator's configured
+    runtime with tuning settings (see hotpath/agentgate.py)."""
+    agentgate.check_spec_file(path)
 
 
 @tool("hotpath_experiment_run", "ACTIVE: launch the spec's arms as separate llama-server processes on the spec's port, interleaved, and record results. Uses the GPU for minutes to hours; runs as a job (poll hotpath_job_status). Requires confirm=true and HOTPATH_MCP_ALLOW_ACTIVE=1. The spec's contents are checked: binary/model must be ${key} references to the operator's config. wait_s waits for the GPU preconditions (free VRAM, idle GPU) before failing.",
@@ -337,10 +304,7 @@ def _improve_argv(a, dry_run):
         argv += ["--server", _loopback(a["server"], "server")]
     if a.get("args"):
         import shlex
-        bad = sorted({_flag_of(t) for t in shlex.split(a["args"]) if _flag_of(t) in _SPEC_FORBIDDEN_FLAGS})
-        if bad:
-            raise ValueError("args: %s not allowed: the runner supplies its own model, host and port, and an experiment server may not write files, "
-                             "authenticate or load other models" % ", ".join(bad))
+        agentgate.check_args_string(shlex.split(a["args"]), "args")
         argv.append("--args=" + a["args"])
     if a.get("wait_s"):
         argv += ["--wait-s", str(int(a["wait_s"]))]
@@ -434,7 +398,12 @@ def _kill_tree(proc):
 
 
 def _child_env():
+    from hotpath import locks
     env = dict(os.environ)
+    # every launch in the child is checked against the agent allowlist, and the child stops its servers and exits if this
+    # server is killed outright (no stdin close, so stop_all_jobs never ran)
+    env[agentgate.GATE_ENV] = "1"
+    env[locks.PARENT_ENV] = "%d:%s" % (os.getpid(), locks.process_start(os.getpid()) or "")
     env["PYTHONIOENCODING"] = "utf-8"
     env["PYTHONUNBUFFERED"] = "1"             # a job's progress lines reach its output file (and hotpath_job_status) as they happen
     # the child must import this same hotpath, also when it runs from a source checkout and the working directory is elsewhere
@@ -594,9 +563,16 @@ def _job_cancel(a):
 
 def _job_call(name, args):
     if name == "hotpath_job_status" and not args.get("job_id"):
+        from hotpath import locks
         with _JOBS_LOCK:
             rows = ["%s  %s  %s" % (j.id, j.tool, j.state()) for j in JOBS.values()]
-        return "\n".join(rows) or "no jobs started by this server", False
+            mine = {j.proc.pid for j in JOBS.values() if not j.done.is_set()}
+        holder = locks.gpu_holder()
+        if holder and holder.get("pid") not in mine:
+            # a job of an earlier MCP server (another session or client), or a CLI run: it holds the GPU and this server cannot poll it
+            rows.append("GPU in use by %s; not a job of this server: its records are in that working directory (results/local/), and an "
+                        "improve session there can be continued with resume once it ends" % locks.describe(holder))
+        return "\n".join(rows) or "no jobs started by this server; the GPU is not in use by hotpath", False
     with _JOBS_LOCK:
         job = JOBS.get(args.get("job_id"))
     if not job:
@@ -643,6 +619,9 @@ def call_tool(name, args):
     return _run_child(argv, timeout_s)
 
 
+# tools that change something beyond hotpath's own records in results/local: not advertised as read-only
+_WRITING_TOOLS = frozenset({"hotpath_job_cancel", "hotpath_workload", "hotpath_propose"})
+
 _OUT_LOCK = threading.Lock()
 _IN_FLIGHT = []
 
@@ -688,7 +667,7 @@ def handle(msg, threaded=False):
         _reply(mid, {})
     elif method == "tools/list":
         _reply(mid, {"tools": [{"name": n, "description": d + (" (active)" if act else ""), "inputSchema": s,
-                               "annotations": {"readOnlyHint": not act and n not in ("hotpath_job_cancel",), "destructiveHint": False, "openWorldHint": False}}
+                               "annotations": {"readOnlyHint": not act and n not in _WRITING_TOOLS, "destructiveHint": False, "openWorldHint": False}}
                               for n, (d, s, act, _f) in TOOLS.items()]})
     elif method == "tools/call":
         p = msg.get("params") or {}

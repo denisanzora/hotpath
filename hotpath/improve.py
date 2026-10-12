@@ -17,6 +17,7 @@ from pathlib import Path
 
 from hotpath import diagnose as dg
 from hotpath import launch
+from hotpath import locks
 from hotpath import propose as prop
 from hotpath.records import new_record, write_record
 
@@ -229,16 +230,56 @@ def identity_problem(records, cfg, identity):
     return None
 
 
+def spec_fingerprint(spec):
+    """What makes two runs of a step the same experiment: launch arguments, environment, arms, sizes, cache mode and the
+    workload's content (its set hash), not the spec's file name. A record is reused on resume only for this exact spec."""
+    import hashlib
+    from hotpath.workload import load_workload, workload_identity
+    try:
+        w = workload_identity(load_workload(spec["workload"]))
+        wl = [w.get("set_hash"), w.get("n_predict")]
+    except (OSError, ValueError, KeyError, TypeError):
+        wl = [Path(str(spec.get("workload"))).name, None]
+    keep = ("name", "args_override", "args_remove", "env_override", "env_remove", "request_override", "binary", "model", "control")
+    body = {"binary": spec.get("binary"), "model": spec.get("model"), "common_args": [str(a) for a in spec.get("common_args") or []],
+            "env": spec.get("env") or {}, "arms": [{k: a.get(k) for k in keep if a.get(k) is not None} for a in spec.get("arms") or []],
+            "sizes": [spec.get(k) for k in ("rounds", "repetitions", "warmup", "n_predict", "probe_top_k", "ignore_eos")],
+            "cache_mode": spec.get("cache_mode"), "schema_validation": spec.get("schema_validation"), "workload": wl}
+    return hashlib.sha256(json.dumps(body, sort_keys=True, default=str).encode("utf-8")).hexdigest()[:16]
+
+
+def _matching_record(sdir, spec):
+    """(path, None) for the newest record in the session made from this exact spec, else (None, why the recorded ones do
+    not count, or None when there are none)."""
+    done = sorted(Path(sdir).glob("experiment-%s-2*.json" % spec["name"]))
+    if not done:
+        return None, None
+    fp = spec_fingerprint(spec)
+    for p in reversed(done):
+        try:
+            rec = json.loads(p.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if rec.get("spec_fingerprint") == fp:
+            return p, None
+    return None, "it was recorded for a different spec (another starting point, workload or hotpath version), so it is not evidence for this one"
+
+
 def _reusing(runner, sdir, log):
-    """A runner that returns the record already in the session directory for a spec of the same name (resume), else runs."""
+    """A runner that returns the record already in the session directory for this exact spec (resume), else runs it and
+    stamps the record with the spec's fingerprint."""
     def run(spec, spec_path):
-        done = sorted(sdir.glob("experiment-%s-2*.json" % spec["name"]))
-        if done:
-            log("  reusing %s (completed earlier in this session)" % done[-1].name)
-            rec = json.loads(done[-1].read_text(encoding="utf-8"))
-            rec["_reused_from"] = done[-1].name
+        found, why = _matching_record(sdir, spec)
+        if found:
+            log("  reusing %s (completed earlier in this session)" % found.name)
+            rec = json.loads(found.read_text(encoding="utf-8"))
+            rec["_reused_from"] = found.name
             return rec
-        return runner(spec, spec_path)
+        if why:
+            log("  not reusing the recorded %s: %s" % (spec["name"], why))
+        rec = runner(spec, spec_path)
+        rec["spec_fingerprint"] = spec_fingerprint(spec)
+        return rec
     return run
 
 
@@ -251,44 +292,26 @@ class _DryRunStop(Exception):
     pass
 
 
-def _recorded(sdir, name):
-    return bool(sorted(Path(sdir).glob("experiment-%s-2*.json" % name)))
+def _recorded(sdir, spec):
+    return _matching_record(sdir, spec)[0] is not None
 
 
-def _pid_alive(pid):
-    """Whether a process exists, without signalling it (os.kill(pid, 0) on Windows sends CTRL_C_EVENT)."""
-    import os
+def _check_saved_state(saved, sdir):
+    """In a process the MCP server started, a resumed session's saved state is an input an agent could have edited: its
+    starting arguments and workload must pass the same checks as an agent's own `args` and `workload`."""
+    from hotpath import agentgate
+    if not agentgate.active():
+        return
     try:
-        pid = int(pid)
-    except (TypeError, ValueError):
-        return False
-    if os.name == "nt":
-        import ctypes
-        k32 = ctypes.windll.kernel32
-        h = k32.OpenProcess(0x1000, False, pid)            # PROCESS_QUERY_LIMITED_INFORMATION
-        if not h:
-            return False
-        code = ctypes.c_ulong()
-        ok = k32.GetExitCodeProcess(h, ctypes.byref(code))
-        k32.CloseHandle(h)
-        return bool(ok) and code.value == 259              # STILL_ACTIVE
-    try:
-        os.kill(pid, 0)
-        return True
-    except OSError:
-        return False
-
-
-def _take_lock(sdir):
-    import os
-    lock = Path(sdir) / "running.lock"
-    if lock.is_file():
-        holder = lock.read_text(encoding="utf-8").strip()
-        if holder and holder != str(os.getpid()) and _pid_alive(holder):
-            raise SystemExit("error: session %s is running in another process (pid %s); wait for it (hotpath_job_status) or stop that job, then resume" % (
-                Path(sdir).name, holder))
-    lock.write_text(str(os.getpid()), encoding="utf-8")
-    return lock
+        if saved.get("initial_args"):
+            agentgate.check_args_string(saved["initial_args"], "%s/session.json initial_args" % Path(sdir).name)
+        if saved.get("workload"):
+            agentgate.inside_roots(saved["workload"], "%s/session.json workload" % Path(sdir).name)
+            bad = agentgate.workload_problems(saved["workload"])
+            if bad:
+                raise ValueError("; ".join(bad))
+    except ValueError as e:
+        raise SystemExit("refused to resume %s: %s" % (Path(sdir).name, e))
 
 
 def _write_exp(rec, sdir, name):
@@ -316,6 +339,7 @@ def improve(cfg, start_records, workload, out_dir, runner, max_experiments=3, ma
         if not state.is_file():
             raise SystemExit("error: no resumable session in %s (session.json missing)" % sdir)
         saved = json.loads(state.read_text(encoding="utf-8"))
+        _check_saved_state(saved, sdir)
         start_records, workload, initial_args = saved["start_records"], saved["workload"], saved.get("initial_args")
         log("resuming %s: %d starting record(s), workload %s" % (session, len(start_records), Path(workload).name))
     elif not dry_run:
@@ -323,13 +347,13 @@ def improve(cfg, start_records, workload, out_dir, runner, max_experiments=3, ma
     if dry_run:
         runner = _never_launch          # a dry run reads what a session recorded and launches nothing, also when resuming
     runner = _reusing(runner, sdir, log)
-    lock = None if dry_run else _take_lock(sdir)
+    lock = None if dry_run else locks.take_session(sdir)
     try:
         return _improve(cfg, start_records, workload, out_dir, runner, max_experiments, max_minutes, rounds, repetitions, warmup, port, n_predict,
                         dry_run, log, initial_args, bandwidth_gbs, session, sdir, identity, file_identity)
     finally:
-        if lock is not None and lock.is_file():
-            lock.unlink()
+        if lock is not None:
+            locks.drop_session(lock)
 
 
 def _improve(cfg, start_records, workload, out_dir, runner, max_experiments, max_minutes, rounds, repetitions, warmup, port, n_predict, dry_run, log,
@@ -421,7 +445,7 @@ def _improve(cfg, start_records, workload, out_dir, runner, max_experiments, max
             break
         spec_path = sdir / ("step-%d-%s.json" % (n, f["experiment"]["kind"]))
         spec_path.write_text(json.dumps(spec, indent=2) + "\n", encoding="utf-8")
-        if dry_run and not _recorded(sdir, name):
+        if dry_run and not _recorded(sdir, spec):
             report["next_step"] = {"finding": f["id"], "title": f.get("title"), "spec": str(spec_path), "estimated_minutes": need,
                                    "arms": [a["name"] for a in spec["arms"]], "variable": f["experiment"].get("variable"), "port": port,
                                    "min_free_vram_mib": spec["preconditions"].get("min_free_vram_mib")}

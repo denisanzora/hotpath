@@ -16,6 +16,7 @@ from pathlib import Path
 
 from hotpath import gpu as gpu_mod
 from hotpath import launch
+from hotpath import locks
 from hotpath import server as srv
 from hotpath.measure import run_workload, summarize_requests
 from hotpath.observe import binary_identity
@@ -23,9 +24,13 @@ from hotpath.records import env_snapshot, file_identity, new_record, redact_args
 from hotpath.workload import load_workload, workload_identity
 
 
-def load_spec(path, local_cfg):
-    with open(path, "r", encoding="utf-8") as f:
-        spec = json.load(f)
+def load_spec(path, local_cfg, raw=None):
+    """A spec with its ${key} references resolved from the local config. `raw`: the already parsed (and, for agent-run
+    launches, already checked) content of `path`, so exactly what was checked is what runs."""
+    if raw is None:
+        with open(path, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+    spec = copy.deepcopy(raw)
     # values like "${model_path}" resolve from the local config so specs stay path-free
     def resolve(v):
         if isinstance(v, str) and v.startswith("${") and v.endswith("}"):
@@ -160,6 +165,7 @@ def _launch(cmd, env, log_path):
     if os.name == "nt":
         kw["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
     proc = subprocess.Popen(cmd, env=env, stdout=log, stderr=log, stdin=subprocess.DEVNULL, **kw)
+    locks.track(proc)
     return proc, log
 
 
@@ -172,6 +178,7 @@ def _stop(proc, log):
             proc.kill()
             proc.wait(timeout=30)
     finally:
+        locks.untrack(proc)
         log.close()
 
 
@@ -202,6 +209,12 @@ def run(spec, out_dir, dry_run=False, wait_for_preconditions_s=0):
         if workload.get("cache_mode", "cold") not in CACHE_MODES:
             raise SystemExit("error: cache_mode must be one of %s, got %r" % (", ".join(CACHE_MODES), workload.get("cache_mode")))
         require_schema_validation(workload.get("schema_validation", "auto"))   # fails before any wait or launch
+    # one hotpath process does GPU work at a time on this machine (whichever client or working directory started it)
+    with locks.gpu_work("experiment", spec["name"], wait_s=wait_for_preconditions_s, log=print):
+        return _run_locked(spec, out_dir, workload, wait_for_preconditions_s)
+
+
+def _run_locked(spec, out_dir, workload, wait_for_preconditions_s):
     pre = spec.get("preconditions") or {}
     t_end = time.time() + wait_for_preconditions_s
     while True:
