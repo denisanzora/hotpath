@@ -142,9 +142,11 @@ def holders_hint(pc):
         procs = disc.server_processes()
         ports = disc.listening_ports() if procs else {}
     except Exception:  # noqa: BLE001 - the hint is best effort; the precondition result stands on its own
-        return ""
+        return ". Pass --wait-s N to wait for the preconditions"
     if not procs:
-        return ""
+        gpu = any("VRAM" in r or "util" in r for r in pc.get("reasons") or [])
+        return ". No llama-server is running; %s: pass --wait-s N to wait" % (
+            "another program is using the GPU (desktop activity counts too)" if gpu else "another program holds the port")
     names = ", ".join("llama-server pid %s%s" % (p["pid"], " (port %s)" % ",".join(str(x[1]) for x in ports.get(p["pid"], [])) if ports.get(p["pid"]) else "")
                       for p in procs)
     return (". Running now: %s. hotpath does not stop, restart or reconfigure servers it did not start: stop it yourself if it may be interrupted, "
