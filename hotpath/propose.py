@@ -155,7 +155,7 @@ def build_spec(finding, cfg, common_args, workload, port=8099, rounds=3, repetit
                 nb = launch.int_or_none(launch.get(args, "batch_size")) or 0
                 if ub and nb and nb < ub:
                     arm["args_override"] = dict(arm["args_override"], **{"--batch-size": ub})
-        for k in ("env_override", "env_remove", "args_remove", "request_override", "capacity_change"):
+        for k in ("env_override", "env_remove", "args_remove", "request_override", "capacity_change", "context_policy", "control"):
             if a.get(k):
                 arm[k] = a[k]
         arms.append(arm)

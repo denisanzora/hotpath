@@ -317,6 +317,7 @@ _IMPROVE_PROPS = {
     "from_records": {"type": "array", "items": _STR, "description": "Start from these records (inside the working directory) instead of observing the running server."},
     "server": {"type": "string", "description": "The user's running server to start from (loopback URL); it is observed, never restarted or loaded."},
     "args": {"type": "string", "description": "Starting llama-server arguments as one string, only when no server runs (default: server_args in the config, else defaults fitted to the GPU)."},
+    "resume": {"type": "string", "description": "Continue an interrupted session by its name (improve-YYYYMMDD-HHMMSS, from the report or results/local): completed experiments are reused."},
 }
 
 
@@ -343,6 +344,11 @@ def _improve_argv(a, dry_run):
         argv.append("--args=" + a["args"])
     if a.get("wait_s"):
         argv += ["--wait-s", str(int(a["wait_s"]))]
+    if a.get("resume"):
+        import re
+        if not re.fullmatch(r"improve-[0-9]{8}-[0-9]{6}(-[0-9]+)?", str(a["resume"])):
+            raise ValueError("resume must be a session name such as improve-20261012-091500 (a directory under results/local)")
+        argv += ["--resume", a["resume"]]
     return argv
 
 

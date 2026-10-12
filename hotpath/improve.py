@@ -94,17 +94,72 @@ def next_finding(diag, attempted, requests_workload):
     return None, skipped
 
 
-def adoptable(row, verdict, arm=None):
-    """(adopt?, reason). Only `keep` is adopted; a production gate that does not support applying the flag blocks it, and
-    so does a change that limits what the server accepts (a smaller context), which is the user's call."""
-    if not row["verdict"].startswith("keep"):
-        return False, "not adopted: the verdict is not keep (%s)" % row["verdict"].split(":")[0]
+SPILL_MIB = 256              # more system-memory (shared) use than the baseline: the candidate does not really fit in VRAM
+HEADROOM_MIB = 300           # free VRAM left while the candidate ran, below which a busier desktop could push it over
+PROMPT_REGRESSION = 0.03     # per-prompt wall-time regression allowed beyond twice the prompt's own repetition spread
+
+
+def _policy_check(row, cfg):
+    """An operator's output policy (hotpath.local.json `output_policy`), checked on this row. Only "schema_valid" exists:
+    differing outputs are accepted when every judged request of both arms passed full JSON Schema validation."""
+    policy = (cfg or {}).get("output_policy")
+    if policy != "schema_valid":
+        return policy, None
+    v = row.get("validity") or {}
+    c = v.get("candidate") or {}
+    ok = bool(v and not v.get("dropped") and v.get("decided_on") == "schema_valid" and c.get("judged") and c.get("schema_valid") == c.get("judged"))
+    return policy, {"passed": ok, "basis": "full JSON Schema validation %s/%s in the candidate" % (c.get("schema_valid"), c.get("judged")) if v else "no schema in these requests"}
+
+
+def resource_check(rec_arms, base_name, cand_name):
+    """(problem, needs_decision) from the per-launch counters: more system-memory spill than the baseline is a rejection,
+    too little free VRAM while running is the user's call."""
+    def facts(name):
+        return (rec_arms or {}).get(name, {}).get("launch_facts") or []
+    sb = [((x.get("process_counters_after") or {}).get("shared_mib")) for x in facts(base_name)]
+    sc = [((x.get("process_counters_after") or {}).get("shared_mib")) for x in facts(cand_name)]
+    sb, sc = [x for x in sb if x is not None], [x for x in sc if x is not None]
+    if sb and sc and max(sc) - max(sb) > SPILL_MIB:
+        return "it spills %.0f MiB more into system memory than the baseline (shared GPU memory): it does not fit in VRAM" % (max(sc) - max(sb)), False
+    free = [(g.get("mem_total_mib") or 0) - (g.get("mem_used_mib") or 0) for g in (x.get("gpu_after") or {} for x in facts(cand_name)) if g.get("mem_total_mib")]
+    if free and min(free) < HEADROOM_MIB:
+        return "only %.0f MiB of VRAM stayed free while it ran (no headroom: other programs could push it into system memory)" % min(free), True
+    return None, False
+
+
+def prompt_regression(row):
+    """The prompts on which the candidate's wall time is worse than the baseline's beyond that prompt's own noise."""
+    out = []
+    for pp in ((row.get("metrics") or {}).get("wall_ms") or {}).get("per_prompt") or []:
+        tol = max(PROMPT_REGRESSION, 2 * (pp.get("baseline_relative_spread") or 0.0))
+        if pp.get("ratio") and pp["ratio"] > 1.0 + tol:
+            out.append("%s (%+.0f%%)" % (pp["prompt_id"], 100 * (pp["ratio"] - 1)))
+    return out
+
+
+def adoptable(row, verdict, arm=None, rec_arms=None, base_name=None, cfg=None):
+    """(adopt?, reason, needs_decision). Adopted only when faster and consistent, with outputs identical (or accepted by an
+    operator's checked output policy), no prompt regressing beyond its noise, no spill into system memory, VRAM headroom
+    left, no change to what the server accepts (unless an operator's context policy set it) and, for cache flags, a
+    production gate that supports it."""
+    faster_differ = row["verdict"].startswith("faster")
+    policy, check = _policy_check(row, cfg)
+    if not row["verdict"].startswith("keep") and not (faster_differ and check and check.get("passed")):
+        return False, "not adopted: the verdict is not keep (%s)" % row["verdict"].split(":")[0], faster_differ
+    reg = prompt_regression(row)
+    if reg:
+        return False, "not adopted: faster overall but it regresses on %s beyond those prompts' own noise" % ", ".join(reg), False
+    problem, decide = resource_check(rec_arms, base_name, row.get("arm"))
+    if problem:
+        return False, "not adopted: %s" % problem, decide
     if (arm or {}).get("capacity_change"):
-        return False, "not adopted: faster with identical outputs, but it changes what the server accepts (%s); your decision" % arm["capacity_change"]
+        return False, "not adopted: faster with identical outputs, but it changes what the server accepts (%s); your decision" % arm["capacity_change"], True
     gate = verdict.get("production_gate")
     if gate and not gate.startswith("production applicability supported"):
-        return False, "not adopted: faster on isolated requests, but %s" % gate
-    return True, "adopted: keep verdict"
+        return False, "not adopted: faster on isolated requests, but %s" % gate, False
+    if faster_differ:
+        return True, "adopted under the output policy %r: %s" % (policy, check["basis"]), False
+    return True, "adopted: keep verdict", False
 
 
 def _rank_rows(verdict):
@@ -153,13 +208,74 @@ class Budget:
         return self.max_minutes - self.minutes
 
 
+def identity_problem(records, cfg, identity):
+    """Why evidence about the user's server cannot be carried into experiments with the configured model and binary, or None.
+    Compared on size and a hash of the first 64 MiB; a record without identity is not judged."""
+    for rec in records:
+        if rec.get("kind") != "observation":
+            continue
+        for key, cfg_key, what in (("model", "model_path", "model"), ("runtime_binary", "runtime_binary", "llama-server build")):
+            seen = rec.get(key) or {}
+            seen = seen.get("identity") if key == "model" else seen
+            if not seen or not seen.get("size_bytes") or not cfg.get(cfg_key):
+                continue
+            mine = identity(cfg[cfg_key]) or {}
+            if not mine.get("size_bytes"):
+                continue
+            if (seen.get("size_bytes"), seen.get("sha256_head64m")) != (mine.get("size_bytes"), mine.get("sha256_head64m")):
+                return ("the observed server used a different %s (%s, %s bytes) than %s in hotpath.local.json (%s, %s bytes): experiments would measure "
+                        "another setup than the one diagnosed. Point %s at the server's %s, or start from a new observation" % (
+                            what, seen.get("basename"), seen.get("size_bytes"), cfg_key, mine.get("basename"), mine.get("size_bytes"), cfg_key, what))
+    return None
+
+
+def _reusing(runner, sdir, log):
+    """A runner that returns the record already in the session directory for a spec of the same name (resume), else runs."""
+    def run(spec, spec_path):
+        done = sorted(sdir.glob("experiment-%s-2*.json" % spec["name"]))
+        if done:
+            log("  reusing %s (completed earlier in this session)" % done[-1].name)
+            rec = json.loads(done[-1].read_text(encoding="utf-8"))
+            rec["_reused_from"] = done[-1].name
+            return rec
+        return runner(spec, spec_path)
+    return run
+
+
+def _write_exp(rec, sdir, name):
+    if rec.get("_reused_from"):
+        return Path(sdir) / rec["_reused_from"]
+    return write_record(rec, sdir, "experiment-%s" % name)
+
+
 def improve(cfg, start_records, workload, out_dir, runner, max_experiments=3, max_minutes=60, rounds=3, repetitions=2, warmup=1, port=8099,
-            n_predict=None, dry_run=False, log=print, initial_args=None, bandwidth_gbs=None, session=None):
+            n_predict=None, dry_run=False, log=print, initial_args=None, bandwidth_gbs=None, session=None, resume=False, identity=None):
     """Run the loop. `runner(spec, spec_path)` runs one experiment spec and returns its record (raising SystemExit when
-    it cannot start, for example on unmet preconditions). Returns the improvement report (also written to out_dir)."""
+    it cannot start, for example on unmet preconditions). Returns the improvement report (also written to out_dir).
+    With `resume`, the session's saved starting point is used and experiments already recorded in it are not run again."""
+    from hotpath.records import file_identity
     session = session or "improve-%s" % time.strftime("%Y%m%d-%H%M%S")
+    if not resume:
+        # a new run never shares a session directory (two runs in one second, or a reused name): its records would be reused
+        base_name, k = session, 2
+        while (Path(out_dir) / session).exists():
+            session, k = "%s-%d" % (base_name, k), k + 1
     sdir = Path(out_dir) / session
     sdir.mkdir(parents=True, exist_ok=True)
+    state = sdir / "session.json"
+    if resume:
+        if not state.is_file():
+            raise SystemExit("error: no resumable session in %s (session.json missing)" % sdir)
+        saved = json.loads(state.read_text(encoding="utf-8"))
+        start_records, workload, initial_args = saved["start_records"], saved["workload"], saved.get("initial_args")
+        log("resuming %s: %d starting record(s), workload %s" % (session, len(start_records), Path(workload).name))
+    elif not dry_run:
+        state.write_text(json.dumps({"start_records": list(start_records), "workload": workload, "initial_args": initial_args}) + "\n", encoding="utf-8")
+    runner = _reusing(runner, sdir, log)
+    problem = identity_problem(start_records, cfg, identity or (lambda path: file_identity(path) if Path(path).is_file() else None))
+    if problem:
+        return _early_report(session, out_dir, initial_args or [], "the records you started from", workload, max_experiments, max_minutes,
+                             "refused before launching anything: %s" % problem)
     records = list(start_records)
     requests_wl = _is_requests_workload(workload)
     baseline = None
@@ -182,7 +298,7 @@ def improve(cfg, start_records, workload, out_dir, runner, max_experiments=3, ma
         except SystemExit as e:
             return _early_report(session, out_dir, args, source, workload, max_experiments, max_minutes, "baseline not run: %s" % e)
         baseline["minutes"] = round((time.time() - t0) / 60.0, 1)
-        baseline["record"] = write_record(brec, sdir, "experiment-%s" % bspec["name"]).name
+        baseline["record"] = _write_exp(brec, sdir, bspec["name"]).name
         if any(a.get("failures") for a in brec["arms"].values()):
             baseline["failed"] = [f["error"] for a in brec["arms"].values() for f in a.get("failures") or []][:3]
         records = [brec]
@@ -194,6 +310,7 @@ def improve(cfg, start_records, workload, out_dir, runner, max_experiments=3, ma
     args0, removed = prop.strip_runner_owned(prop._strip_launch_prefix(args0))
     observed = (diag.get("observed_launch") or {}).get("args_redacted")
     original = {"args": list(args0), "env": {}}
+    shape = diag.get("traffic_shape")
     best = {"args": list(args0), "env": {}, "label": None}
     cum = {"args": {}, "args_remove": set(), "env": {}, "env_remove": set()}
     steps, attempted, adopted_steps = [], set(), []
@@ -201,7 +318,10 @@ def improve(cfg, start_records, workload, out_dir, runner, max_experiments=3, ma
     if baseline:
         budget.minutes += baseline.get("minutes") or 0.0
         best["label"] = "%s/baseline" % records[0]["name"]
-    report = {"session": session, "starting_point": {"args": args0, "source": source, "removed_server_args": sorted(set(removed)),
+    top = next((f for f in diag.get("findings") or [] if f.get("severity") in ("high", "medium") and not f.get("superseded_by")), None)
+    report_bottleneck = {"id": top["id"], "title": top.get("title"), "severity": top.get("severity"), "confidence": top.get("confidence"),
+                         "known": (top.get("known") or [])[:2], "bound": (top.get("impact") or {}).get("bound_share_of_request")} if top else None
+    report = {"bottleneck": report_bottleneck, "session": session, "starting_point": {"args": args0, "source": source, "removed_server_args": sorted(set(removed)),
                                                      "diagnosed_arm": diag.get("diagnosed_arm"), "sources": diag.get("sources")},
               "workload": Path(workload).name, "budget": {"max_experiments": budget.max_experiments, "max_minutes": budget.max_minutes},
               "steps": steps, "skipped_findings": [], "confirmation": None, "next_step": None, "baseline": baseline, "decisions": []}
@@ -239,11 +359,17 @@ def improve(cfg, start_records, workload, out_dir, runner, max_experiments=3, ma
         spec_path.write_text(json.dumps(spec, indent=2) + "\n", encoding="utf-8")
         if dry_run:
             report["next_step"] = {"finding": f["id"], "title": f.get("title"), "spec": str(spec_path), "estimated_minutes": need,
-                                   "arms": [a["name"] for a in spec["arms"]], "variable": f["experiment"].get("variable"),
+                                   "arms": [a["name"] for a in spec["arms"]], "variable": f["experiment"].get("variable"), "port": port,
                                    "min_free_vram_mib": spec["preconditions"].get("min_free_vram_mib")}
+            vw, _vb = validation_workload(sdir, shape, _ctx_tokens(best["args"]), n_predict)
+            vest = prop.estimate_minutes({"workload": vw, "arms": [{}, {}], "rounds": rounds, "repetitions": repetitions, "warmup": warmup, "cooldown_s": 5},
+                                         diag.get("rates"), load_s=_measured_load_s(records))
+            report["validation_estimate_minutes"] = vest["minutes"] if vest else None
             stopped = "dry run: nothing launched"
             break
-        log("step %d: %s -> %s (%s)" % (n, f["id"], ", ".join(a["name"] for a in spec["arms"]), "about %.0f min" % need if need else "duration unknown"))
+        log("step %d of at most %d: %s -> %s (%s; %.0f of %.0f budget minutes used)" % (
+            n, budget.max_experiments, f["id"], ", ".join(a["name"] for a in spec["arms"]), "about %.0f min" % need if need else "duration unknown",
+            budget.minutes, budget.max_minutes))
         t0 = time.time()
         try:
             rec = runner(spec, str(spec_path))
@@ -255,7 +381,7 @@ def improve(cfg, start_records, workload, out_dir, runner, max_experiments=3, ma
         budget.experiments += 1
         budget.minutes += max((time.time() - t0) / 60.0, 0.0)
         attempted.add(f["id"])
-        rpath = write_record(rec, sdir, "experiment-%s" % name)
+        rpath = _write_exp(rec, sdir, name)
         records.append(rec)
         diag = dg.diagnose(records, bandwidth_gbs=bandwidth_gbs, cfg=cfg)
         verdict = next((v for v in diag.get("experiment_verdicts") or [] if v["experiment"] == rec["name"]), None)
@@ -263,29 +389,33 @@ def improve(cfg, start_records, workload, out_dir, runner, max_experiments=3, ma
                 "record": rpath.name, "arms": [a["name"] for a in spec["arms"]], "estimated_minutes": need}
         rows = _rank_rows(verdict) if verdict else []
         arm_of = {a["name"]: a for a in spec["arms"]}
+        base_name = spec["arms"][0]["name"]
+        judged = {}
+        for r in rows:
+            judged[r["arm"]] = adoptable(r, verdict, arm_of.get(r["arm"]), rec.get("arms"), base_name, cfg)
         row, ok, why = None, False, None
         for r in rows:
-            r_ok, r_why = adoptable(r, verdict, arm_of.get(r["arm"]))
-            if r_ok:
-                row, ok, why = r, True, r_why
+            if judged[r["arm"]][0] and not (arm_of.get(r["arm"]) or {}).get("control"):
+                row, ok, why = r, True, judged[r["arm"]][1]
                 break
         if not row and rows:
             row = rows[0]
-            ok, why = adoptable(row, verdict, arm_of.get(row["arm"]))
-        # faster candidates that only the user can accept: a capacity change, or outputs that differ
+            ok, why = judged[row["arm"]][0], judged[row["arm"]][1]
+        # faster candidates that only the user can accept: a capacity change, outputs that differ, no VRAM headroom
         for r in rows:
-            if r is row and ok:
+            if (r is row and ok) or (arm_of.get(r["arm"]) or {}).get("control"):
                 continue
             a = arm_of.get(r["arm"]) or {}
-            if (r["verdict"].startswith("keep") and a.get("capacity_change")) or r["verdict"].startswith("faster"):
+            if judged[r["arm"]][2]:
                 report["decisions"].append({"step": n, "arm": r["arm"], "change": _change_text(a), "verdict": r["verdict"],
-                                            "needs": a.get("capacity_change") or "the outputs differ: check whether the difference matters for your application",
-                                            "measured": _metric_line(r)})
+                                            "needs": judged[r["arm"]][1].replace("not adopted: ", ""), "fidelity": (r.get("fidelity") or {}).get("class"),
+                                            "measured": _metric_line(r), "decomposition": decomposition(rows, arm_of, r["arm"])})
         if not row:
             step.update({"adopted": False, "verdict": "no verdict (the record has fewer than two arms with requests)", "why": "nothing to compare"})
         else:
             step.update({"adopted": ok, "candidate": row["arm"], "verdict": row["verdict"], "why": why, "measured": _metric_line(row),
-                         "caveats": verdict.get("caveats") or []})
+                         "fidelity": (row.get("fidelity") or {}).get("class"), "caveats": verdict.get("caveats") or [],
+                         "other_arms": [{"arm": r["arm"], "verdict": r["verdict"].split(":")[0], "why": judged[r["arm"]][1]} for r in rows if r is not row]})
             if ok:
                 arm = arm_of[row["arm"]]
                 best["args"], best["env"] = materialize(spec["common_args"], spec.get("env"), arm)
@@ -317,9 +447,11 @@ def improve(cfg, start_records, workload, out_dir, runner, max_experiments=3, ma
     report["stopped_because"] = stopped
     report["experiments_run"] = budget.experiments
     report["result"] = _result(cfg, original, cum, adopted_steps, records, workload, port, rounds, repetitions, warmup, n_predict, budget, sdir, session,
-                               runner, dry_run, bandwidth_gbs, log, report)
+                               runner, dry_run, bandwidth_gbs, log, report, shape)
     report["minutes_used"] = round(budget.minutes, 1)
-    report["recommended"] = recommended_launch(observed or args0, cum, bool(observed))
+    validated = report["result"].get("validated")
+    report["recommended"] = recommended_launch(observed or args0, cum if validated else {"args": {}, "args_remove": set(), "env": {}, "env_remove": set()},
+                                               bool(observed), validated=validated, adopted=bool(adopted_steps))
     report["remaining"] = [{"id": f["id"], "title": f.get("title"), "confidence": f.get("confidence"), "next": (f.get("measured") or {}).get("how")}
                            for f in diag.get("findings") or [] if f.get("severity") in ("high", "medium") and f["id"] not in attempted][:5]
     rec = new_record("improvement", "controlled" if budget.experiments else "hypothesis", **report)
@@ -410,6 +542,16 @@ def step_spec(finding, cfg, best, workload, port, rounds, repetitions, warmup, n
     if not _same_config(first_args, first_env, best["args"], best["env"]):
         cur = "current" if all(a["name"] != "current" for a in spec["arms"]) else "adopted-so-far"
         spec["arms"].insert(0, {"name": cur})
+    # an arm that launches the same configuration as an earlier one measures nothing new
+    kept = []
+    for a in spec["arms"]:
+        args, env = materialize(spec["common_args"], spec["env"], a)
+        if any(_same_config(args, env, *materialize(spec["common_args"], spec["env"], k)) for k in kept):
+            continue
+        kept.append(a)
+    spec["arms"] = kept
+    if len(kept) < 2:
+        raise ValueError("every candidate arm repeats the configuration already adopted")
     need = [prop.vram_needed_mib(cfg, materialize(spec["common_args"], spec["env"], a)[0]) for a in spec["arms"]]
     if need and all(x is not None for x in need):
         spec["preconditions"]["min_free_vram_mib"] = max(need)
@@ -417,19 +559,67 @@ def step_spec(finding, cfg, best, workload, port, rounds, repetitions, warmup, n
     return spec
 
 
+def validation_workload(sdir, shape, ctx_tokens, n_predict=None):
+    """A broader workload than the steps used, for the final original-vs-improved run: six prompts from the smallest to the
+    largest real request size (p10, median, p90 and the largest, plus two in between), generating the longest observed
+    output (bounded), so a gain on the step workload must also hold on long requests and long generations. Without real
+    traffic: six default sizes. Every prompt + generation fits in `ctx_tokens` (the smallest context of the two arms)."""
+    from hotpath import workload as wl
+    if shape:
+        toks = sorted({shape["prompt_tokens_p10"], (shape["prompt_tokens_p10"] + shape["prompt_tokens_median"]) // 2, shape["prompt_tokens_median"],
+                       (shape["prompt_tokens_median"] + shape["prompt_tokens_p90"]) // 2, shape["prompt_tokens_p90"],
+                       shape.get("prompt_tokens_max") or shape["prompt_tokens_p90"]})
+        gen = int(n_predict or max(32, min(256, shape.get("generated_tokens_max") or shape["generated_tokens_median"])))
+        basis = "sizes from %s; generation = the longest observed output (bounded to 32-256)" % shape["basis"]
+    else:
+        toks = [250, 520, 1050, 1500, 2300, 3450]
+        gen = int(n_predict or 128)
+        basis = "default sizes (no real traffic in the evidence)"
+    cap = int(ctx_tokens * 0.9) - gen if ctx_tokens else None
+    if cap:
+        toks = [t for t in toks if t <= cap] or [max(64, cap)]
+    while len(toks) < 6:
+        toks.append(toks[len(toks) % len(toks)])
+    words = [max(20, int(round((t - 20) / 1.15))) for t in toks[:6]]
+    path = Path(sdir) / "validation-workload.json"
+    w = wl.build_workload("hotpath-validation", len(words), words, seed=7, n_predict=gen, fmt="chatml")
+    w["basis"] = basis
+    path.write_text(json.dumps(w, indent=1) + "\n", encoding="utf-8")
+    return str(path), basis
+
+
+def _ctx_tokens(args):
+    c = launch.int_or_none(launch.get(args, "ctx_size"))
+    np_ = launch.int_or_none(launch.get(args, "parallel")) or 1
+    return (c // np_) if c else 4096
+
+
+def decomposition(rows, arm_of, name):
+    """For a smaller-context arm measured with its context-only control: how much of the wall-time change the context alone
+    explains and how much the extra GPU layers do (ratios against the same baseline in the same experiment)."""
+    a = arm_of.get(name) or {}
+    ctrl = next((x for x in arm_of.values() if x.get("control") and (x.get("args_override") or {}).get("--ctx-size") == (a.get("args_override") or {}).get("--ctx-size")
+                 and x is not a), None)
+    if not ctrl or "--ctx-size" not in (a.get("args_override") or {}):
+        return None
+    ratio = {r["arm"]: ((r.get("metrics") or {}).get("wall_ms") or {}).get("ratio") for r in rows}
+    if ratio.get(ctrl["name"]) is None or ratio.get(name) is None:
+        return None
+    return {"context_only_wall_ratio": ratio[ctrl["name"]], "with_more_layers_wall_ratio": ratio[name],
+            "reading": "the context change alone moves wall time by %+.0f%%; with the extra GPU layers it allows, %+.0f%%" % (
+                100 * (ratio[ctrl["name"]] - 1), 100 * (ratio[name] - 1))}
+
+
 def _result(cfg, original, cum, adopted_steps, records, workload, port, rounds, repetitions, warmup, n_predict, budget, sdir, session, runner,
-            dry_run, bandwidth_gbs, log, report):
+            dry_run, bandwidth_gbs, log, report, shape=None):
     if dry_run:
-        return {"verdict": "dry run: nothing measured", "measured_by": None}
+        return {"verdict": "dry run: nothing measured", "measured_by": None, "validated": None}
     if not budget.experiments:
-        return {"verdict": "nothing measured: %s" % (report.get("stopped_because") or "no experiment ran"), "measured_by": None}
+        return {"verdict": "nothing measured: %s" % (report.get("stopped_because") or "no experiment ran"), "measured_by": None, "validated": None}
     if not adopted_steps:
-        return {"verdict": "no change adopted: the configuration you started from stands", "measured_by": None}
-    if len(adopted_steps) == 1:
-        s = adopted_steps[0]
-        return {"verdict": s["verdict"], "measured_by": s["experiment"], "measured": s.get("measured"),
-                "basis": "one adopted change: its own paired run already compared your configuration with the change"}
-    # two or more adopted changes: one paired run of the original launch against the improved one decides the cumulative claim
+        return {"verdict": "no change adopted: the configuration you started from stands", "measured_by": None, "validated": None}
+    # every adopted change is validated in one paired run of the original launch against the improved one, on a broader
+    # workload than the steps used; only that run supports a recommendation
     improved = {"name": "improved"}
     if cum["args"]:
         improved["args_override"] = dict(cum["args"])
@@ -439,55 +629,63 @@ def _result(cfg, original, cum, adopted_steps, records, workload, port, rounds, 
         improved["env_override"] = dict(cum["env"])
     if cum["env_remove"]:
         improved["env_remove"] = sorted(cum["env_remove"])
+    imp_args = materialize(original["args"], original["env"], improved)[0]
+    vw, vbasis = validation_workload(sdir, shape, min(_ctx_tokens(original["args"]), _ctx_tokens(imp_args)), n_predict)
     name = "%s-confirm" % session
-    spec = {"name": name, "description": "Confirmation by hotpath improve: your original launch against the launch with every adopted change (%s). "
-                                         "Several variables differ by design; the one-variable evidence for each change is in its own step." % (
-                                             ", ".join(s["finding"] for s in adopted_steps)),
+    spec = {"name": name, "description": "Validation by hotpath improve: your original launch against the launch with every adopted change (%s), on a "
+                                         "broader workload than the steps used. Several variables differ by design; the one-variable evidence for each "
+                                         "change is in its own step." % (", ".join(s["finding"] for s in adopted_steps)),
             "binary": "${runtime_binary}", "model": "${model_path}", "port": int(port), "common_args": list(original["args"]), "env": dict(original["env"]),
-            "arms": [{"name": "original"}, improved], "workload": workload, "rounds": int(rounds), "repetitions": int(repetitions), "warmup": int(warmup),
+            "arms": [{"name": "original"}, improved], "workload": vw, "rounds": int(rounds), "repetitions": int(repetitions), "warmup": int(warmup),
             "cooldown_s": 5, "health_timeout_s": 600,
             "preconditions": {"sample_seconds": 5, "max_gpu_util_pct": 10, "min_free_vram_mib": 2000, "ports_must_be_free": [int(port)]},
-            "provenance": {"experiment_kind": "confirmation", "improve_session": session, "adopted_steps": [s["experiment"] for s in adopted_steps]}}
+            "provenance": {"experiment_kind": "confirmation", "improve_session": session, "adopted_steps": [s["experiment"] for s in adopted_steps],
+                           "workload_basis": vbasis}}
     if cfg.get("path_prepend"):
         spec["path_prepend"] = "${path_prepend}"
-    if n_predict:
-        spec["n_predict"] = int(n_predict)
     need = [prop.vram_needed_mib(cfg, materialize(spec["common_args"], spec["env"], a)[0]) for a in spec["arms"]]
     if need and all(x is not None for x in need):
         spec["preconditions"]["min_free_vram_mib"] = max(need)
-    # the original launch's measured rates (the baseline arm of the first step) bound the run: every arm is assumed that slow
-    first = (adopted_steps[0].get("measured") or {}) if adopted_steps else {}
+    first = (adopted_steps[0].get("measured") or {})
     rates = {"prefill_tps": (first.get("prefill_tps") or {}).get("baseline"), "decode_tps": (first.get("decode_tps") or {}).get("baseline"),
              "basis": "the original launch in step %s" % adopted_steps[0]["step"]}
     est = prop.estimate_minutes(spec, rates, load_s=_measured_load_s(records))
     if est:
         spec["provenance"]["estimated_duration"] = est
         if est["minutes"] > budget.time_left():
-            return {"verdict": "not confirmed: the joint original-vs-improved run needs about %.0f min and %.0f min of the budget are left; each change has only its own step's verdict" % (
-                est["minutes"], max(0.0, budget.time_left())), "measured_by": None, "confirmation_spec": None}
+            return {"verdict": "not validated: the final original-vs-improved run needs about %.0f min and %.0f min of the budget are left; your original "
+                               "launch stays the recommendation (raise --max-minutes, or --resume this session with a larger budget)" % (
+                                   est["minutes"], max(0.0, budget.time_left())), "measured_by": None, "validated": False}
     path = sdir / "confirm.json"
     path.write_text(json.dumps(spec, indent=2) + "\n", encoding="utf-8")
-    log("confirming: original vs improved (%s)" % ", ".join(s["finding"] for s in adopted_steps))
+    log("validating: original vs improved (%s) on %d prompts%s" % (", ".join(s["finding"] for s in adopted_steps), 6,
+                                                                    ", about %.0f min" % est["minutes"] if est else ""))
     t0 = time.time()
     try:
         rec = runner(spec, str(path))
     except SystemExit as e:
-        return {"verdict": "not confirmed: %s" % e, "measured_by": None, "confirmation_spec": str(path)}
+        return {"verdict": "not validated: %s; your original launch stays the recommendation" % e, "measured_by": None, "validated": False}
     finally:
         budget.minutes += max((time.time() - t0) / 60.0, 0.0)
-    rpath = write_record(rec, sdir, "experiment-%s" % name)
+    rpath = _write_exp(rec, sdir, name)
     v = dg.experiment_verdict(rec)
     row = (v or {}).get("arms", [None])[0] if v else None
-    report["confirmation"] = {"experiment": name, "record": rpath.name, "verdict": row["verdict"] if row else "no verdict", "measured": _metric_line(row) if row else None}
     if not row:
-        return {"verdict": "not confirmed: the confirmation run produced no comparison", "measured_by": name}
-    return {"verdict": row["verdict"], "measured_by": name, "measured": _metric_line(row),
-            "basis": "one paired run of your original launch against the launch with every adopted change"}
+        return {"verdict": "not validated: the validation run produced no comparison", "measured_by": name, "validated": False}
+    ok, why, _ = adoptable(row, v, improved, rec.get("arms"), "original", cfg)
+    report["confirmation"] = {"experiment": name, "record": rpath.name, "verdict": row["verdict"], "workload_basis": vbasis, "measured": _metric_line(row),
+                              "fidelity": row.get("fidelity"), "passed": ok, "why": why}
+    if not ok:
+        return {"verdict": "not validated: %s; your original launch stays the recommendation. Validation run: %s" % (why.replace("not adopted: ", ""), row["verdict"]),
+                "measured_by": name, "measured": _metric_line(row), "validated": False}
+    return {"verdict": row["verdict"], "measured_by": name, "measured": _metric_line(row), "validated": True,
+            "basis": "one paired run of your original launch against the launch with every adopted change, on a broader workload (%s)" % vbasis}
 
 
-def recommended_launch(user_args, cum, observed):
-    """The user's own launch line with the adopted changes, plus the environment changes. Flags the user set that the
-    loop did not change (port, host, log file, model) stay as they were."""
+def recommended_launch(user_args, cum, observed, validated=True, adopted=False):
+    """The user's own launch line with the adopted changes, plus the environment changes; and the line to go back to.
+    Flags the user set that the loop did not change (port, host, log file, model) stay as they were."""
+    revert = [str(a) for a in user_args]
     args = [str(a) for a in user_args]
     changes = []
     for flag, value in cum["args"].items():
@@ -501,76 +699,125 @@ def recommended_launch(user_args, cum, observed):
         args = launch.remove_arg(args, flag)
         changes.append({"flag": flag, "from": before, "to": "removed"})
     env = [{"variable": k, "to": v} for k, v in sorted(cum["env"].items())] + [{"variable": k, "to": "unset"} for k in sorted(cum["env_remove"])]
-    return {"args": args, "changes": changes, "env": env,
+    if adopted and not validated:
+        note = ("No change is recommended: the adopted changes did not pass the final validation, so your original launch stays (shown below). "
+                "hotpath did not change your server.")
+    elif changes or env:
+        note = ("hotpath did not change your server. To apply, add these changes to the command (or launcher settings) that starts it, restart it "
+                "yourself, and run `hotpath inspect` afterwards to confirm the new launch. To revert, start it again with your original line.")
+    else:
+        note = "No change is recommended; your original launch stays. hotpath did not change your server."
+    return {"args": args, "changes": changes, "env": env, "revert_args": revert,
             "basis": "your server's observed command line (paths shown as file names)" if observed else "the arguments the loop started from",
-            "note": "hotpath did not change your server. To apply, add these changes to the command (or launcher settings) that starts it, "
-                    "restart it yourself, and run `hotpath inspect` afterwards to confirm the new launch."}
+            "note": note}
+
+
+def _metrics_lines(m):
+    L = []
+    for k, lab in (("wall_ms", "wall time per request"), ("prefill_tps", "prompt processing"), ("decode_tps", "generation")):
+        if (m or {}).get(k):
+            x = m[k]
+            L.append("- %s: %s -> %s (ratio %s, %s)" % (lab, _fmt(x["baseline"], k), _fmt(x["candidate"], k), x.get("ratio"), x.get("call")))
+    if (m or {}).get("vram_delta_mib") is not None:
+        L.append("- VRAM: %+d MiB" % m["vram_delta_mib"])
+    if (m or {}).get("outputs"):
+        o = m["outputs"]
+        L.append("- outputs identical on %s/%s prompts (%s)" % (o.get("identical"), o.get("prompts_compared"), o.get("basis")))
+    return L
 
 
 def improvement_markdown(rec):
-    L = ["# hotpath improve: %s" % rec["session"], ""]
-    sp = rec["starting_point"]
-    L += ["Started from: %s (%s)." % (" ".join(sp["args"]) or "(no arguments)", sp["source"]),
-          "Workload: %s; budget %d experiments / %.0f min; used %d experiments%s / %.1f min in all." % (
-              rec["workload"], rec["budget"]["max_experiments"], rec["budget"]["max_minutes"], rec.get("experiments_run", 0),
-              " + baseline" if rec.get("baseline") else "", rec.get("minutes_used", 0.0)) + (" The joint confirmation run is not counted as an experiment." if rec.get("confirmation") else ""),
-          "Stopped: %s." % rec.get("stopped_because"), ""]
+    """The report a developer reads: what was found, what was tested, what was kept or rejected, what needs their decision,
+    the validated result, and exactly how to apply or revert."""
     res = rec.get("result") or {}
-    L += ["## Result", "", res.get("verdict") or "", ""]
-    if res.get("basis"):
-        L += ["Basis: %s." % res["basis"], ""]
-    m = res.get("measured") or {}
-    for k, lab in (("wall_ms", "wall time per request"), ("prefill_tps", "prompt processing"), ("decode_tps", "generation")):
-        if m.get(k):
-            x = m[k]
-            L.append("- %s: %s -> %s (ratio %s, %s)" % (lab, _fmt(x["baseline"], k), _fmt(x["candidate"], k), x.get("ratio"), x.get("call")))
-    if m.get("vram_delta_mib") is not None:
-        L.append("- VRAM: %+d MiB" % m["vram_delta_mib"])
-    if m.get("outputs"):
-        o = m["outputs"]
-        L.append("- outputs identical on %s/%s prompts (%s)" % (o.get("identical"), o.get("prompts_compared"), o.get("basis")))
-    L += ["", "## Steps", ""]
-    if not rec["steps"]:
-        L.append("- none run")
-    for s in rec["steps"]:
-        L.append("%d. **%s** (%s): %s" % (s["step"], s["finding"], s["experiment_kind"], s.get("title") or ""))
-        L.append("   - verdict: %s" % s["verdict"])
-        L.append("   - %s" % s["why"])
-        if s.get("change"):
-            L.append("   - change: %s" % _change_text(s["change"]))
-        for c in s.get("caveats") or []:
-            L.append("   - caveat: %s" % c)
+    r = rec["recommended"]
+    sp = rec["starting_point"]
+    L = ["# hotpath improve: %s" % rec["session"], ""]
+    # summary first
+    if res.get("validated"):
+        head = "Validated improvement. " + (res.get("verdict") or "").split(" [")[0]
+    elif res.get("validated") is False:
+        head = (res.get("verdict") or "").split(" Validation run:")[0]
+    else:
+        head = res.get("verdict") or ""
+    L += ["**%s**" % head, ""]
+    if rec.get("decisions"):
+        L += ["%d faster option(s) need your decision (below)." % len(rec["decisions"]), ""]
+    L += ["## What was found", "",
+          "- Starting configuration: `%s` (%s)" % (" ".join(sp["args"]) or "(no arguments)", sp["source"])]
+    b = rec.get("bottleneck")
+    if b:
+        L.append("- Biggest bottleneck: %s [%s, %s%s]" % (b["title"], b.get("severity"), b.get("confidence"),
+                                                            ", at most %.0f%% of request time" % (100 * b["bound"]) if b.get("bound") is not None else ""))
+        for k in b.get("known") or []:
+            L.append("  - known: %s" % k)
+    L += ["- Workload: %s; budget %d experiments / %.0f min; used %d experiment(s)%s, %.1f min in all" % (
+              rec["workload"], rec["budget"]["max_experiments"], rec["budget"]["max_minutes"], rec.get("experiments_run", 0),
+              " + baseline" if rec.get("baseline") else "", rec.get("minutes_used", 0.0)),
+          "- Stopped: %s" % rec.get("stopped_because"), ""]
     if rec.get("next_step"):
         ns = rec["next_step"]
-        L += ["", "## Next step (dry run)", "", "- %s: %s" % (ns["finding"], ns.get("title")),
-              "- arms %s; variable %s; free VRAM needed %s MiB; about %s min" % (", ".join(ns["arms"]), ns.get("variable"), ns.get("min_free_vram_mib"),
-                                                                                "%.0f" % ns["estimated_minutes"] if ns.get("estimated_minutes") else "?"),
-              "- spec: %s" % Path(ns["spec"]).name]
+        L += ["## Plan (dry run, nothing launched)", "",
+              "1. %s: %s" % (ns["finding"], ns.get("title")),
+              "   - arms: %s; variable: %s" % (", ".join(ns["arms"]), ns.get("variable")),
+              "   - free VRAM needed: %s MiB; about %s min (rough: model loads and speeds are estimates)" % (
+                  ns.get("min_free_vram_mib"), "%.0f" % ns["estimated_minutes"] if ns.get("estimated_minutes") else "?"),
+              "2. Then the next finding on whatever was adopted, up to the budget.",
+              "3. If anything was adopted: a validation run of your original launch against the improved one on a broader workload%s." % (
+                  " (about %.0f min)" % rec["validation_estimate_minutes"] if rec.get("validation_estimate_minutes") else ""),
+              "", "Safety: experiments run on hotpath's own llama-server (port %s); your server must be stopped by you if it holds the GPU; nothing is "
+                  "applied to it." % ns.get("port", 8099), ""]
+    if rec["steps"]:
+        L += ["## What was tested", ""]
+        for st in rec["steps"]:
+            L.append("%d. **%s** (%s): %s" % (st["step"], st["finding"], st["experiment_kind"], st.get("title") or ""))
+            why = st["why"][len("not adopted: "):] if st["why"].startswith("not adopted: ") else (st["why"][len("adopted: "):] if st["why"].startswith("adopted: ") else st["why"])
+            L.append("   - %s: %s" % ("kept" if st["adopted"] else "not kept", why))
+            if st.get("fidelity"):
+                L.append("   - outputs: %s" % st["fidelity"])
+            if st.get("change"):
+                L.append("   - change: %s" % _change_text(st["change"]))
+            for o in st.get("other_arms") or []:
+                L.append("   - other arm %s: %s" % (o["arm"], o["why"].replace("not adopted: ", "")))
+        L.append("")
     if rec.get("decisions"):
-        L += ["", "## Needs your decision", "", "Measured faster, but not adopted because only you can accept the trade-off:", ""]
+        L += ["## Needs your decision", "", "Measured faster, but not adopted because only you can accept the trade-off:", ""]
         for d in rec["decisions"]:
             w = (d.get("measured") or {}).get("wall_ms") or {}
             o = (d.get("measured") or {}).get("outputs") or {}
             same = ("outputs identical on %s/%s prompts" % (o.get("identical"), o.get("prompts_compared"))) if o.get("prompts_compared") else "outputs not compared"
-            L.append("- step %d, %s (%s): wall %s -> %s, %s; %s" % (d["step"], d["arm"], d["change"], _fmt(w.get("baseline"), "wall_ms"),
-                                                                      _fmt(w.get("candidate"), "wall_ms"), same, d["needs"]))
-    r = rec["recommended"]
-    L += ["", "## Recommended launch", ""]
+            L.append("- step %d, %s (`%s`): wall %s -> %s, %s%s" % (d["step"], d["arm"], d["change"], _fmt(w.get("baseline"), "wall_ms"),
+                                                                  _fmt(w.get("candidate"), "wall_ms"), same,
+                                                                  " (%s)" % d["fidelity"] if d.get("fidelity") else ""))
+            L.append("  - trade-off: %s" % d["needs"])
+            if d.get("decomposition"):
+                L.append("  - %s" % d["decomposition"]["reading"])
+        L += ["", "To accept one, add its change to your launch yourself; `hotpath improve` will then start from it.", ""]
+    L += ["## Measured result", ""]
+    if res.get("basis"):
+        L += ["Basis: %s." % res["basis"], ""]
+    L += _metrics_lines(res.get("measured")) or ["- nothing measured end to end"]
+    conf = rec.get("confirmation") or {}
+    if conf.get("fidelity"):
+        f = conf["fidelity"]
+        L.append("- output fidelity in the validation run: %s (%s; %s)" % (f.get("class"), f.get("why"), f.get("basis")))
+    L += ["", "## Apply or revert", ""]
     if r["changes"] or r["env"]:
         for c in r["changes"]:
             L.append("- %s: %s -> %s" % (c["flag"], c["from"], c["to"]))
         for e in r["env"]:
             L.append("- environment %s: %s" % (e["variable"], e["to"]))
-        L += ["", "```", " ".join(r["args"]), "```", "", "(%s)" % r["basis"]]
+        L += ["", "Recommended launch (%s):" % r["basis"], "```", " ".join(r["args"]), "```", "Revert to your original launch:", "```",
+              " ".join(r.get("revert_args") or []), "```"]
     else:
-        L.append("- no change")
+        L += ["Your launch stays as it is:", "```", " ".join(r.get("revert_args") or r["args"]), "```"]
     L += ["", r["note"]]
     if rec.get("skipped_findings"):
-        L += ["", "## Findings not run", ""] + ["- %s: %s" % (s["finding"], s["why_not_run"]) for s in rec["skipped_findings"]]
+        L += ["", "## Not tested", ""] + ["- %s: %s" % (x["finding"], x["why_not_run"]) for x in rec["skipped_findings"]]
     if rec.get("remaining"):
         L += ["", "## Still open", ""] + ["- %s (%s): %s" % (f["id"], f.get("confidence"), f.get("title")) for f in rec["remaining"]]
-    L += ["", "A verdict describes this workload on this machine. Output identity is checked on greedy tokens; it is not a check of what your application "
-              "decides from an output."]
+    L += ["", "A verdict describes this workload on this machine. Identical greedy tokens on these prompts are evidence, not proof, that other prompts "
+              "behave the same; output identity is not a check of what your application decides from an output."]
     return "\n".join(L) + "\n"
 
 

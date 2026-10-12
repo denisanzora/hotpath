@@ -148,7 +148,7 @@ class ImproveLoopTests(unittest.TestCase):
         self.assertIn("real-traffic evidence", skipped["per_request_overhead"])
         self.assertNotIn("--cache-ram", " ".join(str(x) for x in rep["recommended"]["args"]))
         # and when a verdict does carry a gate that does not support applying it, the adoption check refuses it
-        ok, why = im.adoptable({"verdict": "keep on this machine: 9% wall improvement"}, {"production_gate": "production applicability unknown: no evidence"})
+        ok, why, _ = im.adoptable({"verdict": "keep on this machine: 9% wall improvement"}, {"production_gate": "production applicability unknown: no evidence"})
         self.assertFalse(ok)
         self.assertIn("production", why)
 
@@ -190,17 +190,15 @@ class ImproveLoopTests(unittest.TestCase):
         # failure 8
         runner = FakeRunner()
         self.run_loop(runner)
-        self.assertEqual({s["workload"] for s in runner.specs}, {self.workload})
+        self.assertEqual({s["workload"] for s in runner.specs if s["provenance"].get("experiment_kind") != "confirmation"}, {self.workload})
 
-    def test_one_adopted_change_needs_no_extra_confirmation_run(self):
-        # failure 6: a single adopted change was already measured original-vs-candidate in its own paired run
+    def test_one_adopted_change_is_still_validated(self):
+        # failure 6 (revised in 0.3: a three-prompt step is not enough to recommend a change; see test_improve_trust)
         runner = FakeRunner()
         rep = self.run_loop(runner)
-        adopted = [s for s in rep["steps"] if s["adopted"]]
         conf = [s for s in runner.specs if s["provenance"].get("experiment_kind") == "confirmation"]
-        if len(adopted) == 1:
-            self.assertEqual(conf, [])
-            self.assertEqual(rep["result"]["measured_by"], adopted[0]["experiment"])
+        self.assertEqual(len(conf), 1)
+        self.assertEqual(rep["result"]["measured_by"], conf[0]["name"])
         self.assertTrue(rep["result"]["verdict"].startswith("keep"))
 
     def test_two_adopted_changes_are_confirmed_jointly(self):

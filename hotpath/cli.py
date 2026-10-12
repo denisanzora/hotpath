@@ -381,6 +381,14 @@ def cmd_improve(args):
                          "(`hotpath init --root DIR` when they live outside the standard locations).")
     out = _out(args)
     records, start = [], None
+    if args.resume:
+        rep = imp.improve(cfg, [], args.workload or "", out, _experiment_runner(cfg, args.wait_s), max_experiments=args.max_experiments,
+                          max_minutes=args.max_minutes, rounds=args.rounds, repetitions=args.repetitions, warmup=args.warmup, port=args.port,
+                          n_predict=args.n_predict, bandwidth_gbs=args.bandwidth_gbs, session=args.resume, resume=True, log=lambda m: print(m, flush=True))
+        print("")
+        print(imp.improvement_markdown(rep))
+        print("wrote %s" % rep["path"])
+        return 0
     if args.from_records:
         records = [load_record(p) for p in args.from_records]
         start = "the records you named: %s" % ", ".join(Path(p).name for p in args.from_records)
@@ -624,6 +632,8 @@ def build_parser():
     s.add_argument("--max-experiments", type=int, default=3, help="experiments to run at most, not counting the baseline and the final confirmation (default 3)")
     s.add_argument("--max-minutes", type=float, default=60, help="stop before a step whose estimated duration would exceed this (default 60)")
     s.add_argument("--dry-run", action="store_true", help="passive: diagnose and write the first spec, launch nothing")
+    s.add_argument("--resume", metavar="SESSION", help="continue an interrupted session (its directory name under results/local): experiments it already "
+                   "recorded are reused, not run again; the session's starting point and workload are kept")
     s.add_argument("--wait-s", type=int, default=0, help="wait up to this long for each experiment's preconditions (free GPU)")
     s.add_argument("--port", type=int, default=8099); s.add_argument("--rounds", type=int, default=3); s.add_argument("--repetitions", type=int, default=2)
     s.add_argument("--warmup", type=int, default=1); s.add_argument("--n-predict", type=int); s.add_argument("--bandwidth-gbs", type=float)

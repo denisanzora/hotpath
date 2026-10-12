@@ -703,18 +703,43 @@ def observed_request_tokens(ev, arm):
     return (int(max(sizes)), len(sizes)) if sizes else (None, 0)
 
 
-def smaller_context_arm(ev, arm, est, settings, on_gpu, total):
-    """When no more layers fit: an arm whose context is sized from the real traffic (twice the largest observed request,
-    a power of two, at least 4096) and whose freed KV memory goes to GPU layers, if the context at least halves and the
-    estimate gives two or more layers. The f16 KV cache stays, so the arithmetic of requests that fit is unchanged; requests
-    longer than the new context would fail, which the arm states (`capacity_change`) so it is never adopted silently."""
+GROWING_CONVERSATION_SHARE = 0.2   # share of requests that are later turns of a growing conversation above which no cap is proposed
+
+
+def _flags_of(ev, settings):
+    flags = list(settings.get("flags") or [])
+    obs = (ev.get("observed_launch") or {}).get("argv_redacted") or []
+    return flags + [str(x) for x in obs]
+
+
+def smaller_context_arm(ev, arm, est, settings, on_gpu, total, policy_max_tokens=None):
+    """When no more layers fit: an arm with a smaller context whose freed KV memory goes to GPU layers (f16 KV kept, so
+    the arithmetic of requests that fit is unchanged).
+
+    Sizing: per slot, twice the largest real request (prompt tokens as the server counted them, template included, plus
+    reused tokens plus generated tokens), a power of two, at least 4096; times the number of parallel slots, since
+    llama-server divides --ctx-size among them. With an operator's binding `max_request_tokens` the cap is that limit per
+    slot instead, and the arm carries no capacity warning (the operator decided). Without a policy no cap is proposed when
+    real requests look like later turns of growing conversations (most of the prompt reused), when fewer than
+    MIN_REQUESTS_FOR_CONTEXT requests were seen, or when the context would not at least halve."""
     n_ctx = _f(settings.get("n_ctx")) or _f(((ev.get("server_props") or {}).get("n_ctx_per_slot")))
-    biggest, count = observed_request_tokens(ev, arm)
-    if not n_ctx or not biggest or count < MIN_REQUESTS_FOR_CONTEXT or not est.get("kv_mib") or not total:
+    parallel = max(1, int(_f(settings.get("n_parallel"), 1) or 1))
+    if not n_ctx or not est.get("kv_mib") or not total:
         return None
-    new_ctx = 4096
-    while new_ctx < 2 * biggest:
-        new_ctx *= 2
+    rows = (arm or {}).get("requests") if (arm or {}).get("evidence_class") in ("passive", "active") else (ev.get("log") or {}).get("rows")
+    rows = [r for r in rows or [] if _f(r.get("prompt_n")) is not None]
+    biggest, count = observed_request_tokens(ev, arm)
+    growing = sum(1 for r in rows if (_f(r.get("cache_n")) or 0) >= 0.5 * ((_f(r.get("prompt_n")) or 0) + (_f(r.get("cache_n")) or 0)))
+    max_gen = max([_f(r.get("predicted_n")) or 0 for r in rows] or [0])
+    if policy_max_tokens:
+        per_slot = int(-(-int(policy_max_tokens) // 256) * 256)
+    else:
+        if not biggest or count < MIN_REQUESTS_FOR_CONTEXT or growing >= GROWING_CONVERSATION_SHARE * max(count, 1):
+            return None
+        per_slot = 4096
+        while per_slot < 2 * biggest:
+            per_slot *= 2
+    new_ctx = per_slot * parallel
     if new_ctx * 2 > n_ctx:
         return None
     kv_new = est["kv_mib"] * new_ctx / n_ctx
@@ -722,10 +747,36 @@ def smaller_context_arm(ev, arm, est, settings, on_gpu, total):
     fit = min(total, int(max(0.0, est["free_mib"] * 0.95 - kv_new - est["compute_mib"]) // per_layer)) if per_layer > 0 else 0
     if fit < on_gpu + 2:
         return None
-    return {"name": "ctx%d-ngl%d" % (new_ctx, fit), "args_override": {"--ctx-size": new_ctx, "--gpu-layers": fit},
-            "capacity_change": "context %d -> %d tokens: a request longer than %d tokens (prompt + output) would fail; the largest of %d observed real requests "
-                               "was %d tokens" % (int(n_ctx), new_ctx, new_ctx, count, biggest),
-            "estimate": "KV cache %.0f -> %.0f MiB, room for %d layers instead of %d" % (est["kv_mib"], kv_new, fit, on_gpu)}
+    arm_out = {"name": "ctx%d-ngl%d" % (new_ctx, fit), "args_override": {"--ctx-size": new_ctx, "--gpu-layers": fit},
+               "estimate": "KV cache %.0f -> %.0f MiB, room for %d layers instead of %d" % (est["kv_mib"], kv_new, fit, on_gpu)}
+    if policy_max_tokens:
+        arm_out["context_policy"] = int(policy_max_tokens)
+        arm_out["sizing"] = "max_request_tokens %d from hotpath.local.json (binding) x %d slot(s)" % (int(policy_max_tokens), parallel)
+        return arm_out
+    flags = _flags_of(ev, settings)
+    shift = "--context-shift" in flags
+    consequence = ("the server runs with --context-shift, so it would silently drop the start of a longer conversation (context shift) instead of refusing it"
+                   if shift else "llama-server refuses a request that does not fit its slot's context with an error, so a longer request would fail")
+    arm_out["capacity_change"] = ("context %d -> %d tokens (%d per slot x %d): %s. Sized at twice the largest of %d observed real requests (%d tokens: prompt with "
+                                  "template as the server counted it, reused and generated tokens; the largest generation seen was %d tokens, and the largest a "
+                                  "client may request is not in the evidence)" % (int(n_ctx), new_ctx, per_slot, parallel, consequence, count, biggest, int(max_gen)))
+    arm_out["sizing"] = "2 x largest observed request per slot, rounded up to a power of two, at least 4096"
+    return arm_out
+
+
+def context_arms(ev, arm, est, settings, on_gpu, total, policy_max_tokens=None):
+    """The smaller-context arm and, with it, a control at the same context but the current GPU layers: the pair separates
+    what the context change does by itself from what the extra GPU layers it makes room for do."""
+    a = smaller_context_arm(ev, arm, est, settings, on_gpu, total, policy_max_tokens)
+    if not a:
+        return []
+    ctrl = {"name": "ctx%d-ngl%d" % (a["args_override"]["--ctx-size"], on_gpu),
+            "args_override": {"--ctx-size": a["args_override"]["--ctx-size"], "--gpu-layers": on_gpu},
+            "control": "same context as %s with the current GPU layers: isolates the effect of the context change itself" % a["name"]}
+    for k in ("capacity_change", "context_policy"):
+        if a.get(k):
+            ctrl[k] = a[k]
+    return [a, ctrl]
 
 
 def rule_offload(ev, label, arm):
@@ -766,7 +817,7 @@ def rule_offload(ev, label, arm):
         elif est["layers_that_fit"] and est["layers_that_fit"] > n + 1:
             arms = [current, {"name": "ngl%d" % est["layers_that_fit"], "args_override": {"--gpu-layers": est["layers_that_fit"]}}]
         else:
-            cands = [a for a in (smaller_context_arm(ev, arm, est, s, n, m), kv_requant_arm(est, s, n, m)) if a]
+            cands = context_arms(ev, arm, est, s, n, m, ev.get("context_policy")) + [a for a in (kv_requant_arm(est, s, n, m),) if a]
             if cands:
                 arms = [current] + cands
             else:
@@ -1226,6 +1277,7 @@ def experiment_verdict(rec):
             row["validity"] = {"baseline": bv, "candidate": cv, "level": (bv.get("validation_level") or cv.get("validation_level")), "decided_on": key,
                                "downgraded_from_full": (not full) and any((v.get("schema_checked") or 0) > 0 for v in (bv, cv)),
                                "dropped": dropped}
+        row["fidelity"] = arm_fidelity(base, cand, row, oe, full)
         w = row["metrics"].get("wall_ms", {})
         n_prompts = w.get("prompts") or 0
         n_rounds = int((rec.get("spec_redacted") or {}).get("rounds") or 1)
@@ -1244,8 +1296,10 @@ def experiment_verdict(rec):
         elif w.get("call") == "improvement" and all_identical:
             verdict = "keep %s: %.1f%% wall improvement, same direction on %d/%d prompts, identical outputs (%s)" % (scope, 100 * (1 - w["ratio"]), w["consistent_direction"], w["prompts"], basis)
         elif w.get("call") == "improvement":
-            verdict = "faster %s, but outputs differ on %d/%d prompts: explain the difference (numerical shift vs behavior change) before keeping" % (
-                scope, row["outputs"]["prompts_compared"] - row["outputs"]["identical"], row["outputs"]["prompts_compared"])
+            fc = row["fidelity"]
+            verdict = "faster %s, but outputs differ on %d/%d prompts%s: explain the difference (numerical shift vs behavior change) before keeping" % (
+                scope, row["outputs"]["prompts_compared"] - row["outputs"]["identical"], row["outputs"]["prompts_compared"],
+                " (%s: %s)" % (fc["class"], fc["why"]) if fc and fc.get("class") not in (None, "not compared") else "")
         elif w.get("call") == "regression":
             verdict = "reject %s: %.1f%% wall regression" % (scope, 100 * (w["ratio"] - 1))
         elif any(m["call"] == "improvement" for m in row["metrics"].values()):
@@ -1272,6 +1326,33 @@ def experiment_verdict(rec):
         rows.append(row)
     return {"experiment": rec.get("name"), "evidence_class": rep.get("evidence_class"), "comparability_issues": rep.get("comparability_issues"), "arms": rows,
             "scope_note": "A verdict describes this workload on this machine; it is not a property of the runtime in general."}
+
+
+def arm_fidelity(base, cand, row, oe, full_label):
+    """The fidelity class of a candidate arm: from the probes (top-k log-probabilities) when both arms have them, else from
+    token/hash identity alone. Validity drops and an unreproducible baseline override everything."""
+    from hotpath import fidelity
+    validity_dropped = bool((row.get("validity") or {}).get("dropped"))
+    reproducible = all(e.get("stable_within_reference", True) for e in oe.values() if full_label in e)
+    bp, cp = base.get("probes") or {}, cand.get("probes") or {}
+    prompts = {}
+    for pid in bp:
+        if pid in cp and not bp[pid].get("error") and not cp[pid].get("error"):
+            prompts[pid] = fidelity.compare_probes(bp[pid], cp[pid])
+    basis = "probes with top-%s log-probabilities" % min([x.get("k") or 0 for x in list(bp.values()) + list(cp.values()) if isinstance(x, dict) and x.get("k")] or [0])
+    if not prompts:
+        # no probes (older records, requests workloads): identity only, never a near-tie claim
+        for pid, e in oe.items():
+            if full_label in e:
+                prompts[pid] = {"class": "token-identical" if e[full_label].get("identical") else "diverged",
+                                "first_divergence_index": e[full_label].get("first_divergence_index")}
+        basis = "token ids or output hashes only (no probability probes)"
+    mismatch = [pid for pid, pr in list(bp.items()) + list(cp.items()) if isinstance(pr, dict) and pr.get("matches_timed") is False]
+    out = fidelity.classify_arm(prompts, validity_dropped=validity_dropped, baseline_reproducible=reproducible)
+    out.update({"basis": basis, "per_prompt": prompts})
+    if mismatch:
+        out["note"] = "probe outputs differ from the timed outputs on %s: the server is not deterministic for these prompts" % sorted(set(mismatch))[:5]
+    return out
 
 
 def insufficiencies(ev, arm):
@@ -1308,6 +1389,8 @@ def apply_local_config(ev, cfg):
     declared rather than observed in the findings' `source`."""
     if not cfg:
         return ev
+    if cfg.get("max_request_tokens"):
+        ev["context_policy"] = int(cfg["max_request_tokens"])
     args = cfg.get("server_args")
     if args:
         for a in ev["arms"].values():
@@ -1446,7 +1529,7 @@ def traffic_shape(arm, label=None):
         return None
     pt, gn = percentiles(tot), percentiles(gen)
     return {"prompt_tokens_p10": int(pt["p10"]), "prompt_tokens_median": int(pt["median"]), "prompt_tokens_p90": int(pt["p90"]),
-            "generated_tokens_median": int(gn["median"]), "requests": pt["n"],
+            "prompt_tokens_max": int(max(tot)), "generated_tokens_median": int(gn["median"]), "generated_tokens_max": int(max(gen)), "requests": pt["n"],
             "basis": "%d requests in %s, prompt tokens including those reused from the cache" % (pt["n"], label or arm.get("evidence_class"))}
 
 

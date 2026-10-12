@@ -265,6 +265,8 @@ def run(spec, out_dir, dry_run=False, wait_for_preconditions_s=0):
                 if res.get("cache"):
                     arm_rec["cache"] = res["cache"]
                 arm_rec["gpu_snapshots"] += [dict(s, round=rnd) for s in res["gpu_snapshots"]]
+                if rnd == 0 and workload.get("kind") != "requests" and int(spec.get("probe_top_k", 10)) > 0:
+                    arm_rec["probes"] = probe_outputs(base, workload, int(spec.get("probe_top_k", 10)), res["requests"])
                 arm_rec["launch_facts"].append({"round": rnd, "load_s": load_s, "props": snap.get("props"),
                                                 "process_counters_after": gpu_mod.windows_process_gpu_counters(pid),
                                                 "gpu_after": gpu_mod.gpu_dynamic()})
@@ -279,6 +281,26 @@ def run(spec, out_dir, dry_run=False, wait_for_preconditions_s=0):
         arm_rec["summary"] = summarize_requests(arm_rec["requests"])
     rec["server_launches_total"] = len(rec["launches"])
     return rec
+
+
+def probe_outputs(base, workload, k, timed_requests):
+    """Untimed: every prompt once more with the same greedy settings and n_probs=k, for the fidelity comparison between
+    arms (asking for probabilities slows generation, so timed requests never do). Records whether the probe produced the
+    same tokens as this arm's timed requests."""
+    from hotpath import fidelity
+    out = {}
+    for p in workload["prompts"]:
+        try:
+            resp = srv.completion(base, p["text"], workload["n_predict"], temperature=workload.get("temperature", 0.0), cache_prompt=False,
+                                  ignore_eos=bool(workload.get("ignore_eos", True)), extra={"n_probs": int(k)})
+        except Exception as e:  # noqa: BLE001 - a missing probe makes the comparison weaker, not the run invalid
+            out[p["id"]] = {"error": str(e)[:200]}
+            continue
+        pr = fidelity.probe_from_response(resp)
+        timed = [r.get("tokens") for r in timed_requests if r.get("prompt_id") == p["id"] and r.get("tokens")]
+        pr["matches_timed"] = (pr["tokens"] == timed[0]) if timed else None
+        out[p["id"]] = pr
+    return out
 
 
 def plan_json(spec):
