@@ -31,7 +31,8 @@ KNOWN_BANDWIDTH_GBS = {
 
 def _run(cmd, timeout=20):
     try:
-        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        # stdin is never inherited: under the MCP server it is the JSON-RPC pipe, and PowerShell waits for it to close
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, stdin=subprocess.DEVNULL)
         return p.returncode, p.stdout, p.stderr
     except (OSError, subprocess.TimeoutExpired) as e:
         return -1, "", str(e)

@@ -359,7 +359,7 @@ def _profile(a):
 
 def _kill_tree(proc):
     if os.name == "nt":
-        subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)], capture_output=True)
+        subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)], capture_output=True, stdin=subprocess.DEVNULL)
     else:
         import signal
         try:
@@ -371,6 +371,7 @@ def _kill_tree(proc):
 def _child_env():
     env = dict(os.environ)
     env["PYTHONIOENCODING"] = "utf-8"
+    env["PYTHONUNBUFFERED"] = "1"             # a job's progress lines reach its output file (and hotpath_job_status) as they happen
     # the child must import this same hotpath, also when it runs from a source checkout and the working directory is elsewhere
     pkg_parent = str(Path(__file__).resolve().parent.parent)
     env["PYTHONPATH"] = os.pathsep.join([pkg_parent] + [p for p in env.get("PYTHONPATH", "").split(os.pathsep) if p])
@@ -400,7 +401,8 @@ def _run_child(argv, timeout_s):
     if os.name != "nt":
         kw["start_new_session"] = True
     t0 = time.time()
-    proc = subprocess.Popen([sys.executable, "-m", "hotpath"] + argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    # stdin=DEVNULL: the child must never read (or wait on) this server's JSON-RPC pipe
+    proc = subprocess.Popen([sys.executable, "-m", "hotpath"] + argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, stdin=subprocess.DEVNULL,
                             text=True, encoding="utf-8", errors="replace", env=_child_env(), **kw)
     try:
         out, err = proc.communicate(timeout=timeout_s)
@@ -431,7 +433,8 @@ class Job:
         self.cancelled = False
         kw = {"start_new_session": True} if os.name != "nt" else {}
         self._out, self._err = open(self.out_path, "w", encoding="utf-8"), open(self.err_path, "w", encoding="utf-8")
-        self.proc = subprocess.Popen([sys.executable, "-m", "hotpath"] + argv, stdout=self._out, stderr=self._err, env=_child_env(), **kw)
+        self.proc = subprocess.Popen([sys.executable, "-m", "hotpath"] + argv, stdout=self._out, stderr=self._err, stdin=subprocess.DEVNULL,
+                                     env=_child_env(), **kw)
         self.done = threading.Event()
         threading.Thread(target=self._watch, daemon=True).start()
 

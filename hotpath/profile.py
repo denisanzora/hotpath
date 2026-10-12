@@ -16,7 +16,7 @@ from hotpath.records import redact_args, file_identity, new_record
 
 
 def _run(cmd, env=None, timeout=3600):
-    p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, env=env)
+    p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, env=env, stdin=subprocess.DEVNULL)
     return p.returncode, p.stdout, p.stderr
 
 

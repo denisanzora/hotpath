@@ -94,7 +94,8 @@ def _win_argv(cmdline):
 
 def _run(cmd, timeout=20, env=None):
     try:
-        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, env=env, errors="replace")
+        # stdin is never inherited: under the MCP server it is the JSON-RPC pipe, and PowerShell waits for it to close
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, env=env, errors="replace", stdin=subprocess.DEVNULL)
         return p.returncode, p.stdout or "", p.stderr or ""
     except (OSError, subprocess.TimeoutExpired) as e:
         return None, "", str(e)

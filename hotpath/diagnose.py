@@ -1368,6 +1368,10 @@ def diagnosis_brief(d, path=None, discovery=None, top=5):
     L += ["", "Next:"]
     if rec:
         out = "experiments/%s.json" % rec.get("kind", "next")
+        n = 2
+        while Path(out).exists():                 # propose never overwrites: suggest a name that is free
+            out = "experiments/%s-%d.json" % (rec.get("kind", "next"), n)
+            n += 1
         L.append("- hotpath propose %s --finding %s --out %s   (writes a one-variable spec and shows its plan; launches nothing)" % (path or "<diagnosis.json>", rec["finding"], out))
         L.append("- hotpath experiment %s   (ACTIVE: launches its own llama-server per arm on port 8099, interleaved; your server is not touched)" % out)
         if discovery:

@@ -153,7 +153,7 @@ def _launch(cmd, env, log_path):
     kw = {}
     if os.name == "nt":
         kw["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-    proc = subprocess.Popen(cmd, env=env, stdout=log, stderr=log, **kw)
+    proc = subprocess.Popen(cmd, env=env, stdout=log, stderr=log, stdin=subprocess.DEVNULL, **kw)
     return proc, log
 
 
