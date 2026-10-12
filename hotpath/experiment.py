@@ -96,6 +96,9 @@ def plan(spec):
              "Workload: %s, n_predict %s, repetitions %s, warmup %s" % (redact_path(spec["workload"]), spec.get("n_predict") or ("%s (from the workload)" % wl_np if wl_np else "per request body"),
                                                                        spec.get("repetitions", 2), spec.get("warmup", 1)),
              "Preconditions: %s" % (spec.get("preconditions") or {}), ""]
+    est = (spec.get("provenance") or {}).get("estimated_duration")
+    if est:
+        lines.insert(-1, "Estimated duration: about %.0f min (rough: %s)" % (max(1.0, est["minutes"]), est["basis"]))
     lines.insert(-1, "Cache mode: %s; slot-save-path for hotpath-owned servers: %s; schema validation: %s" % (
         spec.get("cache_mode", "cold (workload default)"), spec.get("slot_save_path") or "off", spec.get("schema_validation", "auto")))
     for a in arms:

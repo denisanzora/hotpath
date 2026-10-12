@@ -166,6 +166,34 @@ def build_spec(finding, cfg, common_args, workload, port=8099, rounds=3, repetit
     return spec
 
 
+LAUNCH_S_ASSUMED = 30
+
+
+def estimate_minutes(spec, rates):
+    """Rough duration of a run from the diagnosed configuration's own prefill/decode rates and the workload's size, for
+    planning (and for an agent's polling); every arm is assumed to run at the baseline's rates, so a faster candidate
+    finishes sooner. Model load time is an assumption. None when rates or the workload are unknown."""
+    from hotpath.workload import load_workload
+    if not rates or not rates.get("prefill_tps") or not rates.get("decode_tps"):
+        return None
+    try:
+        w = load_workload(spec["workload"])
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+    if w.get("kind") == "requests":
+        sizes = [(len(json.dumps(it["body"].get("messages") or it["body"].get("prompt") or "")) / 4.0,
+                  it["body"].get("max_tokens") or it["body"].get("n_predict") or 256) for it in w["items"]]
+    else:
+        n_predict = spec.get("n_predict") or w.get("n_predict") or 64
+        sizes = [(1.2 * (p.get("words") or len(p["text"].split())) + 15, n_predict) for p in w["prompts"]]
+    per_pass = sum(t / rates["prefill_tps"] + n / rates["decode_tps"] + 0.2 for t, n in sizes)
+    per_launch = (int(spec.get("warmup", 1)) + int(spec.get("repetitions", 2))) * per_pass + LAUNCH_S_ASSUMED + float(spec.get("cooldown_s", 5))
+    launches = int(spec.get("rounds", 3)) * len(spec["arms"])
+    return {"minutes": round(launches * per_launch / 60.0, 1),
+            "basis": "baseline rates %.0f/%.1f t/s prefill/decode (%s) for every arm, prompt tokens estimated from the workload, %d s per model load assumed" % (
+                rates["prefill_tps"], rates["decode_tps"], rates.get("basis"), LAUNCH_S_ASSUMED)}
+
+
 def _arm_args(common, arm):
     args = list(common)
     for k, v in (arm.get("args_override") or {}).items():
@@ -208,6 +236,9 @@ def propose(diagnosis_path, finding_id, cfg, workload, out_path, common_args=Non
     if removed:
         spec["provenance"]["removed_server_args"] = sorted(set(removed))
     spec["provenance"]["diagnosis"] = Path(diagnosis_path).name
+    est = estimate_minutes(spec, d.get("rates"))
+    if est:
+        spec["provenance"]["estimated_duration"] = est
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(spec, indent=2) + "\n", encoding="utf-8")
     return spec, source

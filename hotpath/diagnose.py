@@ -1374,7 +1374,12 @@ def diagnose(records, bandwidth_gbs=None, cfg=None):
     recommended = next((f for f in findings if f["id"] not in tested and not f.get("superseded_by") and f.get("experiment")
                         and isinstance(f["experiment"].get("arms"), list) and f["severity"] in ("high", "medium")), None)
     obs = ev.get("observed_launch") or {}
-    return {"kind": "diagnosis", "evidence_class": "hypothesis" if not ev["experiments"] else "controlled", "sources": ev["sources"], "diagnosed_arm": label,
+    reqs = (arm or {}).get("requests") or []
+    rates = {"prefill_tps": _med(percentiles([r.get("prompt_tps") for r in reqs])), "decode_tps": _med(percentiles([r.get("predicted_tps") for r in reqs])),
+             "basis": "per-request medians of %s" % label}
+    if not (rates["prefill_tps"] and rates["decode_tps"]) and (arm or {}).get("metrics"):
+        rates = {"prefill_tps": arm["metrics"].get("prefill_tps"), "decode_tps": arm["metrics"].get("decode_tps"), "basis": "/metrics totals"}
+    return {"kind": "diagnosis", "rates": rates if rates["prefill_tps"] and rates["decode_tps"] else None, "evidence_class": "hypothesis" if not ev["experiments"] else "controlled", "sources": ev["sources"], "diagnosed_arm": label,
             "diagnosed_arm_reason": diagnosed_why, "cache_conditions": conditions, "phase_shares": shares, "rank_basis": RANK_BASIS,
             "observed_launch": {"args_redacted": obs.get("argv_redacted"), "source": obs.get("settings_source"), "describe": obs.get("describe")} if obs else None,
             "baseline_args": (arm or {}).get("args"), "baseline_from_verdict": baseline_from,
