@@ -94,22 +94,24 @@ def next_finding(diag, attempted, requests_workload):
     return None, skipped
 
 
-def adoptable(row, verdict):
-    """(adopt?, reason). Only `keep` is adopted; a production gate that does not support applying the flag blocks it."""
+def adoptable(row, verdict, arm=None):
+    """(adopt?, reason). Only `keep` is adopted; a production gate that does not support applying the flag blocks it, and
+    so does a change that limits what the server accepts (a smaller context), which is the user's call."""
     if not row["verdict"].startswith("keep"):
         return False, "not adopted: the verdict is not keep (%s)" % row["verdict"].split(":")[0]
+    if (arm or {}).get("capacity_change"):
+        return False, "not adopted: faster with identical outputs, but it changes what the server accepts (%s); your decision" % arm["capacity_change"]
     gate = verdict.get("production_gate")
     if gate and not gate.startswith("production applicability supported"):
         return False, "not adopted: faster on isolated requests, but %s" % gate
     return True, "adopted: keep verdict"
 
 
-def _best_row(verdict):
-    rows = [r for r in verdict["arms"] if r["verdict"].startswith("keep")]
-    if not rows:
-        rows = list(verdict["arms"])
+def _rank_rows(verdict):
+    """Candidate rows, keep verdicts first, fastest first."""
+    rows = list(verdict["arms"])
     rows.sort(key=lambda r: (not r["verdict"].startswith("keep"), (r["metrics"].get("wall_ms") or {}).get("ratio", 1.0)))
-    return rows[0] if rows else None
+    return rows
 
 
 def _metric_line(row):
@@ -202,7 +204,7 @@ def improve(cfg, start_records, workload, out_dir, runner, max_experiments=3, ma
     report = {"session": session, "starting_point": {"args": args0, "source": source, "removed_server_args": sorted(set(removed)),
                                                      "diagnosed_arm": diag.get("diagnosed_arm"), "sources": diag.get("sources")},
               "workload": Path(workload).name, "budget": {"max_experiments": budget.max_experiments, "max_minutes": budget.max_minutes},
-              "steps": steps, "skipped_findings": [], "confirmation": None, "next_step": None, "baseline": baseline}
+              "steps": steps, "skipped_findings": [], "confirmation": None, "next_step": None, "baseline": baseline, "decisions": []}
     stopped = None
     if baseline and baseline.get("failed"):
         stopped = "the baseline launch failed: %s (see the server log in %s)" % ("; ".join(baseline["failed"]), sdir.name)
@@ -259,15 +261,33 @@ def improve(cfg, start_records, workload, out_dir, runner, max_experiments=3, ma
         verdict = next((v for v in diag.get("experiment_verdicts") or [] if v["experiment"] == rec["name"]), None)
         step = {"step": n, "finding": f["id"], "title": f.get("title"), "experiment_kind": f["experiment"]["kind"], "experiment": name,
                 "record": rpath.name, "arms": [a["name"] for a in spec["arms"]], "estimated_minutes": need}
-        row = _best_row(verdict) if verdict else None
+        rows = _rank_rows(verdict) if verdict else []
+        arm_of = {a["name"]: a for a in spec["arms"]}
+        row, ok, why = None, False, None
+        for r in rows:
+            r_ok, r_why = adoptable(r, verdict, arm_of.get(r["arm"]))
+            if r_ok:
+                row, ok, why = r, True, r_why
+                break
+        if not row and rows:
+            row = rows[0]
+            ok, why = adoptable(row, verdict, arm_of.get(row["arm"]))
+        # faster candidates that only the user can accept: a capacity change, or outputs that differ
+        for r in rows:
+            if r is row and ok:
+                continue
+            a = arm_of.get(r["arm"]) or {}
+            if (r["verdict"].startswith("keep") and a.get("capacity_change")) or r["verdict"].startswith("faster"):
+                report["decisions"].append({"step": n, "arm": r["arm"], "change": _change_text(a), "verdict": r["verdict"],
+                                            "needs": a.get("capacity_change") or "the outputs differ: check whether the difference matters for your application",
+                                            "measured": _metric_line(r)})
         if not row:
             step.update({"adopted": False, "verdict": "no verdict (the record has fewer than two arms with requests)", "why": "nothing to compare"})
         else:
-            ok, why = adoptable(row, verdict)
             step.update({"adopted": ok, "candidate": row["arm"], "verdict": row["verdict"], "why": why, "measured": _metric_line(row),
                          "caveats": verdict.get("caveats") or []})
             if ok:
-                arm = next(a for a in spec["arms"] if a["name"] == row["arm"])
+                arm = arm_of[row["arm"]]
                 best["args"], best["env"] = materialize(spec["common_args"], spec.get("env"), arm)
                 best["label"] = "%s/%s" % (rec["name"], row["arm"])
                 for k, v in (arm.get("args_override") or {}).items():
@@ -526,6 +546,14 @@ def improvement_markdown(rec):
               "- arms %s; variable %s; free VRAM needed %s MiB; about %s min" % (", ".join(ns["arms"]), ns.get("variable"), ns.get("min_free_vram_mib"),
                                                                                 "%.0f" % ns["estimated_minutes"] if ns.get("estimated_minutes") else "?"),
               "- spec: %s" % Path(ns["spec"]).name]
+    if rec.get("decisions"):
+        L += ["", "## Needs your decision", "", "Measured faster, but not adopted because only you can accept the trade-off:", ""]
+        for d in rec["decisions"]:
+            w = (d.get("measured") or {}).get("wall_ms") or {}
+            o = (d.get("measured") or {}).get("outputs") or {}
+            same = ("outputs identical on %s/%s prompts" % (o.get("identical"), o.get("prompts_compared"))) if o.get("prompts_compared") else "outputs not compared"
+            L.append("- step %d, %s (%s): wall %s -> %s, %s; %s" % (d["step"], d["arm"], d["change"], _fmt(w.get("baseline"), "wall_ms"),
+                                                                      _fmt(w.get("candidate"), "wall_ms"), same, d["needs"]))
     r = rec["recommended"]
     L += ["", "## Recommended launch", ""]
     if r["changes"] or r["env"]:

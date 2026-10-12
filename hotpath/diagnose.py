@@ -686,6 +686,48 @@ def kv_requant_arm(est, settings, on_gpu, total):
             "estimate": "KV cache %.0f -> %.0f MiB frees about %.0f MiB, room for %d layers instead of %d" % (est["kv_mib"], kv_q8, est["kv_mib"] - kv_q8, fit, on_gpu)}
 
 
+MIN_REQUESTS_FOR_CONTEXT = 10     # real requests needed before the largest one says anything about the context the traffic needs
+
+
+def observed_request_tokens(ev, arm):
+    """(largest prompt + generated tokens of one real request, number of requests) from the user's own traffic: the
+    diagnosed arm when it is real traffic, else the server log. Never hotpath's synthetic experiment workloads."""
+    rows = (arm or {}).get("requests") if (arm or {}).get("evidence_class") in ("passive", "active") else (ev.get("log") or {}).get("rows")
+    sizes = []
+    for r in rows or []:
+        p = _f(r.get("prompt_n"))
+        if p is None:
+            continue
+        c = _f(r.get("cache_n"))
+        sizes.append(p + (c if c and c > 0 else 0) + (_f(r.get("predicted_n")) or 0))
+    return (int(max(sizes)), len(sizes)) if sizes else (None, 0)
+
+
+def smaller_context_arm(ev, arm, est, settings, on_gpu, total):
+    """When no more layers fit: an arm whose context is sized from the real traffic (twice the largest observed request,
+    a power of two, at least 4096) and whose freed KV memory goes to GPU layers, if the context at least halves and the
+    estimate gives two or more layers. The f16 KV cache stays, so the arithmetic of requests that fit is unchanged; requests
+    longer than the new context would fail, which the arm states (`capacity_change`) so it is never adopted silently."""
+    n_ctx = _f(settings.get("n_ctx")) or _f(((ev.get("server_props") or {}).get("n_ctx_per_slot")))
+    biggest, count = observed_request_tokens(ev, arm)
+    if not n_ctx or not biggest or count < MIN_REQUESTS_FOR_CONTEXT or not est.get("kv_mib") or not total:
+        return None
+    new_ctx = 4096
+    while new_ctx < 2 * biggest:
+        new_ctx *= 2
+    if new_ctx * 2 > n_ctx:
+        return None
+    kv_new = est["kv_mib"] * new_ctx / n_ctx
+    per_layer = est["weights_mib"] / total
+    fit = min(total, int(max(0.0, est["free_mib"] * 0.95 - kv_new - est["compute_mib"]) // per_layer)) if per_layer > 0 else 0
+    if fit < on_gpu + 2:
+        return None
+    return {"name": "ctx%d-ngl%d" % (new_ctx, fit), "args_override": {"--ctx-size": new_ctx, "--gpu-layers": fit},
+            "capacity_change": "context %d -> %d tokens: a request longer than %d tokens (prompt + output) would fail; the largest of %d observed real requests "
+                               "was %d tokens" % (int(n_ctx), new_ctx, new_ctx, count, biggest),
+            "estimate": "KV cache %.0f -> %.0f MiB, room for %d layers instead of %d" % (est["kv_mib"], kv_new, fit, on_gpu)}
+
+
 def rule_offload(ev, label, arm):
     o = offload_evidence(ev, arm)
     if not o:
@@ -724,22 +766,24 @@ def rule_offload(ev, label, arm):
         elif est["layers_that_fit"] and est["layers_that_fit"] > n + 1:
             arms = [current, {"name": "ngl%d" % est["layers_that_fit"], "args_override": {"--gpu-layers": est["layers_that_fit"]}}]
         else:
-            kvq = kv_requant_arm(est, s, n, m)
-            if kvq:
-                arms = [current, kvq]
+            cands = [a for a in (smaller_context_arm(ev, arm, est, s, n, m), kv_requant_arm(est, s, n, m)) if a]
+            if cands:
+                arms = [current] + cands
             else:
                 how = ("by the estimate no more layers fit (need %d MiB for all layers, about %d MiB free): free VRAM first (close other GPU programs), shrink the KV cache "
                        "(smaller --ctx-size, or -ctk q8_0 -ctv q8_0 with flash attention), or use a smaller quantization; then compare against the current launch" % (est["need_all_layers_mib"], est["free_mib"]))
     elif o["kind"] == "vram":
         how = "read the server's log for its 'offloaded N/M layers' line (start it with --log-file), or compare an explicit --gpu-layers %s against the current launch" % (m or "N")
     kv_arm = bool(arms and any("--cache-type-k" in (a.get("args_override") or {}) for a in arms))
-    experiment = {"kind": "gpu_layers", "variable": "--gpu-layers" if not kv_arm else "KV cache type and --gpu-layers (memory moved from the KV cache to model layers)",
+    ctx_arm = bool(arms and any("--ctx-size" in (a.get("args_override") or {}) for a in arms))
+    experiment = {"kind": "gpu_layers", "variable": "--gpu-layers" if not (kv_arm or ctx_arm) else "the memory the KV cache uses, moved to model layers (--gpu-layers)",
                   "arms": arms or how,
                   "metric": "decode and prefill t/s and wall_ms medians; per-arm dedicated and shared (system-memory) VRAM; outputs equivalent",
                   "note": "One variable: the number of GPU layers; context, KV types and microbatch stay as launched. The memory estimate behind the candidate is in the measurements."
-                          if not kv_arm else
-                          "Two settings change together by design: an 8-bit KV cache (with flash attention, which llama.cpp needs for a quantized V cache) frees "
-                          "the memory that the extra GPU layers use; neither helps speed alone. Context and microbatch stay as launched."}
+                          if not (kv_arm or ctx_arm) else
+                          "Each candidate changes two settings together by design: one frees KV-cache memory (a smaller context sized from the real traffic, which keeps "
+                          "the f16 cache, or an 8-bit KV cache with flash attention, which llama.cpp needs for a quantized V cache), the other spends it on GPU layers; "
+                          "neither helps speed alone. A smaller context limits request length, so that arm is never adopted without the user's decision."}
     return _finding("gpu_offload_partial", title, "high", confidence, (arm or {}).get("evidence_class") or "passive",
                     {"offload": {k: v for k, v in o.items() if k != "session"}, "memory_estimate": est, "deliberate_cpu_tensors": deliberate},
                     "Layers left on the CPU read their weights from system memory, typically tens of GB/s on a desktop against hundreds of GB/s of VRAM, and the GPU waits for them "
@@ -751,6 +795,8 @@ def rule_offload(ev, label, arm):
                            "either is reported by the experiment.",
                            "If the runtime's automatic fit chose this split, forcing more layers removes the memory margin it kept for the context and compute buffers."] +
                           (["The CPU placement looks deliberate (expert tensors kept on the CPU); tune --n-cpu-moe rather than forcing everything onto the GPU."] if deliberate else []) +
+                          (["A smaller context limits how long a request may be; it is sized from the largest real request seen so far, which may not be the largest "
+                            "your application ever sends."] if ctx_arm else []) +
                           (["An 8-bit KV cache stores attention keys and values with less precision: outputs can differ from the f16 cache, more so at long contexts; "
                             "the verdict's output check shows it on this workload, not on every prompt.",
                             "`--flash-attn on` needs a build that accepts on/off/auto; an older build fails to start, which the experiment reports as a launch failure."]
@@ -1537,6 +1583,9 @@ def diagnosis_brief(d, path=None, discovery=None, top=5):
     if top and isinstance((top.get("experiment") or {}).get("arms"), str) and (not rec or rec["finding"] != top["id"]):
         L.append("- for the top finding (%s): %s" % (top["id"], top["experiment"]["arms"]))
     if rec:
+        L.append("- hotpath improve --dry-run   (passive: the plan for testing this and the findings after it, one experiment at a time; MCP: hotpath_improve_plan)")
+        L.append("- hotpath improve   (ACTIVE: runs that plan on hotpath's own llama-server, adopts only keep verdicts, reports the launch line to apply; MCP: hotpath_improve)")
+        L.append("  or one experiment at a time:")
         out = "experiments/%s.json" % rec.get("kind", "next")
         n = 2
         while Path(out).exists():                 # propose never overwrites: suggest a name that is free
