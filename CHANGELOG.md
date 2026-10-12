@@ -25,7 +25,7 @@
 - MCP job children import the same hotpath when it runs from a source checkout in another working directory.
 
 ### Validation
-Windows 11, RTX 2080 SUPER, a llama.cpp-derived CUDA build, one 27B ternary GGUF; a `llama-server` started by hand with `-ngl 56` of 65 layers as the user's server. Discovery, init and inspect found and diagnosed it; the proposed `-ngl 65` experiment refused to start while that server held the VRAM; after it was stopped, three runs (CLI, Claude Code through MCP, OpenCode through MCP) measured wall time per request 5.0 → 1.4 s (small workload) and 11.3–11.8 → 3.3 s (default workload), decode 7.7–8.5 → 48.1 t/s, +796–804 MiB, no shared-memory spill; outputs identical on the small workload and diverging deterministically on one of three prompts at token 51 of 64 on the default workload. Details in the README and docs/agents.md.
+Windows 11, RTX 2080 SUPER, a llama.cpp-derived CUDA build, one 27B ternary GGUF; a `llama-server` started by hand with `-ngl 56` of 65 layers as the user's server. Discovery, init and inspect found and diagnosed it; the proposed `-ngl 65` experiment refused to start while that server held the VRAM; after it was stopped, three runs (CLI, Claude Code through MCP, OpenCode through MCP) measured wall time per request 5.0 → 1.4 s (small workload) and 11.3–11.8 → 3.3 s (default workload), decode 7.7–8.5 → 48.1 t/s, +796–804 MiB, no shared-memory spill; outputs identical on the small workload and diverging deterministically on one of three prompts at token 51 of 64 on the default workload. On prompts shaped like the server's observed traffic: wall 7.24 → 1.92 s per request, outputs identical 3/3, verdict keep. Details in the README and docs/agents.md.
 
 ## 0.2.0
 
