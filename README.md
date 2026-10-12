@@ -6,7 +6,8 @@ hotpath is a small command-line toolkit for people running GGUF models with [lla
 
 It does not make inference faster by itself. It gives you a disciplined loop around the tools you already have:
 
-1. **Observe** a running deployment without sending it any inference: build and model identity, GPU state, and the request timings in the server's own log.
+0. **Discover** your setup without configuration: the running `llama-server` and how it was launched (from its command line), installed runtimes and whether they can start (missing CUDA DLLs and the directory that fixes them), GGUF models and whether they fit in VRAM, the GPU, driver, profilers and logs. `hotpath init` writes the result to `hotpath.local.json`; `hotpath inspect` goes straight on to a diagnosis.
+1. **Observe** a running deployment without sending it any inference: build and model identity, launch settings, GPU state, `/metrics` counters and the request timings in the server's own log.
 2. **Triage** that observation: how much of each request is prompt processing vs generation, how decode compares with a memory-bandwidth ceiling for your model and GPU, and which configuration causes are worth testing first. Each finding is labeled with how strong its evidence is and which experiment would settle it.
 3. **Experiment** under control: hotpath launches each variant (different flags, environment variables, runtime binary or model file) on its own port, interleaves the variants across rounds so drift and thermals hit every arm, and checks preconditions such as an idle GPU.
 4. **Compare** honestly: medians with spread, ratios only between comparable records, an explicit list of reasons two records are not comparable, and a greedy-output equivalence check between arms.
@@ -19,7 +20,7 @@ Speed-ups on local inference are easy to misjudge: a different binary also chang
 
 ## Status and what has been validated
 
-This is an early (0.2) release by a single developer. What has actually been run:
+This is an early release by a single developer (0.2.0 released; this branch is 0.3.0.dev0). What has actually been run:
 
 | Component | Validated on |
 |---|---|
@@ -32,6 +33,9 @@ This is an early (0.2) release by a single developer. What has actually been run
 | Cache modes and schema validation (0.2.0) | five two-arm request-shape runs on real application request bodies (3 prompts x 3 rounds each): `cold` with erase unsupported (HTTP 501) and with erase honored both verified 36/36 cold via `cache_prompt: false`; an earlier erase-only cold run was correctly reported "not cold" (36/36 warm, host prompt cache); `warm` labelled as reuse behavior; `as-is` without erase marked not comparable. Removing the schema was rejected in every mode on full Draft 2020-12 validation (18/18 -> 0/18) despite 14-22% lower wall time. CLI and MCP produced identical verdicts on the same record |
 | MCP in real agents | Claude Code 2.1.x and OpenCode 1.18.x, scripted one-shot sessions (details and limits in docs/agents.md) |
 | Diagnose → propose → experiment → verdict loop | one real run on the setup above (0.2.0): `bench` + `measure` of a 3-prompt workload → `diagnose` ranked a 194 ms (5%) per-request residual first → `propose` wrote a 3-arm spec (default, `--cache-ram 0`, `--ctx-checkpoints 0`) → `experiment` ran 9 interleaved launches → `diagnose` on the record: both candidates −4.2…4.4% wall, consistent on 3/3 prompts, greedy outputs identical, VRAM unchanged, with the finding's caveat (prefix reuse lost) attached |
+| Discovery, `init`, `inspect` (0.3.0.dev0) | the same machine with no configuration: four installs found under a named directory, one native CUDA build reported as not starting (`0xC0000135`, `cudart64_12.dll`/`cublas64_12.dll` unresolved) with the toolkit directory that fixes it, verified by re-running `--version` with it on `PATH`; four GGUF headers with roles and VRAM fit; ambiguous binaries and models listed, not chosen. With a user's `llama-server` running, `init` wrote its URL, binary, model, log and launch arguments with their provenance, and `inspect` read the launch from the process command line, the log and `/metrics` |
+| Offload diagnosis → experiment → verdict (0.3.0.dev0) | a `llama-server` started by hand with `-ngl 56` of 65 layers (a deliberately partial offload): `inspect` ranked "9 of 65 layers on the CPU" first (impact bound 97% from measured shares) and proposed `ngl56` vs `ngl65` from the observed command line; the experiment refused to start while that server held the VRAM and named it; after the server was stopped by hand: 3 prompts × 3 rounds, both arms 18/18 cold, wall 5.0 → 1.4 s per request, decode 8.5 → 48.1 t/s, +804 MiB, no shared-memory spill, outputs identical 3/3 (small workload). With the default workload (3 × 450–1300 words) in two agent runs: wall 11.3–11.8 → 3.3 s, decode 7.7–8.0 → 48.1 t/s, and a deterministic greedy divergence on one prompt at token 51 of 64, reported by the verdict as "faster, but outputs differ" |
+| MCP jobs and agent-run experiments (0.3.0.dev0) | scripted stdio client: active job returned a job id, a second active job refused, `hotpath_job_status` returned the finished result; `hotpath_job_cancel` and closing the client's stdin both left no `llama-server` running. Claude Code 2.1.296 and OpenCode 2.0.26 each ran the experiment above through MCP with the operator flag set (details in docs/agents.md) |
 
 Not validated: Linux, macOS, AMD or Intel GPUs, multi-GPU systems, upstream `llama.cpp` releases other than the one above, other runtimes (vLLM, TensorRT-LLM, Ollama, ...). The code avoids Windows-only assumptions where it can (`nvidia-smi`, `lsof`, standard install locations for Nsight on Linux), but those paths are untested; please report what you find. The per-process GPU memory counters (`windows_process_gpu_counters`) are Windows-only and are simply absent elsewhere.
 
@@ -70,21 +74,27 @@ pip install "hotpath[schema] @ git+https://github.com/denisanzora/hotpath"  # wi
 
 `pip install -e .` works for development. You can also run it without installing: `python -m hotpath ...` from the repository root.
 
-## Quickstart with your own model and runtime
+## Quickstart: inspect, test one change, keep what helped
 
-Work in a directory of your own (results are written relative to the current directory under `results/local/`, which is the default and is gitignored in this repository).
-
-**1. Describe your setup once.**
+Work in a directory of your own (results are written relative to the current directory under `results/local/`, which is the default and is gitignored in this repository). Start your `llama-server` as you normally do; adding `--log-file PATH` and `--metrics` gives hotpath the most passive evidence.
 
 ```
-hotpath init              # writes hotpath.local.json
+hotpath init              # discovers your setup and writes hotpath.local.json (passive)
+hotpath inspect           # discover + observe the running server + diagnose (passive): ranked findings and the next step
+hotpath propose results/local/diagnosis-<ts>.json --out experiments/next.json   # one-variable spec from the top finding, with its plan
+hotpath experiment experiments/next.json                 # ACTIVE: launches hotpath's own servers on port 8099
+hotpath diagnose results/local/experiment-<name>-<ts>.json   # verdict, and what remains on the faster configuration
 ```
 
-Edit it: `model_path`, `runtime_binary` (your `llama-server`), `runtime_bin_dir` (where `llama-bench` lives), `build_dir` (a llama.cpp build tree containing `test-backend-ops`), and, if you profile a server that is already running, `server_url` and `server_log`. Every key is optional and each command says which one it needs. See `hotpath.local.example.json` for all keys. Keep this file out of version control; it holds your paths.
+`init` finds the running `llama-server` and takes its executable, model, log file and launch arguments from its command line (each value printed with where it came from); it also searches standard install locations, `PATH` and model caches, and any directory you name with `--root DIR`. When several binaries or models qualify it lists them instead of guessing; choose with `--binary`/`--model`/`--server`. `--update` adds newly discovered keys to an existing file without changing any value; `--template` writes the old placeholder file. Your running server is never added to `owned_servers`.
 
-```
-hotpath tools             # confirms GPU, config, and which external tools were found
-```
+`inspect` prints the setup, its problems with fixes, and the top findings, each with what is known, what is a hypothesis, the share of request time it can act on, and the experiment that would verify it. The full reports are written next to it.
+
+On a single GPU your own server usually holds the VRAM an experiment needs. The plan states the free VRAM a launch needs, and the experiment refuses to start without it, naming the server that holds the GPU. hotpath never stops, restarts or reconfigures a server it did not start: stop it yourself, or use `--wait-s N`.
+
+The rest of this section is the manual path and the individual commands.
+
+**1. Configure by hand (optional).** `hotpath init --template` writes placeholders; the keys are `model_path`, `runtime_binary` (your `llama-server`), `runtime_bin_dir` (where `llama-bench` lives), `build_dir` (a llama.cpp build tree containing `test-backend-ops`), `server_url`, `server_log`, `server_args` and `path_prepend`. Every key is optional and each command says which one it needs. See `hotpath.local.example.json` for all keys. Keep this file out of version control; it holds your paths. `hotpath tools` confirms GPU, config and which external tools were found.
 
 **2. Look at your model.** Reads only the GGUF header:
 
@@ -128,12 +138,27 @@ hotpath compare results/local/experiment-<name>-<timestamp>.json
 
 An experiment prints its comparison when it finishes; `compare` re-renders it, or compares several measurement/kernel records.
 
-## Already running a server? Diagnose from its log, no benchmark needed
+## What discovery looks at, and what it does not
+
+`hotpath discover` (also run by `init` and `inspect`) is read-only and bounded. It looks at:
+
+- **Running servers:** processes named `llama-server` and their command lines (model, port, `-ngl`, `-c`, `-ub`, `-fa`, KV types, cache flags, log file, ...), and on loopback only `GET /health`, `/props` and `/metrics`. Servers that hotpath itself launched for an experiment are recognized and never treated as yours.
+- **Installations:** the running servers' executables, `runtime_binary` from the config, `PATH`, a short list of standard locations (winget, scoop, `~/llama.cpp/build/bin`, `/usr/local/bin`, Homebrew), and directories you name with `--root` (depth 4, an entry cap, no links followed; drive and filesystem roots are refused). Per installation: compute backends present, sibling tools, and on Windows the DLLs its executables import that Windows would not find. A missing CUDA runtime DLL makes `llama-server` exit with no output; discovery names it and the toolkit directory that has it, and confirms the fix by running `--version` with that directory on `PATH`. `--version` is the only program discovery runs (`--no-exec` turns it off).
+- **Models:** GGUF headers only (architecture, quantization, layers, size, whether the weights fit in VRAM, projector/embedding roles) next to the running server's model, in the llama.cpp and Hugging Face caches, LM Studio's folders, `~/models`, and directories you name.
+- **GPU and tools:** every NVIDIA GPU, the driver's CUDA version (and whether a build needs a newer one), Nsight Systems/Compute, `llama-bench`, `test-backend-ops`, the optional `jsonschema`.
+- **Launch scripts** in directories you name that start `llama-server` (batch/shell files, llama-swap style YAML): their command lines as written.
+
+The record lists where it looked and what it executed. What it cannot see is said explicitly: settings given through `LLAMA_ARG_*` environment variables or a launcher's defaults are not in a command line (`unset` means "not on the command line", not "off"), and environment variables of another process are not read.
+
+## Already running a server? Diagnose it passively, no benchmark needed
 
 ```
-hotpath observe --log path/to/llama-server.log         # passive: reads the log, no inference
+hotpath inspect                                          # finds the running server, its launch, log and /metrics
+hotpath observe --log path/to/llama-server.log           # or: just a log file, no server needed
 hotpath diagnose results/local/observation-*.json
 ```
+
+`observe` records the launch settings of the server it observes from the process command line, picks up that server's `--log-file` and model when they are not configured, and reads `/metrics` (aggregate prompt/generation time and prompt-cache reuse since the server started) when the server runs with `--metrics`. Note that at default verbosity current builds do not print launch facts such as `offloaded N/M layers` or `n_ubatch` into the log; the command line is then the evidence, and hotpath labels it so.
 
 From the server's own log hotpath reads every request's prompt and generation timings, token counts, how the slot was selected (LRU / longest common prefix) and how many tokens were reused, per session, with the launch facts the log printed. `diagnose` then reports, from that alone: whether the workload is prefill- or decode-bound (on the server's prompt+generation time — a log has no client wall time, and hotpath says so instead of inventing an overhead figure), how much of each prompt real traffic actually reuses (the evidence that decides whether cache settings may be touched), decode against the bandwidth ceiling for your model, sessions that ran at CPU speed, drift or regressions between sessions and whether launch facts changed, error lines, and whether the log format was understood at all. Each finding keeps its evidence class (`passive` / `historical`) and the list at the end names the single best next measurement — usually one `hotpath measure` against your own server to add wall time and per-request overhead.
 
@@ -161,9 +186,13 @@ hotpath diagnose results/local/experiment-<name>-*.json        # verdict: keep /
 | `hypothesis` | consistent with the evidence; the named experiment would decide |
 | `insufficient` | the records cannot establish it; the finding says what to collect |
 
-What it looks at today: the per-request split into prompt processing, generation and everything else (prefill-bound vs decode-bound vs overhead); the residual per-request overhead and the server flags that affect it; the microbatch size against the prefill share; decode against the memory-bandwidth ceiling for your model and GPU, and whether CUDA graphs are disabled; the served prefill/decode against `llama-bench` on the same model (the gap is server-side work); VRAM headroom and system-memory spill signs; kernel-class shares from a profile; and, for finished experiments, a per-arm verdict that combines paired per-prompt ratios judged against each prompt's own repetition noise, the verified cache state of both arms, the VRAM delta, output identity and output validity. It ends with the list of things the given records cannot establish.
+What it looks at today: how many of the model's layers are on the GPU (the log's `offloaded N/M layers` line, an explicit `-ngl` on the command line, or the server's VRAM against the model's weights), with a stated estimate of whether all layers would fit; the per-request split into prompt processing, generation and everything else (prefill-bound vs decode-bound vs overhead), from client wall times, a server log, or `/metrics` totals; the residual per-request overhead and the server flags that affect it; the microbatch size against the prefill share; decode against the memory-bandwidth ceiling for your model and GPU, and whether CUDA graphs are disabled; the served prefill/decode against `llama-bench` on the same model (the gap is server-side work); prompt-cache reuse of real traffic (log or `/metrics`, and only when there is enough traffic to judge); VRAM headroom and system-memory spill signs; kernel-class shares from a profile; and, for finished experiments, a per-arm verdict that combines paired per-prompt ratios judged against each prompt's own repetition noise, the verified cache state of both arms, the VRAM delta, output identity and output validity. It ends with the list of things the given records cannot establish.
 
-`propose` keeps the comparison fair by construction: one variable differs between arms; the baseline arm is your current configuration (`server_args` in the local config, or the diagnosed experiment's own arguments, or `--common-args`); binary and model are `${...}` references into `hotpath.local.json`; rounds are interleaved by the runner. Server arguments the runner supplies itself or that would share your own server's resources (`--host`, `--port`, `--model`, `--log-file`, `--slot-save-path`, `--api-key`, ...) are left out of the copied baseline, and the command says which; an experiment server therefore cannot take over your server's port or write to its log. It prints the dry-run plan and never launches anything.
+**Ranking and wording.** Problems are ranked by the share of request time the candidate change can act on (for example, prefill + decode for a partial offload, the residual for cache flags), taken from the measured shares and weighted by confidence. The share is an upper bound on what the change can touch, not a predicted gain. Problems whose share is not measurable follow, then context findings. Each finding separates what is `known` (with its source: log, command line, `/metrics`, a measurement) from the `hypothesis` it suggests, lists what `could regress`, names the experiment that would verify it, and says whether it has been `measured`. A finding that another one supersedes (a decode-ceiling gap while part of the model runs on the CPU) is marked so and not recommended.
+
+**The improve step.** After an experiment, `diagnose` reports the verdict for the replaced configuration and then describes what remains on the candidate the verdict found faster (labelled, and with the caveat when the verdict also reports output differences). `propose` on that diagnosis starts the next spec from the faster configuration, so a second change is tested on top of the first instead of against the old baseline.
+
+`propose` keeps the comparison fair by construction: one variable differs between arms; the baseline arm is your current configuration (the arm the last verdict found faster, else the diagnosed server's observed command line, else `server_args` in the local config, else the diagnosed experiment's own arguments; `--common-args` overrides all of them); argument spellings are matched (`-ngl` and `--gpu-layers` are one argument, so exactly one value reaches the server); binary and model are `${...}` references into `hotpath.local.json`; rounds are interleaved by the runner. The plan states the requests it will send, the free VRAM a launch needs (from the GGUF header), and a rough duration from the diagnosed configuration's own rates. Server arguments the runner supplies itself or that would share your own server's resources (`--host`, `--port`, `--model`, `--log-file`, `--slot-save-path`, `--api-key`, ...) are left out of the copied baseline, and the command says which; an experiment server therefore cannot take over your server's port or write to its log. It prints the dry-run plan and never launches anything.
 
 Diagnoses are not results. A `hypothesis` finding is an argument for an experiment; the experiment's verdict is what you act on. Verdicts are paired per prompt (each prompt's candidate/baseline ratio against that prompt's own repetition noise), state the workload size (`N prompts x R rounds`, marked preliminary below 3 x 3), judge output identity, output validity and speed separately, and describe this machine and workload only. Experiments that trade prefix reuse for per-request overhead (`--cache-ram`, `--ctx-checkpoints`) carry a production gate: without an `observe --log` record showing how much real traffic reuses, the verdict says applicability is unknown; with high real reuse it says not to apply.
 
@@ -195,12 +224,15 @@ What is retained where: the **workload file** holds your request bodies (prompts
 
 ## Use it from an AI coding agent
 
-`hotpath mcp` (also installed as `hotpath-mcp`) serves the commands as MCP tools over local stdio, with active tools (experiments, benchmarks, profiling) disabled unless you start it with `HOTPATH_MCP_ALLOW_ACTIVE=1`. `skills/hotpath/SKILL.md` is a portable Agent Skill that teaches an agent the workflow. Both reuse the CLI. The protocol behavior has been exercised with a scripted client, and the server has been used end to end from real Claude Code and OpenCode sessions on one Windows machine; other clients are untested. Details and the exact validation status are in [docs/agents.md](docs/agents.md).
+`hotpath mcp` (also installed as `hotpath-mcp`) serves the commands as MCP tools over local stdio, with active tools (experiments, benchmarks, profiling) disabled unless you start it with `HOTPATH_MCP_ALLOW_ACTIVE=1`. `skills/hotpath/SKILL.md` is a portable Agent Skill that teaches an agent the workflow. Both reuse the CLI. An agent starts with `hotpath_inspect`; active tools run as jobs that return within 45 s (a result or a job id to poll with `hotpath_job_status`), because some clients are reported to cancel a tool call after about a minute while an experiment takes many. Claude Code and OpenCode have each run an experiment end to end through MCP on one Windows machine; other clients are untested. Details and the exact validation status are in [docs/agents.md](docs/agents.md).
 
 ## Other commands
 
 | Command | What it does |
 |---|---|
+| `hotpath discover [--root DIR]` | the local setup: running servers and their launch settings, installs and whether they start, GGUF models, GPU, tools, logs, problems with fixes (passive) |
+| `hotpath init [--binary B] [--model M] [--server URL] [--update]` | write `hotpath.local.json` from discovery, each value with its source |
+| `hotpath inspect` | passive, one step: discover, observe the running server (command line, log, `/metrics`, GPU), diagnose, and print the next step |
 | `hotpath diagnose RECORD...` | ranked bottleneck findings with confidence, measurements, opportunity bound, confirming experiment and risks; keep/reject/inconclusive verdicts for finished experiments |
 | `hotpath propose DIAGNOSIS --out SPEC` | one-variable experiment spec for a finding (default: the diagnosis's recommended one) plus its dry-run plan; launches nothing |
 | `hotpath measure --server URL --workload W --i-own-this-server` | ACTIVE: run a workload against a server you own and record timings (refuses servers not in `owned_servers` unless the flag is given) |
@@ -252,15 +284,18 @@ Practical guidance:
 - Only `llama.cpp`-family servers are supported (the HTTP API, log format and `--version` output are what the parsers expect). Log parsing is regex-based and can break when upstream changes its log lines.
 - NVIDIA only. The built-in bandwidth table lists published peak memory bandwidth for a handful of GPUs; only the RTX 2080 SUPER entry has been checked against a real run. Use `--bandwidth-gbs` to override.
 - The experiment runner launches whole servers per arm, which is slow for large models but isolates arms properly.
-- MCP server and agent skill have been validated in scripted Claude Code and OpenCode sessions on one machine only; other clients are untested (see docs/agents.md).
+- MCP server and agent skill have been validated in Claude Code and OpenCode sessions on one machine only; other clients are untested (see docs/agents.md).
+- Discovery was exercised on Windows only. Its Linux and macOS paths (`/proc` and `ps` for processes, `ldd` for libraries, standard install and cache locations) are written but untested. Process command lines of other users may be unreadable; environment variables of a running server (`LLAMA_ARG_*`) are not read at all, so a setting given that way appears as `unset`.
+- The offload rule's memory estimate (weights + KV cache at the configured context and types + the compute buffer, against free VRAM) uses the log's buffer sizes when printed and otherwise stated allowances; it only chooses the candidate arm. The experiment's per-arm dedicated and shared VRAM is the evidence.
+- The duration estimate in a plan uses the diagnosed configuration's rates for every arm and an assumed model-load time; in the validation run it was 16 min for a run that took 10 (the candidate was faster).
+- MCP jobs live as long as the MCP server: they are stopped when the client exits and their state does not survive a restart (their output stays in `results/local/jobs/`). One active job runs at a time.
 - The test suite covers the diagnosis and proposal logic on synthetic record structures (`python -m unittest discover -s tests`); the commands that drive servers and profilers are verified by running the actual workflows (see CONTRIBUTING).
-- `diagnose` reasons from the measurements hotpath itself collects. Its rules are relative (shares, ratios, fractions of a ceiling) and were checked on one GPU/model/runtime; a finding is only as good as the records behind it, and it says `insufficient` rather than guess. From a server log alone it cannot see client wall time, per-request overhead, or GPU state during requests; prefix-cache effectiveness comes only from a log's slot-selection lines (hotpath's own workloads disable the cache on purpose); nothing is known about kernels until a profile has been run.
+- `diagnose` reasons from the measurements hotpath itself collects. Its rules are relative (shares, ratios, fractions of a ceiling) and were checked on one GPU/model/runtime; a finding is only as good as the records behind it, and it says `insufficient` rather than guess. From a server log alone it cannot see client wall time, per-request overhead, or GPU state during requests; prefix-cache effectiveness comes from a log's slot-selection lines or the `/metrics` aggregate (hotpath's own workloads disable the cache on purpose); nothing is known about kernels until a profile has been run.
 - Log parsing recognizes llama-server's per-request timing, slot-selection and release lines; builds that log differently are reported as a format problem. The threshold that separates CPU-fallback sessions (`log_cpu_mode_prefill_tps_below`, default 10 t/s) is a heuristic you can change in the local config.
-- `propose` covers the experiment kinds `diagnose` emits as arm lists (microbatch sweep, CUDA-graph toggle, prompt-cache/checkpoint flags, request shape); findings whose confirmation is a procedure (a profile, a launch check) are described, not generated.
+- `propose` covers the experiment kinds `diagnose` emits as arm lists (GPU layers, microbatch sweep, CUDA-graph toggle when graphs are disabled, prompt-cache/checkpoint flags, request shape); findings whose confirmation is a procedure (a profile, a launch check, freeing VRAM) are described, not generated.
 - `requests` workloads send top-level body fields as given; `request_override` edits top-level fields only. Output identity on the chat endpoint is a content-hash comparison. Full schema validation needs the optional `jsonschema` package; schemas using external `$ref`s or formats the validator does not assert are checked only as far as the validator goes. Grammar-constrained (`grammar` GBNF) outputs are not validated.
 - Cache state is verified from the server's `cache_n` and nothing else; a server that does not report it yields `unknown` and no prefill-side verdict. `cold` disables reuse entirely (including between consecutive items), so it measures cold processing, not the reuse your application would get; use `warm` for that. Cold mode overrides `cache_prompt` in your request bodies.
 - Spec files written by an agent are checked before an MCP-launched experiment: `binary`/`model`/`path_prepend` must be `${key}` references into `hotpath.local.json`, environment overrides are limited to `GGML_`/`LLAMA_`/`CUDA_` variables, and server arguments that write files, change the network binding, download a model or change which model loads (`--log-file`, `--host`, `--port`, `--model`, `--hf-repo`, `--lora`, ...) are refused. Arguments not on that list are passed to `llama-server` as written, so only run specs you would run yourself.
-- Agent integration is validated for Claude Code and (see docs/agents.md) OpenCode by scripted runs on one machine; other clients are untested.
 - `hotpath profile` and `hotpath kernels` are thin wrappers: they run the underlying tool and summarize its output; `diagnose` ranks a profile's kernel classes but does not interpret individual kernels.
 
 ## Troubleshooting
@@ -270,8 +305,10 @@ Practical guidance:
 | `nvidia-smi found=False` | Driver not installed or not on `PATH`. Facts and the idle-GPU precondition need it. |
 | `llama-bench found=False` / `test-backend-ops found=False` | Set `runtime_bin_dir` / `build_dir` in `hotpath.local.json`, or put them on `PATH`. |
 | `nsys found=False` | Install Nsight Systems or the CUDA toolkit, or put `nsys` on `PATH`. |
-| Server exits immediately in an experiment | Open `results/local/server-<name>-<arm>-r0.log`. A native Windows build may need its CUDA runtime DLLs on `PATH`; list that directory under `path_prepend` in the config. |
-| `preconditions not met` | Something else is using the GPU or the port. Free it, or use `--wait-s`. |
+| Server exits immediately in an experiment, or `llama-server` prints nothing | Run `hotpath discover --root <its directory>`: it lists the DLLs the build imports that Windows cannot find and the CUDA toolkit directory that has them (verified with `--version`); `hotpath init --update` writes it as `path_prepend`. Otherwise open `results/local/server-<name>-<arm>-r0.log`. |
+| `preconditions not met: free VRAM ... Running now: llama-server pid N` | Your own server holds the GPU memory the experiment needs. hotpath will not stop it; stop it yourself (or use `--wait-s` to wait). |
+| `preconditions not met` (other) | Something else is using the GPU or the port. Free it, or use `--wait-s`. |
+| `init` leaves `runtime_binary` or `model_path` unset | Several candidates were found (they are listed) or none: choose with `--binary`/`--model`, or search with `--root DIR`. |
 | `refusing to submit inference ... not in owned_servers` | `measure` only targets servers you declare as yours (`owned_servers` or `--i-own-this-server`). |
 | Every output in `compare` diverges | Check that `temperature` is 0 and that arms are not reordering sums on purpose (different kernels, batch sizes); one near-tie flip is common and not necessarily a bug. |
 | `error: ... (set HOTPATH_DEBUG=1 for a traceback)` | Set that variable to see the full traceback when reporting a bug. |

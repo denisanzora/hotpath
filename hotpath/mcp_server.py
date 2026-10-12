@@ -579,6 +579,7 @@ def call_tool(name, args):
 
 
 _OUT_LOCK = threading.Lock()
+_IN_FLIGHT = []
 
 
 def _reply(msg_id, result=None, error=None):
@@ -626,7 +627,9 @@ def handle(msg, threaded=False):
         p = msg.get("params") or {}
         if threaded:
             # calls run concurrently (a job_status that waits must not hold up a cancel or a ping); replies are matched by id
-            threading.Thread(target=_tool_call, args=(mid, p), daemon=True).start()
+            t = threading.Thread(target=_tool_call, args=(mid, p), daemon=True)
+            _IN_FLIGHT.append(t)
+            t.start()
         else:
             _tool_call(mid, p)
     else:
@@ -645,7 +648,10 @@ def main():
             except json.JSONDecodeError:
                 _reply(None, error={"code": -32700, "message": "parse error"})
     finally:
-        # the client went away: stop the jobs this server started, so no experiment keeps the GPU without anyone to report to
+        # input ended: answer the calls already received (a piped client still reads them; each is bounded by its own
+        # timeout), then stop the jobs this server started, so no experiment keeps the GPU without anyone to report to
+        for t in list(_IN_FLIGHT):
+            t.join(timeout=330)
         stop_all_jobs()
 
 
