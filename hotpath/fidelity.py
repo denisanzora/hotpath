@@ -33,8 +33,21 @@ def probe_from_response(resp):
     return {"tokens": list(tokens), "top": top, "k": max((len(t) for t in top), default=0)}
 
 
+def probe_from_chat_response(resp):
+    """{tokens, top} from an OpenAI-compatible /v1/chat/completions response asked for `logprobs` and `top_logprobs`
+    (choices[0].logprobs.content). Token ids where the server returns them (llama-server does), else token strings."""
+    ch = (resp.get("choices") or [{}])[0]
+    content = ((ch.get("logprobs") or {}).get("content")) or []
+    tokens, top = [], []
+    for pos in content:
+        tokens.append(pos.get("id", pos.get("token")))
+        top.append([[c.get("id", c.get("token")), c.get("logprob")] for c in pos.get("top_logprobs") or []
+                    if c.get("id", c.get("token")) is not None and c.get("logprob") is not None])
+    return {"tokens": tokens, "top": top, "k": max((len(t) for t in top), default=0)}
+
+
 def _lp(pos):
-    return {int(t): float(lp) for t, lp in pos}
+    return {(int(t) if isinstance(t, (int, float)) else t): float(lp) for t, lp in pos}
 
 
 def _partial_kl(pb, pc):
@@ -89,9 +102,11 @@ def compare_probes(base, cand):
         out["class"] = "logprob-identical" if out["max_logprob_shift"] == 0.0 else "token-identical"
         return out
     if d >= n or d >= len(base.get("top") or []) or d >= len(cand.get("top") or []):
+        out.update(cascade(bt, ct, d))
         out["class"] = "diverged"
         out["note"] = "the outputs differ in length; no probabilities at the divergence"
         return out
+    out.update(cascade(bt, ct, d))
     pb, pc = _lp(base["top"][d]), _lp(cand["top"][d])
     mb, mb_least = _margin(pb, bt[d], ct[d])
     mc, _ = _margin(pc, ct[d], bt[d])
@@ -103,6 +118,17 @@ def compare_probes(base, cand):
     return out
 
 
+def cascade(bt, ct, d):
+    """How far a divergence carried: tokens generated after it by each arm, and how much of the rest still lines up
+    (difflib ratio of the two remaining token sequences: 1.0 the same tokens re-aligned, near 0 a different continuation).
+    A sequence measure, not a semantic one: similar tokens can still mean a different answer."""
+    import difflib
+    rb, rc = list(bt[d:]), list(ct[d:])
+    sim = difflib.SequenceMatcher(None, rb, rc, autojunk=False).ratio() if (rb or rc) else 1.0
+    return {"tokens_after_divergence": [len(rb), len(rc)], "rest_similarity": round(sim, 3),
+            "divergence_at_fraction": round(d / max(1, len(bt)), 3)}
+
+
 def is_equivalent(prompt_result):
     return prompt_result.get("class") in IDENTICAL
 
@@ -111,9 +137,14 @@ def classify_arm(prompts, validity_dropped=False, baseline_reproducible=True, po
     """One candidate arm against the baseline, over every compared prompt. `equivalent` is the only thing that may permit
     automatic adoption: identical tokens on every prompt, or differences that an operator-configured policy accepted after
     it was actually checked (policy_check: {"passed": bool, "basis": str})."""
-    classes = [p.get("class") for p in prompts.values()]
+    sampled = sum(1 for p in prompts.values() if p.get("class") == "sampled")
+    classes = [p.get("class") for p in prompts.values() if p.get("class") != "sampled"]
     counts = {c: classes.count(c) for c in sorted(set(classes))}
-    base = {"prompts": len(classes), "counts": counts, "policy": policy, "policy_check": policy_check}
+    base = {"prompts": len(classes), "counts": counts, "policy": policy, "policy_check": policy_check, "sampled_not_judged": sampled}
+    if not classes and sampled and not validity_dropped:
+        return dict(base, **{"class": "not judged (sampled requests)", "equivalent": False,
+                             "why": "all %d compared requests sample (temperature above 0): their outputs are not expected to repeat, so identity "
+                                    "says nothing; validity and decision fields are the evidence" % sampled})
     if validity_dropped:
         return dict(base, **{"class": "invalid or regressed", "equivalent": False,
                              "why": "output validity dropped; a decision-level regression whatever the tokens"})

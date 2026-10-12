@@ -238,6 +238,9 @@ def _run_locked(spec, out_dir, workload, wait_for_preconditions_s):
     for a in spec["arms"]:
         rec["arms"][a["name"]] = {"requests": [], "warmup_requests": [], "gpu_snapshots": [], "launches": 0, "launch_facts": [], "failures": []}
     rec["cache_mode"] = workload.get("cache_mode", "cold")
+    if spec.get("decision_fields"):
+        rec["decision_fields"] = spec["decision_fields"]
+    private_probes = {}         # application requests: probe tokens stay in memory and only their comparison is recorded
     n_items = len(workload.get("items") or workload.get("prompts") or [])
     total = rounds * len(spec["arms"])
     print("running %d launches, %d requests" % (total, total * n_items * (int(spec.get("warmup", 1)) + int(spec.get("repetitions", 2)))), flush=True)
@@ -278,8 +281,12 @@ def _run_locked(spec, out_dir, workload, wait_for_preconditions_s):
                 if res.get("cache"):
                     arm_rec["cache"] = res["cache"]
                 arm_rec["gpu_snapshots"] += [dict(s, round=rnd) for s in res["gpu_snapshots"]]
-                if rnd == 0 and workload.get("kind") != "requests" and int(spec.get("probe_top_k", 10)) > 0:
-                    arm_rec["probes"] = probe_outputs(base, workload, int(spec.get("probe_top_k", 10)), res["requests"])
+                if rnd == 0 and int(spec.get("probe_top_k", 10)) > 0:
+                    if workload.get("kind") == "requests":
+                        private_probes[a["name"]], arm_rec["probes"] = probe_requests(base, workload, int(spec.get("probe_top_k", 10)), res["requests"],
+                                                                                      a.get("request_override"))
+                    else:
+                        arm_rec["probes"] = probe_outputs(base, workload, int(spec.get("probe_top_k", 10)), res["requests"])
                 arm_rec["launch_facts"].append({"round": rnd, "load_s": load_s, "props": snap.get("props"),
                                                 "process_counters_after": gpu_mod.windows_process_gpu_counters(pid),
                                                 "gpu_after": gpu_mod.gpu_dynamic()})
@@ -290,10 +297,61 @@ def _run_locked(spec, out_dir, workload, wait_for_preconditions_s):
                 _stop(proc, log)
                 rec["launches"].append({"round": rnd, "arm": a["name"], "log": log_path.name})
                 time.sleep(float(spec.get("cooldown_s", 5)))
+    if private_probes:
+        compare_private_probes(rec, spec, private_probes)
     for name, arm_rec in rec["arms"].items():
         arm_rec["summary"] = summarize_requests(arm_rec["requests"])
     rec["server_launches_total"] = len(rec["launches"])
     return rec
+
+
+def compare_private_probes(rec, spec, private_probes):
+    """Each arm's probes against the first arm's, computed before anything is written: the record keeps where outputs
+    diverge, the log-probability margins there and how far the divergence carried, never the tokens of the user's outputs."""
+    from hotpath import fidelity
+    first = spec["arms"][0]["name"]
+    ref = private_probes.get(first) or {}
+    for name, probes in private_probes.items():
+        if name == first:
+            continue
+        rec["arms"][name]["probe_comparison"] = {pid: fidelity.compare_probes(ref[pid], pr) for pid, pr in probes.items() if pid in ref}
+    rec["probe_comparison_basis"] = ("application requests: each arm's probe outputs were compared with arm %s's in memory when the run ended; "
+                                     "token ids and top-k candidates are not stored" % first)
+
+
+def probe_requests(base, workload, k, timed_requests, request_override=None):
+    """Untimed: every application request once more as the arm sends it, with top-k log-probabilities (chat: `logprobs` +
+    `top_logprobs`, completion: `n_probs`) and the prompt cache off. Returns (private probes with tokens, for comparison in
+    memory only; public per-request facts for the record: probe length, whether it reproduced the timed output). Requests
+    that sample (temperature above 0) are not probed: identity is not expected for them."""
+    import hashlib
+    from hotpath import fidelity
+    from hotpath.measure import _content, apply_request_override
+    from hotpath.workload import is_sampled
+    private, public = {}, {}
+    for it in workload["items"]:
+        body = apply_request_override(it["body"], request_override)
+        if is_sampled(body):
+            public[it["id"]] = {"sampled": True}
+            continue
+        body["cache_prompt"] = False
+        chat = it["endpoint"].startswith("/v1/chat")
+        if chat:
+            body.update({"logprobs": True, "top_logprobs": max(1, min(int(k), 20))})
+        else:
+            body["n_probs"] = int(k)
+        try:
+            resp = srv.request(base, it["endpoint"], body)
+        except Exception as e:  # noqa: BLE001 - a missing probe makes the comparison weaker, not the run invalid
+            public[it["id"]] = {"error": type(e).__name__}
+            continue
+        pr = fidelity.probe_from_chat_response(resp) if chat else fidelity.probe_from_response(resp)
+        content, _stop = _content(resp)
+        h = hashlib.sha256(content.encode("utf-8")).hexdigest()[:16]
+        timed = [r.get("output_sha256") for r in timed_requests if r.get("prompt_id") == it["id"] and r.get("output_sha256")]
+        public[it["id"]] = {"k": pr["k"], "n_tokens": len(pr["tokens"]), "matches_timed": (h == timed[0]) if timed else None}
+        private[it["id"]] = pr
+    return private, public
 
 
 def probe_outputs(base, workload, k, timed_requests):

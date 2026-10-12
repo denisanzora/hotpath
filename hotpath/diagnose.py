@@ -1152,8 +1152,9 @@ def prompt_reuse_differs(base_reqs, cand_reqs, tolerance=0.10):
 
 
 def arm_cache_evidence(arm):
-    """What the server's own cache_n said about an arm's requests, plus how isolation was attempted."""
-    reqs = arm.get("requests") or []
+    """What the server's own cache_n said about an arm's requests, plus how isolation was attempted. Requests the server
+    rejected carry no timings and are counted elsewhere, not as unknown cache state."""
+    reqs = [r for r in arm.get("requests") or [] if not r.get("error")]
     states = [request_cache_state(r) for r in reqs]
     n = len(states)
     cold = states.count("cold")
@@ -1212,7 +1213,9 @@ def experiment_verdict(rec):
         comp = cache_comparability(base_cache, cand_cache)
         row = {"arm": lab, "vs": labels[0], "metrics": {}, "failures": len(cand.get("failures") or []),
                "cache": {"baseline": base_cache, "candidate": cand_cache, "comparability": comp}}
-        base_reqs, cand_reqs = base.get("requests") or [], cand.get("requests") or []
+        all_b, all_c = base.get("requests") or [], cand.get("requests") or []
+        base_reqs, cand_reqs = [r for r in all_b if not r.get("error")], [r for r in all_c if not r.get("error")]
+        row["request_errors"] = {"baseline": rejected_requests(all_b), "candidate": rejected_requests(all_c)}
         # Cache-sensitive metrics are paired on VERIFIED requests only: a request whose own cache_n does not match the
         # comparison basis is excluded (and counted), and a prompt needs verified requests in BOTH arms to be compared.
         # Arm-level percentages alone cannot hide a contaminated prompt.
@@ -1254,11 +1257,21 @@ def experiment_verdict(rec):
             row["vram_delta_mib"] = round(max(cd) - max(bd))
         full = "%s/%s" % (rec.get("name"), lab)
         oe = rep.get("output_equivalence") or {}
-        ident = [e.get(full, {}).get("identical") for e in oe.values() if full in e]
+        sampled = {r.get("prompt_id") for r in base_reqs if r.get("sampled")}
+        ident = [e.get(full, {}).get("identical") for pid, e in oe.items() if full in e and pid not in sampled]
         # records written before the basis field existed compared token ids, the only method then
         basis = next((e.get("basis") for e in oe.values() if full in e and e.get("basis")), None) or "token ids"
         row["outputs"] = {"prompts_compared": len(ident), "identical": sum(1 for x in ident if x), "basis": basis,
-                          "first_divergence_indices": [e[full].get("first_divergence_index") for e in oe.values() if full in e and not e[full].get("identical")]}
+                          "first_divergence_indices": [e[full].get("first_divergence_index") for pid, e in oe.items()
+                                                       if full in e and not e[full].get("identical") and pid not in sampled]}
+        if sampled:
+            row["outputs"]["sampled_not_compared"] = len(sampled)
+        cls = class_metrics(row["metrics"], base_reqs)
+        if cls:
+            row["classes"] = cls
+        fa = field_agreement(base_reqs, cand_reqs, rec.get("decision_fields"))
+        if fa:
+            row["fields"] = fa
         # validity (application-shaped requests with a schema): judged apart from speed and from output identity, on the
         # strongest level that was actually checked (full schema when the validator is installed, else required keys)
         from hotpath.measure import summarize_requests as _sr
@@ -1284,8 +1297,13 @@ def experiment_verdict(rec):
         small = n_prompts < 3 or n_rounds < 3
         scope = "on this machine and workload (%d prompts x %d rounds%s)" % (n_prompts, n_rounds, "; preliminary" if small else "")
         all_identical = row["outputs"]["prompts_compared"] > 0 and row["outputs"]["identical"] == row["outputs"]["prompts_compared"]
+        new_errors = row["request_errors"]["candidate"]["n"] - row["request_errors"]["baseline"]["n"]
         if row["failures"]:
             verdict = "reject: launch failures in this arm"
+        elif new_errors > 0:
+            e = row["request_errors"]["candidate"]
+            verdict = "reject: the server rejected %d of %d requests in this arm (%s) that the baseline served: this configuration cannot serve your requests" % (
+                e["n"], len(all_c), ", ".join("%s x%d" % kv for kv in sorted(e["types"].items())))
         elif row.get("validity", {}).get("dropped"):
             key = row["validity"]["decided_on"]
             verdict = "reject: output validity dropped on %s (%s/%s -> %s/%s): a decision-level difference, whatever the speed" % (
@@ -1295,6 +1313,8 @@ def experiment_verdict(rec):
             verdict = "inconclusive %s: %s; only decode and validity are comparable here" % (scope, comp["detail"])
         elif w.get("call") == "improvement" and all_identical:
             verdict = "keep %s: %.1f%% wall improvement, same direction on %d/%d prompts, identical outputs (%s)" % (scope, 100 * (1 - w["ratio"]), w["consistent_direction"], w["prompts"], basis)
+        elif w.get("call") == "improvement" and not row["outputs"]["prompts_compared"] and row["outputs"].get("sampled_not_compared"):
+            verdict = "faster %s, but every compared request samples (temperature above 0), so output identity cannot be judged: validity and decision fields are the evidence" % scope
         elif w.get("call") == "improvement":
             fc = row["fidelity"]
             verdict = "faster %s, but outputs differ on %d/%d prompts%s: explain the difference (numerical shift vs behavior change) before keeping" % (
@@ -1328,6 +1348,85 @@ def experiment_verdict(rec):
             "scope_note": "A verdict describes this workload on this machine; it is not a property of the runtime in general."}
 
 
+def rejected_requests(reqs):
+    errs = [r["error"] for r in reqs if isinstance(r.get("error"), dict)]
+    types = {}
+    for e in errs:
+        k = "HTTP %s %s" % (e.get("http"), e.get("type"))
+        types[k] = types.get(k, 0) + 1
+    return {"n": len(errs), "types": types}
+
+
+def class_metrics(metrics, base_reqs):
+    """Per request class (application requests): the median of the per-request candidate/baseline ratios, the worst
+    request's ratio and the class's own repetition noise, for wall time, prefill and decode. A gain on one class must not
+    hide a regression on another."""
+    cls_of = {r.get("prompt_id"): r.get("class") for r in base_reqs if r.get("class")}
+    if len(set(cls_of.values())) < 1 or not cls_of:
+        return None
+    out = {}
+    for metric, better in (("wall_ms", "lower"), ("prefill_tps", "higher"), ("decode_tps", "higher")):
+        m = metrics.get(metric)
+        if not m or not m.get("per_prompt"):
+            continue
+        groups = {}
+        for pp in m["per_prompt"]:
+            c = cls_of.get(pp["prompt_id"])
+            if c is not None and pp.get("ratio") is not None:
+                groups.setdefault(c, []).append(pp)
+        for c, pps in groups.items():
+            ratios = sorted(pp["ratio"] for pp in pps)
+            spreads = [pp.get("baseline_relative_spread") or 0.0 for pp in pps]
+            worst = ratios[-1] if better == "lower" else ratios[0]
+            out.setdefault(c, {"requests": len(pps)})[metric] = {
+                "ratio": round(percentiles(ratios)["median"], 3), "worst_request_ratio": round(worst, 3),
+                "noise": round(percentiles(spreads)["median"], 3), "consistent": all(((r - 1.0) * (1 if better == "higher" else -1)) > 0 for r in ratios)}
+    return out or None
+
+
+def field_agreement(base_reqs, cand_reqs, decision_fields=None):
+    """Structured outputs compared field by field: per schema property, on how many requests the candidate produced the
+    same value as the baseline (from value hashes; no output text), and whether the baseline's own repetitions agreed with
+    each other. Decision fields are the operator's `decision_fields` when configured, else the schema's enum, boolean and
+    number fields, labelled as not confirmed to be what the application decides on."""
+    def by_prompt(reqs):
+        out = {}
+        for r in reqs:
+            if isinstance(r.get("fields"), dict):
+                out.setdefault(r.get("prompt_id"), []).append(r)
+        return out
+    b, c = by_prompt(base_reqs), by_prompt(cand_reqs)
+    pids = sorted(p for p in b if p in c)
+    if not pids:
+        return None
+    by_field = {}
+    for pid in pids:
+        bf, cf = b[pid][0]["fields"], c[pid][0]["fields"]
+        kinds = b[pid][0].get("field_kinds") or {}
+        for k, h in bf.items():
+            e = by_field.setdefault(k, {"kind": kinds.get(k), "compared": 0, "agree": 0, "baseline_unstable": 0})
+            e["compared"] += 1
+            e["agree"] += int(cf.get(k) == h)
+            e["baseline_unstable"] += int(len({x["fields"].get(k) for x in b[pid]}) > 1)
+    cls_of = {r.get("prompt_id"): r.get("class") for r in base_reqs}
+    if isinstance(decision_fields, dict):
+        chosen = {pid: [f for f in decision_fields.get(cls_of.get(pid)) or decision_fields.get("*") or [] if f in by_field] for pid in pids}
+        basis = "configured decision_fields per request class"
+    elif isinstance(decision_fields, list) and decision_fields:
+        chosen = {pid: [f for f in decision_fields if f in by_field] for pid in pids}
+        basis = "configured decision_fields"
+    else:
+        auto = [k for k, e in by_field.items() if e["kind"] in ("categorical", "number")]
+        chosen = {pid: auto for pid in pids}
+        basis = "schema fields of kind enum/boolean/number, not confirmed as the fields your application decides on (set decision_fields)"
+    judged = [pid for pid in pids if chosen[pid]]
+    same = [pid for pid in judged if all(c[pid][0]["fields"].get(f) == b[pid][0]["fields"].get(f) for f in chosen[pid])]
+    return {"requests": len(pids), "by_field": by_field, "decision_basis": basis,
+            "decision_fields": sorted({f for pid in judged for f in chosen[pid]}),
+            "decisions_judged": len(judged), "decisions_equal": len(same),
+            "decisions_differ_on": sorted(set(judged) - set(same))[:10]}
+
+
 def arm_fidelity(base, cand, row, oe, full_label):
     """The fidelity class of a candidate arm: from the probes (top-k log-probabilities) when both arms have them, else from
     token/hash identity alone. Validity drops and an unreproducible baseline override everything."""
@@ -1336,16 +1435,27 @@ def arm_fidelity(base, cand, row, oe, full_label):
     reproducible = all(e.get("stable_within_reference", True) for e in oe.values() if full_label in e)
     bp, cp = base.get("probes") or {}, cand.get("probes") or {}
     prompts = {}
-    for pid in bp:
-        if pid in cp and not bp[pid].get("error") and not cp[pid].get("error"):
-            prompts[pid] = fidelity.compare_probes(bp[pid], cp[pid])
-    basis = "probes with top-%s log-probabilities" % min([x.get("k") or 0 for x in list(bp.values()) + list(cp.values()) if isinstance(x, dict) and x.get("k")] or [0])
+    k = min([x.get("k") or 0 for x in list(bp.values()) + list(cp.values()) if isinstance(x, dict) and x.get("k")] or [0])
+    if isinstance(cand.get("probe_comparison"), dict):
+        # application requests: compared in memory when the run ended (the record holds no output tokens)
+        prompts = dict(cand["probe_comparison"])
+        basis = "probes with top-%s log-probabilities, compared when the run ended" % k
+    else:
+        for pid in bp:
+            if pid in cp and not bp[pid].get("error") and not cp[pid].get("error") and bp[pid].get("tokens") is not None:
+                prompts[pid] = fidelity.compare_probes(bp[pid], cp[pid])
+        basis = "probes with top-%s log-probabilities" % k
+    for pid, pr in list(bp.items()) + list(cp.items()):
+        if isinstance(pr, dict) and pr.get("sampled"):
+            prompts[pid] = {"class": "sampled"}
     if not prompts:
         # no probes (older records, requests workloads): identity only, never a near-tie claim
+        sampled = {r.get("prompt_id") for r in base.get("requests") or [] if r.get("sampled")}
         for pid, e in oe.items():
             if full_label in e:
-                prompts[pid] = {"class": "token-identical" if e[full_label].get("identical") else "diverged",
-                                "first_divergence_index": e[full_label].get("first_divergence_index")}
+                prompts[pid] = {"class": "sampled"} if pid in sampled else {
+                    "class": "token-identical" if e[full_label].get("identical") else "diverged",
+                    "first_divergence_index": e[full_label].get("first_divergence_index")}
         basis = "token ids or output hashes only (no probability probes)"
     mismatch = [pid for pid, pr in list(bp.items()) + list(cp.items()) if isinstance(pr, dict) and pr.get("matches_timed") is False]
     out = fidelity.classify_arm(prompts, validity_dropped=validity_dropped, baseline_reproducible=reproducible)

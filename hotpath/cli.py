@@ -400,6 +400,42 @@ def _session_gpu(args):
     return locks.gpu_work("improve", args.resume or "new session", wait_s=args.wait_s, log=lambda m: print(m, flush=True))
 
 
+def split_args_string(text):
+    """A launch line given as one string. On Windows, backslashes in paths are kept (POSIX shell rules would drop them)
+    and surrounding quotes are removed."""
+    if os.name != "nt":
+        return shlex.split(text)
+    return [t[1:-1] if len(t) >= 2 and t[0] == t[-1] and t[0] in "\"'" else t for t in shlex.split(text, posix=False)]
+
+
+def requests_workload(captured):
+    """The requests workload for a capture file: workloads/<name>.requests.json, built once from the capture (an existing
+    one is reused when it was built from the same file contents, so a session keeps measuring the same requests)."""
+    import hashlib
+    src = Path(captured)
+    digest = hashlib.sha256(src.read_bytes()).hexdigest()[:16]
+    out = Path("workloads") / ("%s.requests.json" % src.stem)
+    if out.is_file():
+        try:
+            if json.loads(out.read_text(encoding="utf-8")).get("source_sha256") == digest:
+                return str(out)
+        except ValueError:
+            pass
+        out = Path("workloads") / ("%s-%s.requests.json" % (src.stem, digest[:6]))
+        if out.is_file():
+            return str(out)
+    try:
+        w = wl_mod.workload_from_requests(str(src), name=src.stem)
+    except ValueError as e:
+        raise SystemExit("error: %s" % e)
+    w["source_sha256"] = digest
+    wl_mod.save_workload(w, str(out))
+    ident = wl_mod.workload_identity(w)
+    print("wrote %s: %d of your requests in %d class(es) (%s); it holds your prompts, keep it local" % (
+        out, ident["n_prompts"], len(ident["classes"]), ", ".join("%s x%d" % kv for kv in sorted(ident["classes"].items()))))
+    return str(out)
+
+
 def cmd_improve(args):
     """ACTIVE (unless --dry-run): diagnose, test the top finding with an experiment, adopt it only on a keep verdict, repeat
     within the budget, confirm the cumulative change, and print the launch line to apply."""
@@ -459,6 +495,8 @@ def cmd_improve(args):
         else:
             start = "no running server or log: a baseline of your configuration on hotpath's own server"
     shape = None
+    if args.requests:
+        args.workload = requests_workload(args.requests)
     if records and not (args.workload or cfg.get("workload")):
         shape = diag_mod.diagnose(records, cfg=cfg).get("traffic_shape")
     workload = choose_workload(args.workload, cfg, shape)
@@ -466,8 +504,9 @@ def cmd_improve(args):
     with _session_gpu(args):
         rep = imp.improve(cfg, records, workload, out, None if args.dry_run else _experiment_runner(cfg, args.wait_s), max_experiments=args.max_experiments,
                           max_minutes=args.max_minutes, rounds=args.rounds, repetitions=args.repetitions, warmup=args.warmup, port=args.port,
-                          n_predict=args.n_predict, dry_run=args.dry_run, initial_args=shlex.split(args.args) if args.args else None, bandwidth_gbs=args.bandwidth_gbs,
-                          log=lambda m: print(m, flush=True))
+                              n_predict=args.n_predict, dry_run=args.dry_run, initial_args=split_args_string(args.args) if args.args else None,
+                          bandwidth_gbs=args.bandwidth_gbs, log=lambda m: print(m, flush=True), cache_mode=args.cache_mode,
+                          step_requests=args.step_requests, validation_requests=args.validation_requests)
     print("")
     print(imp.improvement_markdown(rep))
     print("wrote %s" % rep["path"])
@@ -665,6 +704,14 @@ def build_parser():
     s.add_argument("--server", help="the running server to start from (default: server_url, else the only running llama-server)")
     s.add_argument("--log", help="server log to diagnose from (default: the server's --log-file, else server_log)")
     s.add_argument("--workload", help="workload file (default: 'workload' in the config, else synthetic prompts shaped like your observed traffic)")
+    s.add_argument("--requests", metavar="CAPTURED", help="your application's own request bodies (JSON array or JSONL of llama-server request bodies, "
+                   "optionally {\"class\": ..., \"body\": ...}): every step and the final validation run these real requests instead of synthetic prompts; "
+                   "the workload is written to workloads/ (keep it local: it holds your prompts)")
+    s.add_argument("--cache-mode", choices=("cold", "warm", "as-is"), help="prompt-cache handling for request workloads (default cold: no reuse, "
+                   "every request fully processed; warm: your requests in order with reuse, as your application sends them)")
+    s.add_argument("--step-requests", type=int, default=2, help="requests per request class in each step (default 2: the median and the largest)")
+    s.add_argument("--validation-requests", type=int, default=4, help="requests per request class in the final validation (default 4, smallest to "
+                   "largest, preferring ones the steps did not run)")
     s.add_argument("--args", help="starting llama-server arguments as one quoted string, when no server runs, e.g. --args \"-ngl 99 -c 8192\" "
                    "(default: server_args, else defaults fitted to your GPU)")
     s.add_argument("--max-experiments", type=int, default=3, help="experiments to run at most, not counting the baseline and the final confirmation (default 3)")

@@ -50,6 +50,8 @@ def output_equivalence(sets):
     by_prompt = {}
     for lab in labels:
         for r in sets[lab]["requests"]:
+            if r.get("error"):
+                continue            # rejected by the server: no output (counted in the verdict)
             key = r.get("tokens") if r.get("tokens") else ("sha256:" + str(r.get("output_sha256")))
             by_prompt.setdefault(r["prompt_id"], {}).setdefault(lab, []).append(key)
     result = {}

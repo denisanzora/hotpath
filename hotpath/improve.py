@@ -100,16 +100,34 @@ HEADROOM_MIB = 300           # free VRAM left while the candidate ran, below whi
 PROMPT_REGRESSION = 0.03     # per-prompt wall-time regression allowed beyond twice the prompt's own repetition spread
 
 
+OUTPUT_POLICIES = ("identical", "schema_valid", "decisions_equal")
+
+
 def _policy_check(row, cfg):
-    """An operator's output policy (hotpath.local.json `output_policy`), checked on this row. Only "schema_valid" exists:
-    differing outputs are accepted when every judged request of both arms passed full JSON Schema validation."""
+    """An operator's output policy (hotpath.local.json `output_policy`), checked on this row; the default "identical"
+    accepts no difference. "schema_valid": differing outputs are accepted when every judged request of the candidate passed
+    full JSON Schema validation and, if the operator configured `decision_fields`, every one of them came out equal.
+    "decisions_equal": the same, and `decision_fields` must be configured (an operator's statement of what the application
+    decides on); without it the policy never passes. Neither policy says the outputs are equivalent, only that they met
+    the operator's stated criteria."""
     policy = (cfg or {}).get("output_policy")
-    if policy != "schema_valid":
+    if policy not in ("schema_valid", "decisions_equal"):
         return policy, None
     v = row.get("validity") or {}
     c = v.get("candidate") or {}
     ok = bool(v and not v.get("dropped") and v.get("decided_on") == "schema_valid" and c.get("judged") and c.get("schema_valid") == c.get("judged"))
-    return policy, {"passed": ok, "basis": "full JSON Schema validation %s/%s in the candidate" % (c.get("schema_valid"), c.get("judged")) if v else "no schema in these requests"}
+    basis = ["full JSON Schema validation %s/%s in the candidate" % (c.get("schema_valid"), c.get("judged")) if v else "no schema in these requests"]
+    fa = row.get("fields") or {}
+    configured = bool((cfg or {}).get("decision_fields"))
+    if configured:
+        dec_ok = bool(fa.get("decisions_judged")) and fa.get("decisions_equal") == fa.get("decisions_judged")
+        basis.append("decision fields %s equal on %s/%s requests" % (", ".join(fa.get("decision_fields") or []) or "(none found in the outputs)",
+                                                                     fa.get("decisions_equal"), fa.get("decisions_judged")))
+        ok = ok and dec_ok
+    elif policy == "decisions_equal":
+        ok = False
+        basis.append("decision_fields is not configured, so no decision could be checked")
+    return policy, {"passed": ok, "basis": "; ".join(basis)}
 
 
 def resource_check(rec_arms, base_name, cand_name):
@@ -138,6 +156,20 @@ def prompt_regression(row):
     return out
 
 
+def class_regression(row):
+    """Request classes whose median wall time got worse beyond the class's own repetition noise: an average gain must not
+    be bought with a slower application step."""
+    out = []
+    for c, m in sorted((row.get("classes") or {}).items()):
+        w = m.get("wall_ms") or {}
+        if w.get("ratio") is None:
+            continue
+        tol = max(PROMPT_REGRESSION, 2 * (w.get("noise") or 0.0))
+        if w["ratio"] > 1.0 + tol:
+            out.append("%s (%+.0f%% over %d requests)" % (c, 100 * (w["ratio"] - 1), m.get("requests") or 0))
+    return out
+
+
 def adoptable(row, verdict, arm=None, rec_arms=None, base_name=None, cfg=None):
     """(adopt?, reason, needs_decision). Adopted only when faster and consistent, with outputs identical (or accepted by an
     operator's checked output policy), no prompt regressing beyond its noise, no spill into system memory, VRAM headroom
@@ -147,12 +179,18 @@ def adoptable(row, verdict, arm=None, rec_arms=None, base_name=None, cfg=None):
     policy, check = _policy_check(row, cfg)
     if not row["verdict"].startswith("keep") and not (faster_differ and check and check.get("passed")):
         return False, "not adopted: the verdict is not keep (%s)" % row["verdict"].split(":")[0], faster_differ
+    creg = class_regression(row)
+    if creg:
+        return False, "not adopted: faster overall but the request class %s got slower beyond its own noise" % "; ".join(creg), False
     reg = prompt_regression(row)
     if reg:
         return False, "not adopted: faster overall but it regresses on %s beyond those prompts' own noise" % ", ".join(reg), False
     problem, decide = resource_check(rec_arms, base_name, row.get("arm"))
     if problem:
         return False, "not adopted: %s" % problem, decide
+    if (arm or {}).get("request_override"):
+        return False, ("not adopted: faster, but it changes what your application sends (%s), which is a change to your application, not to "
+                       "the server launch; your decision" % _request_change_text(arm["request_override"])), True
     if (arm or {}).get("capacity_change"):
         return False, "not adopted: faster with identical outputs, but it changes what the server accepts (%s); your decision" % arm["capacity_change"], True
     gate = verdict.get("production_gate")
@@ -161,6 +199,11 @@ def adoptable(row, verdict, arm=None, rec_arms=None, base_name=None, cfg=None):
     if faster_differ:
         return True, "adopted under the output policy %r: %s" % (policy, check["basis"]), False
     return True, "adopted: keep verdict", False
+
+
+def _request_change_text(ov):
+    parts = ["set %s" % k for k in (ov.get("set") or {})] + ["remove %s" % k for k in ov.get("remove") or []]
+    return ", ".join(parts) or "none"
 
 
 def _rank_rows(verdict):
@@ -190,6 +233,95 @@ def _measured_load_s(records):
             loads.sort()
             return loads[len(loads) // 2]
     return None
+
+
+STEP_POSITIONS = {1: [0.5], 2: [0.5, 1.0], 3: [0.0, 0.5, 1.0]}
+
+
+def _spread(items, n, avoid=(), positions=None):
+    """n items from a size-sorted list at evenly spaced positions (the largest always included), preferring items not in
+    `avoid` near each position, so a validation set is mostly requests the steps did not see."""
+    if n >= len(items):
+        return list(items)
+    positions = positions or ([0.5] if n == 1 else [i / (n - 1) for i in range(n)])
+    picks = []
+    for q in positions:
+        idx = int(round(q * (len(items) - 1)))
+        order = sorted(range(len(items)), key=lambda j: (abs(j - idx), j))
+        if q >= 1.0:
+            pick = items[-1] if items[-1] not in picks else None              # the largest request, seen or not
+        else:
+            pick = next((items[j] for j in order if items[j]["id"] not in avoid and items[j] not in picks), None) or \
+                next((items[j] for j in order if items[j] not in picks), None)
+        if pick is not None:
+            picks.append(pick)
+    return picks
+
+
+def requests_plan(workload, sdir, cfg, cache_mode=None, step_per_class=2, validation_per_class=4, max_steps=8, max_validation=16):
+    """For a workload of the user's own requests: the subset the steps run (per request class the median and the largest
+    request) and a broader validation subset (per class, from the smallest to the largest, mostly requests the steps did
+    not see), both kept in the session as lists of item ids (the request bodies stay in the workload file). Kept for the
+    whole session, so a resumed run measures the same requests."""
+    from hotpath import workload as wl
+    sdir = Path(sdir)
+    sp, vp = sdir / "steps-requests.json", sdir / "validation-requests.json"
+    w = wl.load_workload(workload)
+    if not (sp.is_file() and vp.is_file()):
+        order = {it["id"]: i for i, it in enumerate(w["items"])}
+        groups = {}
+        for it in w["items"]:
+            groups.setdefault(wl.request_class(it), []).append(it)
+        for c in groups:
+            groups[c].sort(key=lambda it: (wl.request_size(it), order[it["id"]]))
+        n_cls = len(groups)
+        per_step = max(1, min(int(step_per_class), max_steps // n_cls or 1))
+        per_val = max(1, min(int(validation_per_class), max_validation // n_cls or 1))
+        steps, val = [], []
+        for c, items in groups.items():
+            st = _spread(items, per_step, positions=STEP_POSITIONS.get(per_step))
+            steps += st
+            val += _spread(items, per_val, avoid={x["id"] for x in st})
+        steps.sort(key=lambda it: order[it["id"]])          # the application's own order (it matters for warm caches)
+        val.sort(key=lambda it: order[it["id"]])
+        sp.write_text(json.dumps(wl.subset(workload, [x["id"] for x in steps], "%s-steps" % w["name"],
+                                           "per request class: the median and the largest request (%d per class)" % per_step), indent=1) + "\n", encoding="utf-8")
+        vp.write_text(json.dumps(wl.subset(workload, [x["id"] for x in val], "%s-validation" % w["name"],
+                                           "per request class: %d requests from the smallest to the largest, preferring ones the steps did not run" % per_val),
+                                 indent=1) + "\n", encoding="utf-8")
+    steps_w, val_w = wl.load_workload(str(sp)), wl.load_workload(str(vp))
+    seen = {it["id"] for it in steps_w["items"]}
+    ident = wl.workload_identity(w)
+
+    def per_class(ws):
+        out = {}
+        for it in ws["items"]:
+            out[wl.request_class(it)] = out.get(wl.request_class(it), 0) + 1
+        return out
+    mode = cache_mode or w.get("cache_mode") or "cold"
+    summary = {"source": Path(workload).name, "requests": len(w["items"]), "classes": ident["classes"], "sampled_requests": ident["sampled_requests"],
+               "steps": {"requests": len(steps_w["items"]), "per_class": per_class(steps_w), "basis": json.loads(sp.read_text(encoding="utf-8")).get("basis")},
+               "validation": {"requests": len(val_w["items"]), "per_class": per_class(val_w), "held_out": sum(1 for it in val_w["items"] if it["id"] not in seen),
+                              "basis": json.loads(vp.read_text(encoding="utf-8")).get("basis")},
+               "cache_mode": mode, "decision_fields": cfg.get("decision_fields") or None,
+               "note": ("cache_mode cold: every request with cache_prompt false, so each change is measured on full prompt processing; your application's "
+                        "prefix reuse is not part of these numbers (cache_mode warm replays the requests in order with reuse)" if mode == "cold" else
+                        "cache_mode %s: the requests are replayed in your application's order with the prompt cache as they send it" % mode)}
+    return {"steps": str(sp), "validation": str(vp), "cache_mode": mode, "decision_fields": cfg.get("decision_fields") or None,
+            "validation_basis": "%d of your own requests (%s; %d not run in the steps)" % (len(val_w["items"]), summary["validation"]["basis"], summary["validation"]["held_out"]),
+            "summary": summary}
+
+
+def _apply_rq(spec, rq):
+    """Request-workload settings every spec of the session carries: the cache mode, the operator's decision fields, and no
+    n_predict (each request has its own generation limit)."""
+    if not rq:
+        return spec
+    spec["cache_mode"] = rq["cache_mode"]
+    if rq.get("decision_fields"):
+        spec["decision_fields"] = rq["decision_fields"]
+    spec.pop("n_predict", None)
+    return spec
 
 
 def _is_requests_workload(path):
@@ -321,7 +453,8 @@ def _write_exp(rec, sdir, name):
 
 
 def improve(cfg, start_records, workload, out_dir, runner, max_experiments=3, max_minutes=60, rounds=3, repetitions=2, warmup=1, port=8099,
-            n_predict=None, dry_run=False, log=print, initial_args=None, bandwidth_gbs=None, session=None, resume=False, identity=None):
+            n_predict=None, dry_run=False, log=print, initial_args=None, bandwidth_gbs=None, session=None, resume=False, identity=None,
+            cache_mode=None, step_requests=2, validation_requests=4):
     """Run the loop. `runner(spec, spec_path)` runs one experiment spec and returns its record (raising SystemExit when
     it cannot start, for example on unmet preconditions). Returns the improvement report (also written to out_dir).
     With `resume`, the session's saved starting point is used and experiments already recorded in it are not run again."""
@@ -341,34 +474,48 @@ def improve(cfg, start_records, workload, out_dir, runner, max_experiments=3, ma
         saved = json.loads(state.read_text(encoding="utf-8"))
         _check_saved_state(saved, sdir)
         start_records, workload, initial_args = saved["start_records"], saved["workload"], saved.get("initial_args")
+        cache_mode = saved.get("cache_mode", cache_mode)
         log("resuming %s: %d starting record(s), workload %s" % (session, len(start_records), Path(workload).name))
     elif not dry_run:
-        state.write_text(json.dumps({"start_records": list(start_records), "workload": workload, "initial_args": initial_args}) + "\n", encoding="utf-8")
+        state.write_text(json.dumps({"start_records": list(start_records), "workload": workload, "initial_args": initial_args, "cache_mode": cache_mode}) + "\n",
+                         encoding="utf-8")
     if dry_run:
         runner = _never_launch          # a dry run reads what a session recorded and launches nothing, also when resuming
     runner = _reusing(runner, sdir, log)
     lock = None if dry_run else locks.take_session(sdir)
     try:
         return _improve(cfg, start_records, workload, out_dir, runner, max_experiments, max_minutes, rounds, repetitions, warmup, port, n_predict,
-                        dry_run, log, initial_args, bandwidth_gbs, session, sdir, identity, file_identity)
+                        dry_run, log, initial_args, bandwidth_gbs, session, sdir, identity, file_identity,
+                        {"cache_mode": cache_mode, "step": step_requests, "validation": validation_requests})
     finally:
         if lock is not None:
             locks.drop_session(lock)
 
 
 def _improve(cfg, start_records, workload, out_dir, runner, max_experiments, max_minutes, rounds, repetitions, warmup, port, n_predict, dry_run, log,
-             initial_args, bandwidth_gbs, session, sdir, identity, file_identity):
+             initial_args, bandwidth_gbs, session, sdir, identity, file_identity, rq_opts=None):
     problem = identity_problem(start_records, cfg, identity or (lambda path: file_identity(path) if Path(path).is_file() else None))
     if problem:
         return _early_report(session, out_dir, initial_args or [], "the records you started from", workload, max_experiments, max_minutes,
                              "refused before launching anything: %s" % problem)
     records = list(start_records)
     requests_wl = _is_requests_workload(workload)
+    rq = None
+    if requests_wl:
+        try:
+            rq = requests_plan(workload, sdir, cfg, (rq_opts or {}).get("cache_mode"), (rq_opts or {}).get("step") or 2, (rq_opts or {}).get("validation") or 4)
+        except (OSError, ValueError, KeyError) as e:
+            return _early_report(session, out_dir, initial_args or [], "the records you started from", workload, max_experiments, max_minutes,
+                                 "refused before launching anything: the requests workload cannot be used: %s" % e)
+        log("your requests: %d in %d class(es) from %s; steps run %d, the validation %d (%d not seen by the steps); cache mode %s" % (
+            rq["summary"]["requests"], len(rq["summary"]["classes"]), rq["summary"]["source"], rq["summary"]["steps"]["requests"],
+            rq["summary"]["validation"]["requests"], rq["summary"]["validation"]["held_out"], rq["cache_mode"]))
+    step_wl = rq["steps"] if rq else workload
     baseline = None
     if not records:
         # nothing running and no log: measure the starting configuration on hotpath's own server first
         args, source = (list(initial_args), "command line") if initial_args else baseline_args_without_server(cfg)
-        bspec = baseline_spec(cfg, args, workload, port, repetitions, warmup, n_predict, "%s-baseline" % session)
+        bspec = _apply_rq(baseline_spec(cfg, args, step_wl, port, repetitions, warmup, n_predict, "%s-baseline" % session), rq)
         bpath = sdir / "baseline.json"
         bpath.write_text(json.dumps(bspec, indent=2) + "\n", encoding="utf-8")
         baseline = {"spec": str(bpath), "args": args, "source": source}
@@ -412,7 +559,8 @@ def _improve(cfg, start_records, workload, out_dir, runner, max_experiments, max
     report = {"bottleneck": report_bottleneck, "session": session, "starting_point": {"args": args0, "source": source, "removed_server_args": sorted(set(removed)),
                                                      "diagnosed_arm": diag.get("diagnosed_arm"), "sources": diag.get("sources")},
               "workload": Path(workload).name, "budget": {"max_experiments": budget.max_experiments, "max_minutes": budget.max_minutes},
-              "steps": steps, "skipped_findings": [], "confirmation": None, "next_step": None, "baseline": baseline, "decisions": []}
+              "steps": steps, "skipped_findings": [], "confirmation": None, "next_step": None, "baseline": baseline, "decisions": [],
+              "requests": rq["summary"] if rq else None}
     stopped = None
     if baseline and baseline.get("failed"):
         stopped = "the baseline launch failed: %s (see the server log in %s)" % ("; ".join(baseline["failed"]), sdir.name)
@@ -430,7 +578,7 @@ def _improve(cfg, start_records, workload, out_dir, runner, max_experiments, max
         n = len(steps) + 1
         name = "%s-s%d-%s" % (session, n, f["experiment"]["kind"])
         try:
-            spec = step_spec(f, cfg, best, workload, port, rounds, repetitions, warmup, n_predict, name)
+            spec = _apply_rq(step_spec(f, cfg, best, step_wl, port, rounds, repetitions, warmup, n_predict, name), rq)
         except ValueError as e:
             attempted.add(f["id"])
             report["skipped_findings"].append({"finding": f["id"], "title": f.get("title"), "why_not_run": str(e)})
@@ -449,7 +597,7 @@ def _improve(cfg, start_records, workload, out_dir, runner, max_experiments, max
             report["next_step"] = {"finding": f["id"], "title": f.get("title"), "spec": str(spec_path), "estimated_minutes": need,
                                    "arms": [a["name"] for a in spec["arms"]], "variable": f["experiment"].get("variable"), "port": port,
                                    "min_free_vram_mib": spec["preconditions"].get("min_free_vram_mib")}
-            vw, _vb = validation_workload(sdir, shape, _ctx_tokens(best["args"]), n_predict)
+            vw = rq["validation"] if rq else validation_workload(sdir, shape, _ctx_tokens(best["args"]), n_predict)[0]
             vest = prop.estimate_minutes({"workload": vw, "arms": [{}, {}], "rounds": rounds, "repetitions": repetitions, "warmup": warmup, "cooldown_s": 5},
                                          diag.get("rates"), load_s=_measured_load_s(records))
             report["validation_estimate_minutes"] = vest["minutes"] if vest else None
@@ -546,7 +694,7 @@ def _improve(cfg, start_records, workload, out_dir, runner, max_experiments, max
     report["stopped_because"] = stopped
     report["experiments_run"] = budget.experiments
     report["result"] = _result(cfg, original, cum, adopted_steps, records, workload, port, rounds, repetitions, warmup, n_predict, budget, sdir, session,
-                               runner, dry_run, bandwidth_gbs, log, report, shape)
+                               runner, dry_run, bandwidth_gbs, log, report, shape, rq)
     report["minutes_used"] = round(budget.minutes, 1)
     validated = report["result"].get("validated")
     if validated and report.get("validated_steps") and len(report["validated_steps"]) < len(adopted_steps):
@@ -555,7 +703,7 @@ def _improve(cfg, start_records, workload, out_dir, runner, max_experiments, max
     report["recommended"] = recommended_launch(observed or args0, cum if validated else {"args": {}, "args_remove": set(), "env": {}, "env_remove": set()},
                                                bool(observed), validated=validated, adopted=bool(adopted_steps))
     if not dry_run and budget.experiments:
-        validate_decisions(cfg, original, report, records, port, rounds, repetitions, warmup, n_predict, budget, sdir, session, runner, log, shape)
+        validate_decisions(cfg, original, report, records, port, rounds, repetitions, warmup, n_predict, budget, sdir, session, runner, log, shape, rq)
     report["remaining"] = [{"id": f["id"], "title": f.get("title"), "confidence": f.get("confidence"), "next": (f.get("measured") or {}).get("how")}
                            for f in diag.get("findings") or [] if f.get("severity") in ("high", "medium") and f["id"] not in attempted][:5]
     rec = new_record("improvement", "controlled" if budget.experiments else "hypothesis", **report)
@@ -726,7 +874,7 @@ def decomposition(rows, arm_of, name):
 
 
 def _result(cfg, original, cum, adopted_steps, records, workload, port, rounds, repetitions, warmup, n_predict, budget, sdir, session, runner,
-            dry_run, bandwidth_gbs, log, report, shape=None):
+            dry_run, bandwidth_gbs, log, report, shape=None, rq=None):
     if dry_run:
         return {"verdict": "dry run: nothing measured", "measured_by": None, "validated": None}
     if not budget.experiments:
@@ -748,7 +896,7 @@ def _result(cfg, original, cum, adopted_steps, records, workload, port, rounds, 
     tried = []
     for k, (label, steps_) in enumerate(candidates):
         out = _validate(cfg, original, steps_, records, port, rounds, repetitions, warmup, n_predict, budget, sdir, session, runner, log, shape,
-                        "%s-confirm" % session if k == 0 else "%s-confirm-%d" % (session, k + 1))
+                        "%s-confirm" % session if k == 0 else "%s-confirm-%d" % (session, k + 1), rq)
         out["label"] = label
         tried.append(out)
         if out.get("validated") or out.get("stop"):
@@ -778,7 +926,7 @@ def _result(cfg, original, cum, adopted_steps, records, workload, port, rounds, 
             "measured_by": first.get("measured_by"), "measured": first.get("measured"), "validated": False, "not_validated": untried}
 
 
-def validate_decisions(cfg, original, report, records, port, rounds, repetitions, warmup, n_predict, budget, sdir, session, runner, log, shape):
+def validate_decisions(cfg, original, report, records, port, rounds, repetitions, warmup, n_predict, budget, sdir, session, runner, log, shape, rq=None):
     """A step-level decision (a smaller context) was measured on the step workload only; validate the fastest such option
     against the original launch on the same broad workload the adopted changes faced, so the user decides on evidence of
     the same standard. Within the time budget; the result is attached to the decision, nothing is adopted."""
@@ -792,7 +940,7 @@ def validate_decisions(cfg, original, report, records, port, rounds, repetitions
                                  "basis": "the original launch in step 1"})
     pseudo = {"finding": "option %s" % d["arm"], "step": d["step"], "experiment": d["arm"], "change": d["change_spec"], "measured": d.get("measured")}
     out = _validate(cfg, orig, [pseudo], records, port, rounds, repetitions, warmup, n_predict, budget, sdir, session, runner, log, shape,
-                    "%s-option-%s" % (session, d["arm"]))
+                    "%s-option-%s" % (session, d["arm"]), rq)
     row = out.get("row")
     fid = (row.get("fidelity") or {}) if row else {}
     d["validation"] = {"run": out.get("measured_by"), "verdict": out.get("verdict"), "measured": out.get("measured"), "fidelity": fid.get("class"),
@@ -811,7 +959,7 @@ def _cum_change(steps_):
     return c
 
 
-def _validate(cfg, original, steps_, records, port, rounds, repetitions, warmup, n_predict, budget, sdir, session, runner, log, shape, name):
+def _validate(cfg, original, steps_, records, port, rounds, repetitions, warmup, n_predict, budget, sdir, session, runner, log, shape, name, rq=None):
     """One validation run: the original launch against the original plus `steps_`' changes, on the broader workload."""
     ch = _cum_change(steps_)
     improved = {"name": "improved"}
@@ -819,7 +967,10 @@ def _validate(cfg, original, steps_, records, port, rounds, repetitions, warmup,
         if ch[k]:
             improved[k] = ch[k]
     imp_args = materialize(original["args"], original["env"], improved)[0]
-    vw, vbasis = validation_workload(sdir, shape, min(_ctx_tokens(original["args"]), _ctx_tokens(imp_args)), n_predict)
+    if rq:
+        vw, vbasis = rq["validation"], rq["validation_basis"]
+    else:
+        vw, vbasis = validation_workload(sdir, shape, min(_ctx_tokens(original["args"]), _ctx_tokens(imp_args)), n_predict)
     spec = {"name": name, "description": "Validation by hotpath improve: your original launch against the launch with %s, on a broader workload than the "
                                          "steps used. Several variables may differ by design; the one-variable evidence for each change is in its own step." % (
                                              ", ".join(st["finding"] for st in steps_)),
@@ -831,6 +982,7 @@ def _validate(cfg, original, steps_, records, port, rounds, repetitions, warmup,
                            "workload_basis": vbasis}}
     if cfg.get("path_prepend"):
         spec["path_prepend"] = "${path_prepend}"
+    _apply_rq(spec, rq)
     need = [prop.vram_needed_mib(cfg, materialize(spec["common_args"], spec["env"], a)[0]) for a in spec["arms"]]
     if need and all(x is not None for x in need):
         spec["preconditions"]["min_free_vram_mib"] = max(need)
@@ -845,7 +997,8 @@ def _validate(cfg, original, steps_, records, port, rounds, repetitions, warmup,
                         why="not adopted: the budget ran out before validation", stop=True)
     path = sdir / ("%s.json" % name.replace(session + "-", ""))
     path.write_text(json.dumps(spec, indent=2) + "\n", encoding="utf-8")
-    log("validating: original vs %s on %d prompts%s" % (", ".join(st["finding"] for st in steps_), 6, ", about %.0f min" % est["minutes"] if est else ""))
+    log("validating: original vs %s on %s%s" % (", ".join(st["finding"] for st in steps_), vbasis.split(" (")[0] if rq else "6 prompts",
+                                                ", about %.0f min" % est["minutes"] if est else ""))
     t0 = time.time()
     try:
         rec = runner(spec, str(path))

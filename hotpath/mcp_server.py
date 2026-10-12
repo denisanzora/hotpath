@@ -281,6 +281,9 @@ _IMPROVE_PROPS = {
     "max_experiments": {"type": "integer", "description": "Experiments to run at most (default 3), not counting the baseline and the final confirmation."},
     "max_minutes": {"type": "number", "description": "Stop before a step whose estimated duration would exceed the time left (default 60)."},
     "workload": {"type": "string", "description": "Workload file inside the working directory (default: synthetic prompts shaped like the observed traffic)."},
+    "requests": {"type": "string", "description": "The user's captured application request bodies (JSONL or JSON array, inside the working directory): steps and the "
+                 "final validation run these real requests. Prefer this whenever the user has them."},
+    "cache_mode": {"type": "string", "enum": ["cold", "warm", "as-is"], "description": "Prompt-cache handling for request workloads (default cold)."},
     "from_records": {"type": "array", "items": _STR, "description": "Start from these records (inside the working directory) instead of observing the running server."},
     "server": {"type": "string", "description": "The user's running server to start from (loopback URL); it is observed, never restarted or loaded."},
     "args": {"type": "string", "description": "Starting llama-server arguments as one string, only when no server runs (default: server_args in the config, else defaults fitted to the GPU)."},
@@ -298,6 +301,10 @@ def _improve_argv(a, dry_run):
         argv += ["--max-minutes", str(float(a["max_minutes"]))]
     if a.get("workload"):
         argv += ["--workload", _inside_cwd(a["workload"], "workload")]
+    if a.get("requests"):
+        argv += ["--requests", _inside_cwd(a["requests"], "requests")]
+    if a.get("cache_mode"):
+        argv += ["--cache-mode", str(a["cache_mode"])]
     if a.get("from_records"):
         argv += ["--from"] + [_inside_cwd(r, "record") for r in a["from_records"]]
     if a.get("server"):

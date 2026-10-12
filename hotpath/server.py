@@ -14,6 +14,14 @@ class ServerError(RuntimeError):
     pass
 
 
+class RequestRejected(ServerError):
+    """The server answered a request with an HTTP error status: it is up, and refused this request."""
+
+    def __init__(self, code, error_type):
+        super().__init__("HTTP %s (%s)" % (code, error_type))
+        self.code, self.error_type = code, error_type
+
+
 def _get(url, timeout=10):
     req = urllib.request.Request(url, headers={"Accept": "application/json"})
     with urllib.request.urlopen(req, timeout=timeout) as r:
@@ -127,7 +135,16 @@ def request(base, endpoint, body, timeout=900):
     body = dict(body)
     body["stream"] = False
     t0 = time.perf_counter()
-    r = _post(base + endpoint, body, timeout=timeout)
+    try:
+        r = _post(base + endpoint, body, timeout=timeout)
+    except urllib.error.HTTPError as e:
+        etype = None
+        try:
+            err = json.loads(e.read().decode("utf-8", "replace")).get("error")
+            etype = err.get("type") if isinstance(err, dict) else None
+        except (ValueError, AttributeError, OSError):
+            pass
+        raise RequestRejected(e.code, str(etype or "unknown")[:60])
     r["_wall_ms"] = round((time.perf_counter() - t0) * 1000.0, 1)
     return r
 

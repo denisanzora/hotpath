@@ -47,17 +47,77 @@ def _body_hash(body):
     return hashlib.sha256(json.dumps(body, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()[:16]
 
 
+def request_class(item):
+    """The request class of an application request: the label the capture gave it (`class` or `stage`), else one derived
+    from its shape: endpoint, the JSON schema's name (or grammar / free text) and a short hash of the system message, so
+    requests the application builds the same way fall into one class without storing any of their text."""
+    if item.get("class"):
+        return str(item["class"])
+    body = item.get("body") or {}
+    ep = "chat" if "messages" in body else "completion"
+    rf = body.get("response_format") if isinstance(body.get("response_format"), dict) else {}
+    js = rf.get("json_schema") if isinstance(rf.get("json_schema"), dict) else {}
+    shape = js.get("name") or ("schema" if (rf.get("type") in ("json_schema", "json_object") or body.get("json_schema")) else
+                               ("grammar" if body.get("grammar") else "text"))
+    sysmsg = next((m.get("content") for m in body.get("messages") or [] if isinstance(m, dict) and m.get("role") == "system"), None)
+    tag = hashlib.sha256(json.dumps(sysmsg, ensure_ascii=False).encode("utf-8")).hexdigest()[:6] if sysmsg else "nosys"
+    return "%s/%s/%s" % (ep, str(shape)[:40], tag)
+
+
+def request_size(item):
+    """Characters of prompt content plus the requested generation limit: an ordering key for picking small to large
+    requests before any of them was measured."""
+    body = item.get("body") or {}
+    if "messages" in body:
+        chars = sum(len(m.get("content") if isinstance(m.get("content"), str) else json.dumps(m.get("content")))
+                    for m in body["messages"] if isinstance(m, dict))
+    else:
+        chars = len(str(body.get("prompt") or ""))
+    return chars + 4 * int(body.get("max_tokens") or body.get("n_predict") or 0)
+
+
+def is_sampled(body):
+    """Whether a request samples (temperature above 0 without top_k 1): its output is not expected to repeat across
+    configurations, so token identity is not a meaningful check for it. llama-server's default temperature is 0.8."""
+    try:
+        t = float(body.get("temperature", 0.8))
+    except (TypeError, ValueError):
+        return True
+    return t > 0 and body.get("top_k") != 1
+
+
 def load_workload(path):
     with open(path, "r", encoding="utf-8") as f:
         w = json.load(f)
+    if w.get("subset_of"):
+        # a subset names items of another requests workload by id and holds no request bodies itself, so the user's prompts
+        # stay in the one file they keep in workloads/ (never in a results or session directory)
+        parent = load_workload(w["subset_of"])
+        if parent.get("kind") != "requests":
+            raise ValueError("subset_of must name a requests workload, %s is not one" % w["subset_of"])
+        by_id = {it["id"]: it for it in parent["items"]}
+        missing = [i for i in w.get("item_ids") or [] if i not in by_id]
+        if missing:
+            raise ValueError("subset names items %s that %s does not have" % (missing[:5], w["subset_of"]))
+        out = {k: v for k, v in parent.items() if k != "items"}
+        out.update({k: v for k, v in w.items() if k != "item_ids"})
+        out["kind"] = "requests"
+        out["items"] = [by_id[i] for i in w["item_ids"]]
+        return out
     if w.get("kind") == "requests":
         for it in w["items"]:
             it.setdefault("sha256", _body_hash(it["body"]))
             it.setdefault("endpoint", "/v1/chat/completions" if "messages" in it["body"] else "/completion")
+            it["class"] = request_class(it)
         return w
     for p in w["prompts"]:
         p.setdefault("sha256", hashlib.sha256(p["text"].encode()).hexdigest()[:16])
     return w
+
+
+def subset(parent_path, item_ids, name, basis):
+    """A requests workload made of some items of `parent_path` (by id, in this order), holding no bodies."""
+    return {"name": name, "kind": "requests", "subset_of": str(parent_path), "item_ids": list(item_ids), "basis": basis}
 
 
 def save_workload(w, path):
@@ -84,15 +144,22 @@ def workload_from_requests(path, name="requests", limit=None):
         raw = [json.loads(ln) for ln in text.splitlines() if ln.strip()]
     items = []
     for i, r in enumerate(raw):
+        label = None
         if isinstance(r, dict) and "body" in r and isinstance(r["body"], dict):
             endpoint, body = r.get("endpoint"), r["body"]
+            label = r.get("class") or r.get("stage")          # a capture may label each request with the application step it serves
         else:
             endpoint, body = None, r
         if not isinstance(body, dict) or not ("messages" in body or "prompt" in body):
             raise ValueError("item %d is not a llama-server request body (needs 'messages' or 'prompt')" % i)
         body = dict(body)
         body["stream"] = False
-        items.append({"id": "r%02d" % i, "endpoint": endpoint or ("/v1/chat/completions" if "messages" in body else "/completion"), "body": body, "sha256": _body_hash(body)})
+        it = {"id": ("r%02d" if len(raw) <= 100 else "r%04d") % i, "endpoint": endpoint or ("/v1/chat/completions" if "messages" in body else "/completion"),
+              "body": body, "sha256": _body_hash(body)}
+        if label:
+            it["class"] = str(label)[:60]
+        it["class"] = request_class(it)
+        items.append(it)
         if limit and len(items) >= limit:
             break
     if not items:
@@ -108,9 +175,15 @@ def workload_from_requests(path, name="requests", limit=None):
 def workload_identity(w):
     if w.get("kind") == "requests":
         hashes = [it["sha256"] for it in w["items"]]
+        classes = {}
+        for it in w["items"]:
+            c = request_class(it)
+            classes[c] = classes.get(c, 0) + 1
         return {"name": w["name"], "kind": "requests", "n_prompts": len(hashes), "n_predict": None, "temperature": None, "ignore_eos": False,
                 "prompt_hashes": hashes, "set_hash": hashlib.sha256("".join(hashes).encode()).hexdigest()[:16],
-                "endpoints": sorted({it["endpoint"] for it in w["items"]}),
+                "endpoints": sorted({it["endpoint"] for it in w["items"]}), "classes": classes,
+                "sampled_requests": sum(1 for it in w["items"] if is_sampled(it["body"])),
+                "subset_of": Path(w["subset_of"]).name if w.get("subset_of") else None,
                 "fields_present": sorted({k for it in w["items"] for k in it["body"] if k not in ("messages", "prompt")})}
     return {"name": w["name"], "n_prompts": len(w["prompts"]), "n_predict": w["n_predict"], "temperature": w.get("temperature", 0.0),
             "ignore_eos": bool(w.get("ignore_eos", True)),
