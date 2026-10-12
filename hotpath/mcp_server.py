@@ -366,6 +366,12 @@ def _improve_plan(a):
       "a job (poll hotpath_job_status). Requires confirm=true and HOTPATH_MCP_ALLOW_ACTIVE=1. Changes nothing on the user's server.",
       _s(dict(_IMPROVE_PROPS, wait_s=_INT, confirm=_CONFIRM, timeout_s=_TIMEOUT, wait_for_result_s=_RESULT_WAIT), ["confirm"]), active=True)
 def _improve(a):
+    # the job is killed at its timeout; a budget it cannot finish would lose the final validation, so refuse it up front
+    budget_s = float(a.get("max_minutes") if a.get("max_minutes") is not None else 60) * 60
+    limit = min(int(a.get("timeout_s") or _max_timeout()), _max_timeout())
+    if budget_s * 1.25 > limit:
+        raise ValueError("max_minutes %.0f does not fit the job timeout of %d s (the final validation and model loads need room beyond the budget): "
+                         "lower max_minutes to %d or less, or the operator raises HOTPATH_MCP_MAX_TIMEOUT_S" % (budget_s / 60, limit, int(limit / 1.25 / 60)))
     return _improve_argv(a, False)
 
 

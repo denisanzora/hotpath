@@ -458,7 +458,18 @@ def improve(cfg, start_records, workload, out_dir, runner, max_experiments=3, ma
     path = write_record(rec, out_dir, "improvement")
     Path(str(path)[:-5] + ".md").write_text(improvement_markdown(rec), encoding="utf-8")
     rec["path"] = str(path)
+    if not dry_run:
+        (sdir / "finished").write_text(Path(path).name + "\n", encoding="utf-8")
     return rec
+
+
+def unfinished_sessions(out_dir):
+    """Sessions that started experiments but wrote no report (interrupted): (name, completed experiment records)."""
+    out = []
+    for d in sorted(Path(out_dir).glob("improve-*")):
+        if d.is_dir() and (d / "session.json").is_file() and not (d / "finished").exists():
+            out.append((d.name, len(list(d.glob("experiment-*.json")))))
+    return out
 
 
 def _early_report(session, out_dir, args, source, workload, max_experiments, max_minutes, stopped, next_step=None):

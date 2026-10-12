@@ -381,6 +381,10 @@ def cmd_improve(args):
                          "(`hotpath init --root DIR` when they live outside the standard locations).")
     out = _out(args)
     records, start = [], None
+    pending = [x for x in imp.unfinished_sessions(out) if x[0] != args.resume]
+    if pending:
+        print("note: interrupted improve session(s) can be continued instead of starting over: %s (`hotpath improve --resume NAME`; "
+              "MCP: hotpath_improve with resume=NAME)" % ", ".join("%s (%d experiment(s) recorded)" % x for x in pending[-3:]))
     if args.resume:
         rep = imp.improve(cfg, [], args.workload or "", out, _experiment_runner(cfg, args.wait_s), max_experiments=args.max_experiments,
                           max_minutes=args.max_minutes, rounds=args.rounds, repetitions=args.repetitions, warmup=args.warmup, port=args.port,

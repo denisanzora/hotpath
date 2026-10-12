@@ -78,7 +78,7 @@ An experiment takes minutes to hours, and clients limit how long one tool call m
 
 ### The agent workflow
 
-When the user asks for their setup to be improved: `hotpath_improve_plan` (passive) shows the starting point, the first experiment, the free VRAM it needs and a rough duration; after the user agrees, `hotpath_improve` with `confirm=true` runs the loop as one job (poll `hotpath_job_status`). It adopts only `keep` verdicts, does not run cache-flag experiments without real-traffic reuse evidence, confirms two or more adopted changes in one paired original-vs-improved run, and ends with the launch line to apply. `args` (starting arguments when no server runs) refuses the same runner-owned and file-writing flags as agent-authored specs.
+When the user asks for their setup to be improved: `hotpath_improve_plan` (passive) shows the starting point, the first experiment, the free VRAM it needs and a rough duration; after the user agrees, `hotpath_improve` with `confirm=true` runs the loop as one job (poll `hotpath_job_status`). It adopts only `keep` verdicts, does not run cache-flag experiments without real-traffic reuse evidence, confirms two or more adopted changes in one paired original-vs-improved run, and ends with the launch line to apply. `args` (starting arguments when no server runs) refuses the same runner-owned and file-writing flags as agent-authored specs; `resume` (a session name) continues an interrupted run without repeating its completed experiments. The final answer to the user should separate what was measured and validated, what needs their decision, and that nothing was applied.
 
 Step by step:
 
