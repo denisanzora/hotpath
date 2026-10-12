@@ -368,7 +368,9 @@ def measure(cfg, base, workload, repetitions, warmup, owned, background_seconds=
         raise SystemExit("server not healthy: %s" % snap.get("health"))
     port = int(base.rsplit(":", 1)[1].split("/")[0])
     pid = gpu_mod.pid_listening_on(port)
+    from hotpath import discover as disc
     rec = new_record("measurement", "active", label=label, target=snap,
+                     server_launch=disc.launch_for_record(disc.server_launch(pid)) if pid else {"available": False, "note": "no process found on port %d" % port},
                      workload=workload_identity(workload),
                      gpu=gpu_mod.gpu_static(),
                      background_before=gpu_mod.sample_background(seconds=background_seconds, interval=1.0),

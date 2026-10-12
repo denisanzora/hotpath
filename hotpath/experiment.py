@@ -15,6 +15,7 @@ import time
 from pathlib import Path
 
 from hotpath import gpu as gpu_mod
+from hotpath import launch
 from hotpath import server as srv
 from hotpath.measure import run_workload, summarize_requests
 from hotpath.observe import binary_identity
@@ -54,17 +55,12 @@ def slot_save_path_for(spec, arm, out_dir):
 
 def arm_launch(spec, arm, out_dir=None):
     binary = arm.get("binary") or spec["binary"]
-    args = list(spec.get("common_args", []))
+    args = [str(a) for a in spec.get("common_args", [])]
+    # alias-aware: an override of --gpu-layers replaces a -ngl in common_args, so exactly one value reaches the server
     for k, v in (arm.get("args_override") or {}).items():
-        if k in args:
-            i = args.index(k)
-            args[i + 1] = str(v)
-        else:
-            args += [k, str(v)]
+        args = launch.set_arg(args, k, v)
     for k in arm.get("args_remove") or []:
-        if k in args:
-            i = args.index(k)
-            del args[i:i + 2]
+        args = launch.remove_arg(args, k)
     ssp = slot_save_path_for(spec, arm, out_dir or "results/local")
     if ssp and "--slot-save-path" not in args:
         args += ["--slot-save-path", ssp]
@@ -85,10 +81,20 @@ def arm_launch(spec, arm, out_dir=None):
 def plan(spec):
     rounds = int(spec.get("rounds", 3))
     arms = spec["arms"]
-    lines = ["Experiment: %s" % spec["name"], "Rounds: %d, arms: %d -> server launches: %d" % (rounds, len(arms), rounds * len(arms)),
+    n_items, wl_np = None, None
+    try:
+        w = load_workload(spec["workload"])
+        n_items = len(w.get("items") or w.get("prompts") or [])
+        wl_np = w.get("n_predict")
+    except (OSError, ValueError, KeyError, TypeError):
+        pass
+    per_launch = (int(spec.get("warmup", 1)) + int(spec.get("repetitions", 2))) * n_items if n_items else None
+    lines = ["Experiment: %s" % spec["name"], "Rounds: %d, arms: %d -> server launches: %d%s" % (
+                 rounds, len(arms), rounds * len(arms), ", requests: %d (%d per launch, warmups included)" % (per_launch * rounds * len(arms), per_launch) if per_launch else ""),
              "Binary: %s" % redact_path(spec["binary"]), "Model: %s" % redact_path(spec["model"]),
              "Common args: %s" % " ".join(redact_args(spec.get("common_args", []))), "Env: %s" % (spec.get("env") or {}),
-             "Workload: %s, n_predict %s, repetitions %s, warmup %s" % (redact_path(spec["workload"]), spec.get("n_predict"), spec.get("repetitions", 2), spec.get("warmup", 1)),
+             "Workload: %s, n_predict %s, repetitions %s, warmup %s" % (redact_path(spec["workload"]), spec.get("n_predict") or ("%s (from the workload)" % wl_np if wl_np else "per request body"),
+                                                                       spec.get("repetitions", 2), spec.get("warmup", 1)),
              "Preconditions: %s" % (spec.get("preconditions") or {}), ""]
     lines.insert(-1, "Cache mode: %s; slot-save-path for hotpath-owned servers: %s; schema validation: %s" % (
         spec.get("cache_mode", "cold (workload default)"), spec.get("slot_save_path") or "off", spec.get("schema_validation", "auto")))
@@ -123,6 +129,23 @@ def check_preconditions(pre):
             ok = False
             reasons.append("port %s is in use" % port)
     return {"checked": True, "ok": ok, "reasons": reasons, "free_vram_mib": free, "background": s}
+
+
+def holders_hint(pc):
+    """When preconditions fail on GPU memory, load or a port: name the llama-server processes that are running, and say
+    that hotpath leaves them alone. hotpath only ever stops the servers it launched itself."""
+    from hotpath import discover as disc
+    try:
+        procs = disc.server_processes()
+        ports = disc.listening_ports() if procs else {}
+    except Exception:  # noqa: BLE001 - the hint is best effort; the precondition result stands on its own
+        return ""
+    if not procs:
+        return ""
+    names = ", ".join("llama-server pid %s%s" % (p["pid"], " (port %s)" % ",".join(str(x[1]) for x in ports.get(p["pid"], [])) if ports.get(p["pid"]) else "")
+                      for p in procs)
+    return (". Running now: %s. hotpath does not stop, restart or reconfigure servers it did not start: stop it yourself if it may be interrupted, "
+            "or pass --wait-s N to wait until the GPU is free" % names)
 
 
 def _launch(cmd, env, log_path):
@@ -180,7 +203,7 @@ def run(spec, out_dir, dry_run=False, wait_for_preconditions_s=0):
         if not pc.get("checked") or pc["ok"]:
             break
         if time.time() >= t_end:
-            raise SystemExit("preconditions not met: %s" % pc["reasons"])
+            raise SystemExit("preconditions not met: %s%s" % ("; ".join(pc["reasons"]), holders_hint(pc)))
         print("waiting for preconditions: %s" % pc["reasons"])
         time.sleep(60)
     ssp = slot_save_path_for(spec, None, out_dir)

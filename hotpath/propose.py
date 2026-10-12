@@ -16,24 +16,62 @@ DEFAULT_COMMON_ARGS = ["--ctx-size", "4096", "--gpu-layers", "99", "--batch-size
 
 
 def _set_arg(args, flag, value):
-    args = list(args)
-    if flag in args:
-        args[args.index(flag) + 1] = str(value)
-    else:
-        args += [flag, str(value)]
-    return args
+    from hotpath import launch
+    return launch.set_arg(args, flag, value)
+
+
+_PATH_SETTINGS = ("model", "log_file", "model_draft", "host", "port")
+
+
+def _speed_settings(args):
+    """The settings of an argv that matter for a comparison (paths, host and port excluded)."""
+    from hotpath import launch
+    s = launch.parse(args)["settings"]
+    return {k: str(v) for k, v in s.items() if k not in _PATH_SETTINGS}
 
 
 def baseline_args(diagnosis_record, cfg, override=None):
-    """Common arguments for the spec: explicit override > cfg['server_args'] > the diagnosed experiment's arm args > defaults."""
+    """Common arguments for the spec, so the baseline arm is the configuration that was diagnosed:
+    explicit override > the diagnosed server's observed command line (or server_args in the config when it matches it, since
+    the config keeps full paths) > server_args > the diagnosed experiment's arm args > defaults."""
     if override:
         return list(override), "command line"
+    obs = (diagnosis_record or {}).get("observed_launch") or {}
+    if obs.get("args_redacted"):
+        from hotpath import launch
+        if cfg.get("server_args") and _speed_settings(cfg["server_args"]) == _speed_settings(obs["args_redacted"]):
+            return list(cfg["server_args"]), "hotpath.local.json server_args (same settings as the observed command line, %s)" % obs.get("source")
+        kept, dropped = launch.drop_path_args(obs["args_redacted"])
+        src = "the diagnosed server's observed command line (%s)" % obs.get("source")
+        if cfg.get("server_args"):
+            src += "; server_args in hotpath.local.json differ from it and were not used"
+        if [d for d in dropped if d not in RUNNER_OWNED_FLAGS]:
+            src += "; arguments with file paths left out (records keep only basenames): %s; put the full arguments in server_args to keep them" % ", ".join(
+                d for d in dropped if d not in RUNNER_OWNED_FLAGS)
+        return kept, src
     if cfg.get("server_args"):
         return list(cfg["server_args"]), "hotpath.local.json server_args"
     arm = (diagnosis_record or {}).get("baseline_args")
     if arm:
         return list(arm), "diagnosed experiment arm"
     return list(DEFAULT_COMMON_ARGS), "hotpath defaults (adapt --ctx-size and --gpu-layers to your model)"
+
+
+def vram_needed_mib(cfg, args):
+    """Free VRAM an experiment arm needs before launch: the model's weight bytes plus 10%, when the model file is
+    known; None otherwise (then the spec keeps a generic floor). The arm's real footprint is measured per arm."""
+    from hotpath import gguf
+    mp = cfg.get("model_path")
+    if not mp or not Path(mp).is_file():
+        return None
+    try:
+        s = gguf.summarize(gguf.read_header(mp))
+    except (OSError, ValueError, KeyError):
+        return None
+    from hotpath.launch import int_or_none, get
+    ngl = int_or_none(get(args, "n_gpu_layers"))
+    frac = 1.0 if ngl is None or not s.get("n_layer") else min(1.0, max(0, ngl) / (s["n_layer"] + 1))
+    return int(s["total_bytes"] / (1 << 20) * frac * 1.1)
 
 
 # llama-server arguments the experiment runner owns or that must never be shared with the user's own server: it adds
@@ -95,8 +133,9 @@ def build_spec(finding, cfg, common_args, workload, port=8099, rounds=3, repetit
             arm["args_override"] = a["args_override"]
             # a larger microbatch needs --batch-size at least as large; keep every other argument identical
             if kind == "ubatch_sweep":
+                from hotpath import launch
                 ub = int(a["args_override"].get("--ubatch-size", 0))
-                nb = int(dict(zip(args[::2], args[1::2])).get("--batch-size", 0) or 0)
+                nb = launch.int_or_none(launch.get(args, "batch_size")) or 0
                 if ub and nb and nb < ub:
                     arm["args_override"] = dict(arm["args_override"], **{"--batch-size": ub})
         for k in ("env_override", "env_remove", "args_remove", "request_override"):
@@ -121,6 +160,13 @@ def build_spec(finding, cfg, common_args, workload, port=8099, rounds=3, repetit
     if n_predict:
         spec["n_predict"] = int(n_predict)
     return spec
+
+
+def _arm_args(common, arm):
+    args = list(common)
+    for k, v in (arm.get("args_override") or {}).items():
+        args = _set_arg(args, k, v)
+    return args
 
 
 def check_output_path(out_path, force=False):
@@ -150,6 +196,11 @@ def propose(diagnosis_path, finding_id, cfg, workload, out_path, common_args=Non
     args, removed = strip_runner_owned(_strip_launch_prefix(args))
     spec = build_spec(findings[finding_id], cfg, args, workload, port=port, rounds=rounds, repetitions=repetitions, warmup=warmup, n_predict=n_predict)
     spec["provenance"]["common_args_source"] = source
+    # the largest arm decides how much free VRAM a launch needs; a generic floor when the model is unknown
+    need = [vram_needed_mib(cfg, _arm_args(args, a)) for a in spec["arms"]]
+    if all(n is not None for n in need) and need:
+        spec["preconditions"]["min_free_vram_mib"] = max(need)
+        spec["provenance"]["min_free_vram_basis"] = "model weights on the GPU + 10% for the largest arm (estimate from the GGUF header)"
     if removed:
         spec["provenance"]["removed_server_args"] = sorted(set(removed))
     spec["provenance"]["diagnosis"] = Path(diagnosis_path).name

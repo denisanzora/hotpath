@@ -188,22 +188,120 @@ def cmd_compare(args):
     return 0
 
 
+def _roots(args, cfg):
+    from hotpath import discover as disc
+    roots = []
+    for r in list(getattr(args, "root", None) or []) + list(cfg.get("discovery_roots") or []):
+        try:
+            roots.append(disc.check_root(r))
+        except ValueError as e:
+            raise SystemExit("error: %s" % e)
+    return roots
+
+
+def _discover(args, cfg, prefer=None):
+    from hotpath import discover as disc
+    from hotpath.records import new_record
+    rec = disc.discover(None if cfg.get("_missing") else cfg, roots=_roots(args, cfg), run_found=not getattr(args, "no_exec", False),
+                        run_in_roots=not getattr(args, "no_exec_roots", False), max_depth=getattr(args, "max_depth", None) or disc.MAX_DEPTH, prefer=prefer)
+    return rec, new_record("discovery", "passive", **rec)
+
+
+def cmd_discover(args):
+    """Find the local inference setup (running servers, installs, models, GPU, tools, logs) without changing anything."""
+    from hotpath import discover as disc
+    cfg = load_local(args.local)
+    rec, full = _discover(args, cfg)
+    md = disc.discovery_markdown(rec)
+    print(md)
+    _write(full, args, "discovery", md)
+    print("")
+    if cfg.get("_missing"):
+        print("Next: `hotpath init` writes the suggested values to hotpath.local.json%s." % (
+            " (choose among several candidates with --binary/--model/--server)" if rec["ambiguous"] else ""))
+    if disc.healthy_user_servers(rec) or cfg.get("server_url"):
+        print("Next: `hotpath inspect` diagnoses the running server from its command line, log and /metrics (passive).")
+    return 0
+
+
 def cmd_init(args):
-    """Write a starter hotpath.local.json (refuses to overwrite)."""
+    """Write hotpath.local.json from discovery (refuses to overwrite; --update adds only missing keys; --template writes placeholders)."""
     target = Path(args.path or DEFAULT_NAME)
-    if target.exists():
-        print("%s already exists; not overwriting" % target)
+    if args.template:
+        if target.exists():
+            print("%s already exists; not overwriting" % target)
+            return 1
+        template = {"server_url": "http://127.0.0.1:8080", "model_path": "/path/to/model.gguf", "runtime_binary": "/path/to/llama-server",
+                    "runtime_bin_dir": "/path/to/llama.cpp/build/bin", "build_dir": "/path/to/llama.cpp/build", "owned_servers": ["http://127.0.0.1:8099"]}
+        target.write_text(json.dumps(template, indent=2) + "\n", encoding="utf-8")
+        print("wrote %s; edit the paths, then run: hotpath tools" % target)
+        return 0
+    if target.exists() and not args.update:
+        print("%s already exists; not overwriting. `hotpath init --update` adds discovered keys it does not have yet (existing values are kept)." % target)
         return 1
-    template = {
-        "server_url": "http://127.0.0.1:8080",
-        "model_path": "/path/to/model.gguf",
-        "runtime_binary": "/path/to/llama-server",
-        "runtime_bin_dir": "/path/to/llama.cpp/build/bin",
-        "build_dir": "/path/to/llama.cpp/build",
-        "owned_servers": ["http://127.0.0.1:8099"],
-    }
-    target.write_text(json.dumps(template, indent=2) + "\n", encoding="utf-8")
-    print("wrote %s; edit the paths, then run: hotpath tools" % target)
+    if target.name.lower() != DEFAULT_NAME and not target.name.lower().endswith(".local.json"):
+        raise SystemExit("error: the config file name must end in .local.json (it holds local paths and is gitignored by that pattern)")
+    existing = json.loads(target.read_text(encoding="utf-8")) if target.exists() else {}
+    cfg = dict(existing, _path=str(target)) if existing else {"_missing": True}
+    prefer = {k: v for k, v in (("runtime_binary", args.binary), ("model_path", args.model), ("server_url", args.server)) if v}
+    try:
+        rec, full = _discover(args, cfg, prefer)
+    except ValueError as e:
+        raise SystemExit("error: %s" % e)
+    from hotpath import discover as disc
+    _write(full, args, "discovery", disc.discovery_markdown(rec))
+    sug, src = rec["suggested_config"], rec["suggested_config_sources"]
+    if args.root:
+        sug["discovery_roots"] = [str(r) for r in _roots(args, {})]
+        src["discovery_roots"] = "--root (searched again by later discover/inspect runs)"
+    added = {k: v for k, v in sug.items() if k not in existing}
+    data = dict(existing) if existing else {"_comment": "Written by `hotpath init` from discovery; every value says where it came from in the init output. "
+                                                         "Keep this file out of version control: it holds local paths."}
+    data.update(added)
+    target.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+    print("%s %s" % ("updated" if existing else "wrote", target))
+    for k, v in added.items():
+        print("  %-16s %s\n  %-16s   (%s)" % (k, " ".join(v) if k == "server_args" else v, "", src.get(k)))
+    if existing and not added:
+        print("  nothing to add: every discovered key is already set (existing values are never changed)")
+    for k, v in rec["ambiguous"].items():
+        if k not in existing:
+            flag = {"runtime_binary": "--binary", "model_path": "--model", "server_url": "--server"}[k]
+            print("  %-16s not set: several candidates; choose with `hotpath init %s%s PATH`:\n%s" % (
+                k, "--update " if existing else "", flag, "\n".join("    - %s" % c for c in v)))
+    for x in rec["issues"]:
+        if x["severity"] == "high":
+            print("  problem: %s: %s. Fix: %s" % (x["where"], x["what"], x["fix"]))
+    missing = [k for k in ("runtime_binary", "model_path") if k not in data]
+    if missing:
+        print("  still missing: %s. Pass --binary/--model, or --root DIR to search where they live." % ", ".join(missing))
+    print("Next: `hotpath inspect` (passive) diagnoses the running server; `hotpath tools` checks the external tools.")
+    return 0
+
+
+def cmd_inspect(args):
+    """Passive, one step: discover the setup, observe the running (or configured) server with its log and /metrics, diagnose."""
+    from hotpath import discover as disc
+    from hotpath import diagnose as diag_mod
+    cfg = load_local(args.local)
+    rec, full = _discover(args, cfg)
+    _write(full, args, "discovery", disc.discovery_markdown(rec))
+    print(disc.discovery_brief(rec))
+    live = disc.healthy_user_servers(rec)
+    base = args.server or cfg.get("server_url") or (live[0]["base_url"] if len(live) == 1 else None)
+    if not base and len(live) > 1:
+        raise SystemExit("several llama-servers are running (%s); choose one with --server" % ", ".join(s["base_url"] for s in live))
+    if not (base or args.log or cfg.get("server_log")):
+        print("\nNo running llama-server and no log to read: start your server (with --log-file and --metrics for the most evidence) "
+              "or pass --log LOG, then run `hotpath inspect` again.")
+        return 0
+    obs = observe_mod.observe(cfg, log_path=args.log, base_url=base, sample_seconds=args.sample_seconds)
+    opath = _write(obs, args, "observation", observe_mod.observation_markdown(obs))
+    d = diag_mod.diagnose([obs], bandwidth_gbs=args.bandwidth_gbs, cfg=None if cfg.get("_missing") else cfg)
+    d["source_files"] = [Path(str(opath)).name]
+    dpath = _write(d, args, "diagnosis", diag_mod.diagnosis_markdown(d))
+    print("")
+    print(diag_mod.diagnosis_brief(d, str(dpath), rec))
     return 0
 
 
@@ -362,9 +460,31 @@ def build_parser():
     s.add_argument("records", nargs="+")
     s.set_defaults(fn=cmd_compare)
 
-    s = sub.add_parser("init", help="write a starter hotpath.local.json in the current directory")
+    def discovery_args(s):
+        s.add_argument("--root", action="append", help="also search this directory (repeatable; bounded depth; drive roots are refused)")
+        s.add_argument("--no-exec", action="store_true", help="do not run `llama-server --version` on found binaries")
+        s.add_argument("--no-exec-roots", action="store_true", help=argparse.SUPPRESS)
+
+    s = sub.add_parser("discover", help="find the local setup: running llama-servers and their launch settings, installs, GGUF models, GPU, tools, logs (passive)")
+    discovery_args(s)
+    s.add_argument("--max-depth", type=int, help="directory depth for --root searches (default 4)")
+    s.set_defaults(fn=cmd_discover)
+
+    s = sub.add_parser("init", help="write hotpath.local.json from discovery (the running server's binary, model, args, log; CUDA path fixes)")
     s.add_argument("path", nargs="?", help="where to write it (default hotpath.local.json)")
+    discovery_args(s)
+    s.add_argument("--binary", help="choose this llama-server when several are found"); s.add_argument("--model", help="choose this GGUF model")
+    s.add_argument("--server", help="choose this running server (URL) when several answer")
+    s.add_argument("--update", action="store_true", help="add discovered keys to an existing file; existing values are never changed")
+    s.add_argument("--template", action="store_true", help="write the old placeholder template instead of discovering")
     s.set_defaults(fn=cmd_init)
+
+    s = sub.add_parser("inspect", help="passive, one step: discover + observe the running server (command line, log, /metrics, GPU) + diagnose")
+    discovery_args(s)
+    s.add_argument("--server", help="server URL (default: server_url in the config, else the only running llama-server)")
+    s.add_argument("--log", help="server log (default: the server's --log-file, else server_log in the config)")
+    s.add_argument("--sample-seconds", type=float, default=5.0); s.add_argument("--bandwidth-gbs", type=float)
+    s.set_defaults(fn=cmd_inspect)
 
     s = sub.add_parser("mcp", help="run the MCP server on stdio so AI coding agents can call hotpath (active tools are off unless HOTPATH_MCP_ALLOW_ACTIVE=1)")
     s.set_defaults(fn=cmd_mcp)

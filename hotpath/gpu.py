@@ -60,6 +60,49 @@ def gpu_static():
     return info
 
 
+def gpus_all():
+    """Every NVIDIA GPU nvidia-smi reports (gpu_static describes only the first). Empty list without nvidia-smi."""
+    if not nvidia_smi_available():
+        return []
+    fields = "index,name,driver_version,memory.total,memory.used,compute_cap,utilization.gpu,pcie.link.gen.current,pcie.link.width.current"
+    rc, out, _ = _run(["nvidia-smi", "--query-gpu=" + fields, "--format=csv,noheader,nounits"])
+    if rc != 0:
+        return []
+    rows = []
+    for line in out.strip().splitlines():
+        d = dict(zip(fields.split(","), [v.strip() for v in line.split(",")]))
+        d["bandwidth_gbs_known"] = KNOWN_BANDWIDTH_GBS.get(d.get("name"))
+        rows.append(d)
+    return rows
+
+
+def driver_cuda_version():
+    """Highest CUDA version the installed driver supports, from nvidia-smi's banner ("CUDA Version: 12.8", or
+    "CUDA UMD Version" on newer drivers). None when it cannot be read."""
+    if not nvidia_smi_available():
+        return None
+    import re
+    rc, out, _ = _run(["nvidia-smi"])
+    m = re.search(r"CUDA (?:UMD )?Version:\s*([\d.]+)", out or "")
+    return m.group(1) if m else None
+
+
+def compute_apps():
+    """Processes nvidia-smi lists as using the GPU for compute: pid, name, used MiB (often N/A under Windows WDDM)."""
+    if not nvidia_smi_available():
+        return []
+    rc, out, _ = _run(["nvidia-smi", "--query-compute-apps=pid,process_name,used_memory", "--format=csv,noheader,nounits"])
+    if rc != 0:
+        return []
+    apps = []
+    for line in out.strip().splitlines():
+        parts = [p.strip() for p in line.split(",")]
+        if len(parts) >= 3 and parts[0].isdigit():
+            apps.append({"pid": int(parts[0]), "name": parts[1].replace("\\", "/").rsplit("/", 1)[-1],
+                         "used_mib": float(parts[2]) if parts[2].replace(".", "", 1).isdigit() else None})
+    return apps
+
+
 def gpu_dynamic():
     """Utilization, memory used, power, temperature at this instant."""
     if not nvidia_smi_available():

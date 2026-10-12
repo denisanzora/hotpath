@@ -50,7 +50,8 @@ def _args_value(args, flag, default=None):
     """Value following a flag in a recorded argv list (several spellings accepted)."""
     if not args:
         return default
-    flags = {flag} | {{"--ubatch-size": "-ub", "--batch-size": "-b", "--ctx-size": "-c", "--gpu-layers": "-ngl", "--parallel": "-np"}.get(flag, flag)}
+    flags = {flag} | {{"--ubatch-size": "-ub", "--batch-size": "-b", "--ctx-size": "-c", "--gpu-layers": "-ngl", "--parallel": "-np",
+                       "--cache-type-k": "-ctk", "--cache-type-v": "-ctv", "--cache-ram": "-cram"}.get(flag, flag)}
     for i, a in enumerate(args[:-1]):
         if a in flags:
             return args[i + 1]
@@ -59,10 +60,26 @@ def _args_value(args, flag, default=None):
 
 # ---- evidence collection -----------------------------------------------------------------------
 
+def launch_settings(launch_rec):
+    """Diagnosis settings from an observed command line (observe/measure records), labelled as observed. Values not on
+    the command line stay None: a build default or LLAMA_ARG_* variable may set them."""
+    from hotpath import launch as launch_mod
+    if not launch_rec or not launch_rec.get("available"):
+        return {}
+    s = launch_rec.get("settings") or {}
+    return {"n_ubatch": _f(s.get("ubatch_size")), "n_batch": _f(s.get("batch_size")), "n_ctx": _f(s.get("ctx_size")),
+            "n_parallel": _f(s.get("parallel")), "cache_ram": s.get("cache_ram"), "ctx_checkpoints": s.get("ctx_checkpoints"),
+            "n_gpu_layers": s.get("n_gpu_layers"), "flash_attn": s.get("flash_attn"), "cache_type_k": s.get("cache_type_k"),
+            "cache_type_v": s.get("cache_type_v"), "override_tensor": s.get("override_tensor"), "cpu_moe": s.get("cpu_moe") or s.get("n_cpu_moe"),
+            "settings_source": launch_rec.get("source") or "server command line (observed)",
+            "argv_redacted": launch_rec.get("argv_redacted"), "describe": launch_mod.describe(s)}
+
+
 def collect(records):
     """Flatten records into one evidence set. Nothing is interpreted here."""
     ev = {"arms": {}, "gpu": {}, "model": None, "bench": [], "profiles": [], "log_stats": None, "launch": {},
-          "classes": set(), "experiments": [], "sources": [], "server_props": None}
+          "classes": set(), "experiments": [], "sources": [], "server_props": None, "observed_launch": None, "metrics": None,
+          "process_vram": None}
     for rec in records:
         kind = rec.get("kind")
         ev["sources"].append("%s(%s)" % (kind, rec.get("name") or rec.get("label") or rec.get("created")))
@@ -80,6 +97,8 @@ def collect(records):
                     "settings": {"n_ubatch": _f(_args_value(args, "--ubatch-size")), "n_batch": _f(_args_value(args, "--batch-size")),
                                  "n_ctx": _f(_args_value(args, "--ctx-size")), "n_parallel": _f(_args_value(args, "--parallel"), 1),
                                  "cache_ram": _args_value(args, "--cache-ram"), "ctx_checkpoints": _args_value(args, "--ctx-checkpoints"),
+                                 "n_gpu_layers": _args_value(args, "--gpu-layers") or _args_value(args, "--n-gpu-layers"),
+                                 "cache_type_k": _args_value(args, "--cache-type-k"), "cache_type_v": _args_value(args, "--cache-type-v"),
                                  "env_ggml": arm.get("env_ggml") or {}},
                     "vram": {"process_dedicated_mib": [x.get("process_counters_after", {}).get("dedicated_mib") for x in lf],
                              "process_shared_mib": [x.get("process_counters_after", {}).get("shared_mib") for x in lf],
@@ -89,19 +108,33 @@ def collect(records):
                 ev["model"] = rec["model"]["summary"]
         elif kind == "measurement":
             props = (rec.get("target") or {}).get("props") or {}
+            settings = {"n_ctx": _f(props.get("n_ctx_per_slot")), "n_parallel": _f(props.get("total_slots"), 1), "env_ggml": {}}
+            observed = launch_settings(rec.get("server_launch"))
+            for k, v in observed.items():
+                if v is not None and k not in ("n_ctx", "n_parallel"):
+                    settings[k] = v
             ev["arms"][rec.get("label") or rec["created"]] = {
-                "requests": rec.get("requests") or [], "evidence_class": "active", "settings": {"n_ctx": _f(props.get("n_ctx_per_slot")), "n_parallel": _f(props.get("total_slots"), 1), "env_ggml": {}},
+                "requests": rec.get("requests") or [], "evidence_class": "active", "settings": settings,
                 "vram": {"gpu_after": [s.get("gpu") for s in rec.get("gpu_snapshots") or []],
                          "process_dedicated_mib": [(s.get("process") or {}).get("dedicated_mib") for s in rec.get("gpu_snapshots") or []],
                          "process_shared_mib": [(s.get("process") or {}).get("shared_mib") for s in rec.get("gpu_snapshots") or []]},
                 "failures": []}
+            if observed:
+                ev["observed_launch"] = observed
             ev["server_props"] = ev["server_props"] or props
         elif kind == "observation":
             log = rec.get("log") or {}
             ev["log_stats"] = log.get("gpu_like_sessions_stats") or ev["log_stats"]
+            sp = rec.get("server_process") or {}
             ev["launch"] = {"launcher_settings": rec.get("launcher_settings") or {}, "launcher_env": rec.get("launcher_env_documented") or {},
                             "session_table": log.get("session_table") or [], "gpu_now": rec.get("gpu_now") or {},
-                            "server_process": rec.get("server_process") or {}}
+                            "server_process": sp}
+            if launch_settings(sp.get("launch")):
+                ev["observed_launch"] = launch_settings(sp.get("launch"))
+            if (rec.get("metrics") or {}).get("available"):
+                ev["metrics"] = rec["metrics"]
+            if (sp.get("gpu_counters") or {}).get("dedicated_mib") is not None:
+                ev["process_vram"] = sp["gpu_counters"]
             ev["log"] = {"rows": log.get("requests") or [], "sessions": log.get("session_table") or [], "cache": log.get("cache_reuse") or {},
                          "coverage": log.get("parse_coverage") or {}, "cpu_threshold": _f(log.get("cpu_mode_prefill_tps_below"), 10.0),
                          "available": bool(log.get("sessions")), "source": log.get("source_basename")}
@@ -178,10 +211,51 @@ def _passive_arm_from_log(ev):
         sess = next((s for s in log.get("sessions") or [] if s.get("session") == sid), {})
         settings = {"n_ubatch": _f(sess.get("n_ubatch")), "n_batch": _f(sess.get("n_batch")), "env_ggml": (ev.get("launch") or {}).get("launcher_env") or {},
                     "settings_source": "server log, session %s" % sid}
+        # the newest session is the running server when an observation also read its command line: fill what the log did not print
+        obs = ev.get("observed_launch") or {}
+        if obs and sid == max(by_session):
+            filled = [k for k in ("n_ubatch", "n_batch") if settings.get(k) is None and obs.get(k) is not None]
+            for k, v in obs.items():
+                if settings.get(k) is None and v is not None:
+                    settings[k] = v
+            if filled:
+                settings["settings_source"] = "server log, session %s; %s from %s" % (sid, "/".join(filled), obs.get("settings_source"))
         label = "%s/session-%s" % (log.get("source") or "log", sid)
         return label, {"requests": reqs, "evidence_class": "passive", "settings": settings, "vram": {},
                        "failures": [], "time_basis": "server prompt+generation time from the log; no client wall time", "session": sid}
     return None, None
+
+
+def metrics_summary(ev):
+    """Real-traffic aggregates from llama-server's /metrics counters (since the server started): prefill and decode
+    throughput, the time split between them, and the share of prompt tokens served from the prompt cache. None when
+    /metrics was not read or nothing was served yet."""
+    m = ev.get("metrics") or {}
+    t = m.get("since_server_start") or {}
+    ps, gs = _f(t.get("prompt_seconds_total"), 0.0), _f(t.get("tokens_predicted_seconds_total"), 0.0)
+    pt, gt = _f(t.get("prompt_tokens_total"), 0.0), _f(t.get("tokens_predicted_total"), 0.0)
+    if ps + gs <= 0:
+        return None
+    cached = _f(t.get("prompt_tokens_cached_total"))
+    return {"prompt_tokens": int(pt), "generated_tokens": int(gt), "prompt_seconds": round(ps, 2), "generation_seconds": round(gs, 2),
+            "prefill_tps": round(pt / ps, 1) if ps else None, "decode_tps": round(gt / gs, 1) if gs else None,
+            "prefill_share_of_server_time": round(ps / (ps + gs), 3), "decode_share_of_server_time": round(gs / (ps + gs), 3),
+            "cached_prompt_tokens": int(cached) if cached is not None else None,
+            "cached_share_of_prompt_tokens": round(cached / (cached + pt), 3) if cached is not None and cached + pt > 0 else None,
+            "n_busy_slots_per_decode": _f(t.get("n_busy_slots_per_decode")), "requests_deferred": _f(t.get("requests_deferred")),
+            "source": m.get("source") or "llama-server /metrics", "window_s": m.get("window_s")}
+
+
+def _passive_arm_from_metrics(ev):
+    """No log and no measurement: a passive arm whose rates come from /metrics and settings from the command line."""
+    ms = metrics_summary(ev)
+    obs = ev.get("observed_launch") or {}
+    if not ms and not obs:
+        return None, None
+    settings = dict(obs) if obs else {}
+    settings.setdefault("env_ggml", (ev.get("launch") or {}).get("launcher_env") or {})
+    return "running-server", {"requests": [], "evidence_class": "passive", "settings": settings, "vram": {}, "failures": [], "metrics": ms,
+                              "time_basis": "aggregate /metrics counters (no per-request detail)" if ms else "command line only (no traffic data)"}
 
 
 def _baseline_arm(ev):
@@ -195,14 +269,21 @@ def _baseline_arm(ev):
         k = list(ev["arms"])[-1]
         return k, ev["arms"][k]
     label, arm = _passive_arm_from_log(ev)
+    if not arm:
+        label, arm = _passive_arm_from_metrics(ev)
     if arm:
         ev["arms"][label] = arm
     return label, arm
 
 
-def _finding(fid, title, severity, confidence, evidence_class, measurements, why, experiment=None, opportunity=None, risks=None, notes=None):
+def _finding(fid, title, severity, confidence, evidence_class, measurements, why, experiment=None, opportunity=None, risks=None, notes=None,
+             known=None, hypothesis=None):
     f = {"id": fid, "title": title, "severity": severity, "confidence": confidence, "evidence_class": evidence_class,
          "measurements": measurements, "why_it_matters": why}
+    if known:
+        f["known"] = known
+    if hypothesis:
+        f["hypothesis"] = hypothesis
     if opportunity:
         f["opportunity"] = opportunity
     if experiment:
@@ -218,6 +299,16 @@ def _finding(fid, title, severity, confidence, evidence_class, measurements, why
 
 def rule_phase(ev, label, arm):
     sp = phase_split(arm["requests"]) if arm else None
+    if not sp and arm and arm.get("metrics"):
+        m = arm["metrics"]
+        pf, dc = m["prefill_share_of_server_time"], m["decode_share_of_server_time"]
+        shape = "prefill-bound" if pf >= 0.6 else ("decode-bound" if dc >= 0.6 else "mixed")
+        return _finding("workload_phase_split", "Real traffic is %s (prefill %.0f%%, decode %.0f%% of the server's prompt+generation time since it started)" % (shape, 100 * pf, 100 * dc),
+                        "info", "likely", "passive", dict(m, arm=label, time_basis="server metrics totals"),
+                        "Which side of a request a change acts on bounds what it can gain; these shares come from the server's own counters for all traffic since it started.",
+                        known=["%d prompt tokens processed in %.1f s and %d tokens generated in %.1f s since the server started (/metrics)" % (
+                            m["prompt_tokens"], m["prompt_seconds"], m["generated_tokens"], m["generation_seconds"])],
+                        notes=["Aggregate counters have no per-request spread and no client wall time; a server log (--log-file) or `hotpath measure` adds both."])
     if not sp:
         return None
     pf, dc, rs = _med(sp["prefill_share"]), _med(sp["decode_share"]), _med(sp["residual_share"])
@@ -249,15 +340,37 @@ def cache_pattern_evidence(ev):
     prefix reuse for per-request overhead can be recommended beyond the isolated workload it was measured on."""
     cache = (ev.get("log") or {}).get("cache") or {}
     if not cache.get("available") or not cache.get("reused_share_of_prompt"):
-        return {"available": False, "note": "no slot-selection/release lines in a log; reuse pattern of real traffic unknown"}
+        ms = metrics_summary(ev)
+        if ms and ms.get("cached_share_of_prompt_tokens") is not None and ms["prompt_tokens"] + (ms["cached_prompt_tokens"] or 0) > 0:
+            share = ms["cached_share_of_prompt_tokens"]
+            level = "low" if share < 0.15 else ("high" if share >= 0.5 else "mixed")
+            # an aggregate has no distribution: the same value stands for median and p90, and the basis says so
+            tokens = ms["prompt_tokens"] + (ms["cached_prompt_tokens"] or 0)
+            return {"available": True, "reused_share_median": share, "reused_share_p90": share, "lcp_fraction": None, "requests": None,
+                    "level": level, "aggregate": True, "tokens": tokens, "thin": tokens < MIN_TOKENS_FOR_REUSE,
+                    "source": "llama-server /metrics: share of all prompt tokens served from the prompt cache since the server started (aggregate, real traffic)"}
+        return {"available": False, "note": "no slot-selection/release lines in a log and no /metrics prompt-cache counter; reuse pattern of real traffic unknown"}
     share = cache["reused_share_of_prompt"]
     sel = cache.get("selected_by") or {}
     n_sel = sum(sel.values()) or 1
     lcp = sel.get("LCP similarity", 0) / n_sel
     med = share["median"]
     level = "low" if med < 0.15 and share["p90"] < 0.5 else ("high" if med >= 0.5 else "mixed")
-    return {"available": True, "reused_share_median": med, "reused_share_p90": share["p90"], "lcp_fraction": round(lcp, 3), "requests": cache.get("requests_with_reuse_data"),
-            "level": level, "source": "server log slot-selection and release lines (real traffic)"}
+    n = cache.get("requests_with_reuse_data") or 0
+    return {"available": True, "reused_share_median": med, "reused_share_p90": share["p90"], "lcp_fraction": round(lcp, 3), "requests": n,
+            "level": level, "thin": n < MIN_REQUESTS_FOR_REUSE, "source": "server log slot-selection and release lines (real traffic)"}
+
+
+MIN_REQUESTS_FOR_REUSE = 20     # fewer logged requests say nothing about the traffic's reuse pattern
+MIN_TOKENS_FOR_REUSE = 20000    # the /metrics aggregate has no request count; this many prompt tokens is a few dozen typical requests
+
+
+def reuse_text(cp):
+    """How much real traffic reuses, worded for its basis (per-request log rows, or an aggregate /metrics counter)."""
+    if cp.get("aggregate"):
+        return "%.0f%% of all %d prompt tokens since the server started came from the prompt cache (/metrics aggregate)" % (100 * cp["reused_share_median"], cp.get("tokens") or 0)
+    return "real requests reuse a median %.0f%% of their prompt (p90 %.0f%%; LCP-selected %.0f%%)" % (
+        100 * cp["reused_share_median"], 100 * cp["reused_share_p90"], 100 * (cp.get("lcp_fraction") or 0))
 
 
 def rule_residual(ev, label, arm):
@@ -270,10 +383,9 @@ def rule_residual(ev, label, arm):
     s = arm.get("settings") or {}
     cp = cache_pattern_evidence(ev)
     risks = ["Disabling the prompt cache or checkpoints removes prefix reuse across requests; if the real traffic repeats long prefixes, the saved overhead can cost more prompt processing than it saves."]
-    if cp.get("available"):
-        risks.append("Cache-pattern evidence from the log: real requests reuse a median %.0f%% of their prompt (p90 %.0f%%; LCP-selected %.0f%%) — reuse is %s, so a flag that removes it is %s." % (
-            100 * cp["reused_share_median"], 100 * cp["reused_share_p90"], 100 * cp["lcp_fraction"], cp["level"],
-            "defensible for this traffic" if cp["level"] == "low" else "likely to cost more than it saves on this traffic"))
+    if cp.get("available") and not cp.get("thin"):
+        risks.append("Cache-pattern evidence: %s; reuse is %s, so a flag that removes it is %s." % (
+            reuse_text(cp), cp["level"], "defensible for this traffic" if cp["level"] == "low" else "likely to cost more than it saves on this traffic"))
     else:
         risks.append("No cache-pattern evidence: include an `observe --log` record of the real server so the reuse rate of real traffic is known before adopting such a flag.")
     risks.append("Resuming from a checkpoint is not bit-identical to recomputing a prompt; outputs may differ at near-ties either way.")
@@ -290,7 +402,9 @@ def rule_residual(ev, label, arm):
                                 "metric": "wall_ms median and the residual, prefill unchanged, outputs equivalent",
                                 "note": "Flags are llama-server's; a build that lacks one fails to start, which the experiment reports as a launch failure. "
                                         "The experiment's workload disables prompt caching on purpose, so it measures the overhead only; the reuse side needs the log evidence above."},
-                    risks=risks)
+                    risks=risks,
+                    known=["client wall time minus the server's prompt and generation time is %.0f ms per request (median of %d)" % (rms, sp["n"])],
+                    hypothesis="Prompt-cache state saves and context checkpoints are a large part of this time; the flag arms show how much each one costs.")
 
 
 def rule_cache_reuse(ev):
@@ -304,9 +418,18 @@ def rule_cache_reuse(ev):
         return None
     sel = cache.get("selected_by") or {}
     meas = {"requests": cp["requests"], "reused_share_of_prompt_median": cp["reused_share_median"], "reused_share_p90": cp["reused_share_p90"],
-            "reused_tokens_median": _med(cache.get("reused_tokens")), "selected_by": sel, "f_sim_best_median": _med(cache.get("f_sim_best"))}
+            "reused_tokens_median": _med(cache.get("reused_tokens")), "selected_by": sel, "f_sim_best_median": _med(cache.get("f_sim_best")),
+            "basis": cp["source"]}
+    if cp.get("thin"):
+        return _finding("prefix_reuse_thin", "Too little real traffic to judge prefix reuse (%s)" % (
+            "%d prompt tokens in /metrics" % cp["tokens"] if cp.get("aggregate") else "%d logged requests" % cp["requests"]),
+            "info", "insufficient", "passive", meas,
+            "Whether prompt caching pays off depends on how real requests repeat; a handful of requests cannot show it.",
+            notes=["Observe again after the server has served typical traffic (a few dozen requests)."])
+    title = "Real traffic: %s" % reuse_text(cp) if cp.get("aggregate") else \
+        "Real requests reuse a median %.0f%% of their prompt from the slot (p90 %.0f%%)" % (100 * cp["reused_share_median"], 100 * cp["reused_share_p90"])
     if cp["level"] == "low":
-        return _finding("prefix_reuse_low", "Real requests reuse a median %.0f%% of their prompt from the slot (p90 %.0f%%)" % (100 * cp["reused_share_median"], 100 * cp["reused_share_p90"]),
+        return _finding("prefix_reuse_low", title,
                         "medium", "likely", "passive", meas,
                         "Consecutive requests share only a short prefix (typically the system message), so prompt caching rarely saves prompt processing on this traffic; meanwhile every "
                         "request may pay the server's cache bookkeeping (state saves, checkpoints), which a log cannot show.",
@@ -317,7 +440,7 @@ def rule_cache_reuse(ev):
                         risks=["If the application's prompts are reordered so that long static text comes first, reuse would rise and the cache would become valuable; re-check the log after such a change.",
                                "On recurrent/hybrid models partial reuse happens only at checkpoints; reordering prompts without checkpoints at the right place changes little."],
                         notes=["Prompt-order changes in the application (static instructions before per-request content) are usually the larger lever when reuse is this low."])
-    return _finding("prefix_reuse_%s" % cp["level"], "Real requests reuse a median %.0f%% of their prompt from the slot (p90 %.0f%%)" % (100 * cp["reused_share_median"], 100 * cp["reused_share_p90"]),
+    return _finding("prefix_reuse_%s" % cp["level"], title,
                     "info", "likely", "passive", meas,
                     "Prompt caching is doing useful work for this traffic; changes that trade it for lower per-request overhead would cost prompt processing here.",
                     risks=["Do not disable the prompt cache or checkpoints for this deployment on the strength of an isolated-request experiment."])
@@ -405,6 +528,16 @@ def rule_microbatch(ev, label, arm):
     sp = phase_split(arm["requests"]) if arm else None
     pf_share = _med(sp["prefill_share"]) if sp else None
     pf_tps = _med(percentiles([r.get("prompt_tps") for r in arm["requests"]])) if arm else None
+    if (arm or {}).get("metrics") and pf_tps is None:
+        pf_tps, pf_share = arm["metrics"].get("prefill_tps"), arm["metrics"].get("prefill_share_of_server_time")
+    obs = ev.get("observed_launch") or {}
+    if ub is None and obs and obs.get("n_ubatch") is None and (arm or {}).get("evidence_class") != "controlled":
+        # the command line was read and does not set it: the build default applies (512 in current llama.cpp)
+        return _finding("microbatch_default", "Microbatch not set on the command line: the build's default applies", "info", "likely", "passive",
+                        {"source": obs.get("settings_source"), "prefill_tps": pf_tps},
+                        "llama-server's default microbatch (512 in current llama.cpp) is already in the range where prompt processing is batched GEMM work.",
+                        known=["%s has no -ub/--ubatch-size" % obs.get("settings_source")],
+                        notes=["A LLAMA_ARG_UBATCH environment variable would override the default and is not visible in a command line."])
     if ub is None:
         # an older session's value is not this session's value: report it, do not diagnose from it
         tbl = (ev.get("launch") or {}).get("session_table") or []
@@ -439,8 +572,150 @@ def rule_microbatch(ev, label, arm):
                     opportunity={"bound_share_of_request": pf_share, "basis": "prefill share of the request; the gain inside it is unknown until measured (it has ranged from a few percent to several-fold depending on the starting value)"},
                     experiment={"kind": "ubatch_sweep", "variable": "--ubatch-size", "arms": arms, "metric": "prefill t/s and wall_ms medians; per-arm VRAM; greedy outputs equivalent",
                                 "note": "Keep --batch-size >= the largest --ubatch-size; hold CUDA-graph and cache settings constant."},
+                    known=["microbatch %d (%s)" % (ub, source)] + (["prefill %.0f t/s, %.0f%% of the request" % (pf_tps, 100 * pf_share)] if pf_tps and pf_share else []),
+                    hypothesis="A larger microbatch makes prompt processing faster on this GPU; how much is unknown until measured.",
                     risks=["Larger microbatches need a larger compute buffer (VRAM); on a full card this can spill to system memory and look slower.",
                            "Changing the microbatch changes floating-point accumulation order; outputs can differ at near-ties (a numerical shift, not an error)."])
+
+
+KV_TYPE_FACTOR = {"f16": 1.0, "bf16": 1.0, "f32": 2.0, "q8_0": 34 / 64, "q5_1": 24 / 64, "q5_0": 22 / 64, "q4_1": 20 / 64, "q4_0": 18 / 64, "iq4_nl": 18 / 64}
+PROCESS_VRAM_PARTIAL = 0.85     # server's dedicated VRAM below this fraction of the model's weights: not all weights can be on the GPU
+
+
+def offload_evidence(ev, arm):
+    """How many of the model's layers are on the GPU, from the strongest source available: the server log's own
+    'offloaded N/M layers' line, an explicit -ngl on the command line, or (weakest) the server's dedicated VRAM
+    against the model's weight bytes. llama.cpp counts the output layer, so a 64-block model reports N/65."""
+    model = ev.get("model") or {}
+    total = model["n_layer"] + 1 if model.get("n_layer") else None
+    s = (arm or {}).get("settings") or {}
+    tbl = [r for r in (ev.get("launch") or {}).get("session_table") or [] if r.get("offloaded")]
+    sid = (arm or {}).get("session")
+    row = next((r for r in tbl if r.get("session") == sid), None) if sid else (tbl[-1] if tbl and (arm or {}).get("evidence_class") != "controlled" else None)
+    if row:
+        try:
+            n, m = (int(x) for x in str(row["offloaded"]).split("/"))
+            return {"on_gpu": n, "total": m, "source": "server log: 'offloaded %s layers to GPU' (session %s)" % (row["offloaded"], row.get("session")),
+                    "kind": "log", "session": row}
+        except ValueError:
+            pass
+    from hotpath.launch import int_or_none
+    ngl = int_or_none(s.get("n_gpu_layers"))
+    if ngl is not None and ngl >= 0 and total:
+        obs = ev.get("observed_launch") or {}
+        where = obs.get("settings_source") if obs.get("n_gpu_layers") == s.get("n_gpu_layers") and obs.get("settings_source") else (s.get("settings_source") or "launch arguments")
+        return {"on_gpu": min(ngl, total), "total": total, "explicit_ngl": ngl,
+                "source": "-ngl %d on the %s; the model has %d blocks + the output layer" % (ngl, where, total - 1), "kind": "args"}
+    ded = [x for x in ((arm or {}).get("vram") or {}).get("process_dedicated_mib") or [] if x is not None]
+    pv = max(ded) if ded else (ev.get("process_vram") or {}).get("dedicated_mib")
+    if pv and model.get("total_bytes"):
+        w = model["total_bytes"] / (1 << 20)
+        return {"on_gpu": None, "total": total, "process_dedicated_mib": pv, "weights_mib": round(w), "partial_by_vram": pv < PROCESS_VRAM_PARTIAL * w,
+                "source": "server process dedicated VRAM %.0f MiB vs %.0f MiB of model weights (Windows GPU counters)" % (pv, w), "kind": "vram"}
+    return None
+
+
+def memory_estimate(ev, arm, o):
+    """Would all layers fit? Weights + KV cache at the configured context and KV types + the compute buffer, against
+    the memory free when the server started (log) or total VRAM minus what other processes use. An estimate with its
+    assumptions listed, used only to choose experiment arms; the experiment's per-arm VRAM is the evidence."""
+    model = ev.get("model") or {}
+    gpu = ev.get("gpu") or {}
+    s = (arm or {}).get("settings") or {}
+    row = o.get("session") or {}
+    total_mib = _f(gpu.get("memory.total"))
+    if not model.get("total_bytes") or not total_mib or not o.get("total"):
+        return None
+    w = model["total_bytes"] / (1 << 20)
+    assumptions = []
+    n_ctx = _f(row.get("n_ctx")) or s.get("n_ctx") or _f(((ev.get("server_props") or {}).get("n_ctx_per_slot")))
+    kv_mib = _f(row.get("kv_mib"))
+    if kv_mib is None and n_ctx and model.get("kv_bytes_per_token_f16"):
+        fk = KV_TYPE_FACTOR.get(str(s.get("cache_type_k") or "f16").lower(), 1.0)
+        fv = KV_TYPE_FACTOR.get(str(s.get("cache_type_v") or "f16").lower(), 1.0)
+        kv_mib = model["kv_bytes_per_token_f16"] * n_ctx * (fk + fv) / 2 / (1 << 20)
+        assumptions.append("KV cache from the GGUF header at n_ctx %d (%s/%s)" % (n_ctx, s.get("cache_type_k") or "f16", s.get("cache_type_v") or "f16"))
+    elif kv_mib is None:
+        kv_mib = 0.0
+        assumptions.append("KV cache size unknown (no context size in the evidence); counted as 0")
+    compute = _f(row.get("compute_mib"))
+    if compute is None:
+        compute = 512.0
+        assumptions.append("compute buffer 512 MiB (an allowance; the log did not print it)")
+    free = _f(row.get("free_at_start_mib"))
+    if free is None:
+        now = (ev.get("launch") or {}).get("gpu_now") or {}
+        used, ded = _f(now.get("mem_used_mib")), (ev.get("process_vram") or {}).get("dedicated_mib")
+        others = (used - ded) if (used is not None and ded is not None) else None
+        free = total_mib - (others if others is not None and others >= 0 else 600.0)
+        assumptions.append("free VRAM = total minus %s" % ("what other processes used at observation time" if others is not None else "a 600 MiB allowance for the desktop and other programs"))
+    need_all = w + kv_mib + compute
+    per_layer = w / o["total"]
+    fit_layers = int(max(0.0, (free * 0.95 - kv_mib - compute)) // per_layer) if per_layer else None
+    return {"weights_mib": round(w), "kv_mib": round(kv_mib), "compute_mib": round(compute), "need_all_layers_mib": round(need_all),
+            "free_mib": round(free), "fits_all": need_all < free * 0.95, "layers_that_fit": min(fit_layers, o["total"]) if fit_layers is not None else None,
+            "assumptions": assumptions}
+
+
+def rule_offload(ev, label, arm):
+    o = offload_evidence(ev, arm)
+    if not o:
+        return None
+    if o["kind"] == "vram":
+        if not o["partial_by_vram"]:
+            return None
+    elif o["on_gpu"] >= o["total"]:
+        return None
+    s = (arm or {}).get("settings") or {}
+    deliberate = bool(s.get("override_tensor") or s.get("cpu_moe"))
+    sp = phase_split(arm["requests"]) if arm else None
+    est = memory_estimate(ev, arm, o) if o.get("total") else None
+    n, m = o.get("on_gpu"), o.get("total")
+    model = ev.get("model") or {}
+    w = (model.get("total_bytes") or 0) / (1 << 20)
+    if o["kind"] == "vram":
+        title = "The server holds %.0f MiB of VRAM for %.0f MiB of model weights: part of the model is not on the GPU" % (o["process_dedicated_mib"], w)
+        known = [o["source"]]
+        confidence = "hypothesis"
+    else:
+        cpu_share = (m - n) / m
+        title = "%d of %d layers run on the GPU; %d run on the CPU (about %.0f%% of the weights, %.0f MiB)" % (n, m, m - n, 100 * cpu_share, cpu_share * w)
+        known = [o["source"]]
+        confidence = "likely"
+    if (o.get("session") or {}).get("projected_mib"):
+        r = o["session"]
+        known.append("at launch the runtime projected %s MiB of device memory against %s MiB free (its automatic fit then chose the layer count)" % (r["projected_mib"], r["free_at_start_mib"]))
+    if deliberate:
+        known.append("the command line keeps tensors on the CPU on purpose (%s)" % ("--override-tensor" if s.get("override_tensor") else "--cpu-moe/--n-cpu-moe"))
+    arms, how = None, None
+    if est and o["kind"] != "vram":
+        current = {"name": "ngl%d" % o["explicit_ngl"], "args_override": {"--gpu-layers": o["explicit_ngl"]}} if o.get("explicit_ngl") is not None else {"name": "current", "args_override": {}}
+        if est["fits_all"]:
+            arms = [current, {"name": "ngl%d" % m, "args_override": {"--gpu-layers": m}}]
+        elif est["layers_that_fit"] and est["layers_that_fit"] > n + 1:
+            arms = [current, {"name": "ngl%d" % est["layers_that_fit"], "args_override": {"--gpu-layers": est["layers_that_fit"]}}]
+        else:
+            how = ("by the estimate no more layers fit (need %d MiB for all layers, about %d MiB free): free VRAM first (close other GPU programs), shrink the KV cache "
+                   "(smaller --ctx-size, or -ctk q8_0 -ctv q8_0 with flash attention), or use a smaller quantization; then compare against the current launch" % (est["need_all_layers_mib"], est["free_mib"]))
+    elif o["kind"] == "vram":
+        how = "read the server's log for its 'offloaded N/M layers' line (start it with --log-file), or compare an explicit --gpu-layers %s against the current launch" % (m or "N")
+    experiment = {"kind": "gpu_layers", "variable": "--gpu-layers", "arms": arms or how,
+                  "metric": "decode and prefill t/s and wall_ms medians; per-arm dedicated and shared (system-memory) VRAM; outputs equivalent",
+                  "note": "One variable: the number of GPU layers; context, KV types and microbatch stay as launched. The memory estimate behind the candidate is in the measurements."}
+    return _finding("gpu_offload_partial", title, "high", confidence, (arm or {}).get("evidence_class") or "passive",
+                    {"offload": {k: v for k, v in o.items() if k != "session"}, "memory_estimate": est, "deliberate_cpu_tensors": deliberate},
+                    "Layers left on the CPU read their weights from system memory, typically tens of GB/s on a desktop against hundreds of GB/s of VRAM, and the GPU waits for them "
+                    "on every generated token; prompt processing also leaves those layers' matrix work to the CPU. A partly offloaded model is usually limited by its CPU part, not by GPU kernels.",
+                    experiment=experiment,
+                    opportunity={"bound_share_of_request": round(1 - (_med(sp["residual_share"]) or 0), 3) if sp and sp.get("residual_share") else None,
+                                 "basis": "prompt processing and generation both include the CPU-resident layers; the gain is unknown until measured"},
+                    risks=["More GPU layers need more VRAM: a launch can fail with an allocation error, or on Windows silently spill to shared system memory (watch per-arm shared MiB); "
+                           "either is reported by the experiment.",
+                           "If the runtime's automatic fit chose this split, forcing more layers removes the memory margin it kept for the context and compute buffers."] +
+                          (["The CPU placement looks deliberate (expert tensors kept on the CPU); tune --n-cpu-moe rather than forcing everything onto the GPU."] if deliberate else []),
+                    known=known,
+                    hypothesis="The CPU-resident layers set the pace of each token; with them in VRAM, decode and prefill rise and the request gets shorter.",
+                    notes=["The decode-ceiling comparison below assumes all weights in VRAM; with a partial offload it is not the first thing to fix."])
 
 
 def _bench_rows(ev, kind):
@@ -497,6 +772,8 @@ def rule_decode_ceiling(ev, label, arm, bandwidth_gbs=None):
     dc_tps = _med(percentiles([r.get("predicted_tps") for r in arm["requests"]])) if arm else None
     if dc_tps is None and ev.get("log_stats"):
         dc_tps = _med((ev["log_stats"] or {}).get("decode_tps"))
+    if dc_tps is None and (arm or {}).get("metrics"):
+        dc_tps = arm["metrics"].get("decode_tps")
     if not model or not dc_tps:
         return _finding("decode_ceiling_unknown", "Decode cannot be placed against a bandwidth ceiling", "info", "insufficient", "passive",
                         {"model_summary": bool(model), "decode_tps": dc_tps, "bandwidth_gbs": bw},
@@ -529,7 +806,11 @@ def rule_decode_ceiling(ev, label, arm, bandwidth_gbs=None):
     return _finding("decode_below_ceiling", "Decode reaches %.0f%% of the peak-bandwidth ceiling (%.1f of %.0f t/s)" % (100 * frac, dc_tps, ceiling), sev,
                     "likely" if graphs_off else "hypothesis", "passive", meas, why,
                     opportunity={"bound": "up to the ceiling fraction: %.0f%% of decode time is above the bandwidth floor" % (100 * (1 - frac)), "basis": "peak theoretical bandwidth; achievable is typically 70-90% of it"},
-                    experiment=exp, risks=risks)
+                    experiment=exp, risks=risks,
+                    known=["decode %.1f t/s; %.3f GB of weights per token at %.0f GB/s peak gives a %.0f t/s ceiling" % (dc_tps, model["weight_bytes_streamed_per_decode_token"] / 1e9, bw, ceiling)] +
+                          (["the launch environment sets GGML_CUDA_DISABLE_GRAPHS=1"] if graphs_off else []),
+                    hypothesis="Per-kernel launch overhead is the largest part of the gap and CUDA graphs remove it" if graphs_off else
+                               "Some of the gap is launch overhead or kernel efficiency; which part needs a decode profile or the graphs experiment")
 
 
 def rule_vram(ev, label, arm):
@@ -858,8 +1139,10 @@ def insufficiencies(ev, arm):
     out = []
     passive_only = bool(arm) and arm.get("evidence_class") == "passive"
     if passive_only:
-        out.append("Only server-log evidence: client wall time, per-request overhead (cache saves, checkpoints, HTTP) and GPU state during requests are not in a log. "
-                   "Single best next measurement: `hotpath measure --server <your server> --workload <w>` (a few requests, your own server, cache off) — it adds the wall time and the residual to the same diagnosis.")
+        what = "server-log" if arm.get("requests") else ("/metrics" if arm.get("metrics") else "command-line")
+        out.append("Only %s evidence: client wall time, per-request overhead (cache saves, checkpoints, HTTP) and GPU state during requests are not in it. "
+                   "Single best next measurement: `hotpath measure --server <your server> --workload <w> --i-own-this-server` (a few requests on your own server, cache off) - "
+                   "it adds the wall time and the residual to the same diagnosis." % what)
     if not ev["bench"]:
         out.append("No llama-bench record: the server's share of prefill/decode cost cannot be separated from the runtime's (hotpath bench).")
     if not ev["profiles"]:
@@ -870,7 +1153,8 @@ def insufficiencies(ev, arm):
         out.append("Fewer than 6 measured requests in the diagnosed arm: shares and medians have little spread information.")
     if not ev["experiments"]:
         out.append("No controlled experiment yet: every configuration finding above is a hypothesis until an interleaved A/B confirms it.")
-    if not cache_pattern_evidence(ev).get("available"):
+    cpe = cache_pattern_evidence(ev)
+    if not cpe.get("available") or cpe.get("thin"):
         out.append("Prefix-cache effectiveness of real traffic is unknown: hotpath's workloads disable the prompt cache on purpose; an `observe --log` record of the real server supplies the reuse pattern.")
     return out
 
@@ -918,6 +1202,53 @@ def cache_conditions(records):
     return out
 
 
+# which part of a request a finding's candidate change acts on; the measured share of that part bounds what it can gain
+AFFECTS = {"gpu_offload_partial": ("prefill", "decode"), "cpu_fallback_sessions": ("all",), "vram_pressure": ("all",),
+           "microbatch_limits_prefill": ("prefill",), "microbatch_not_small": ("prefill",), "prefill_server_gap": ("prefill",),
+           "decode_below_ceiling": ("decode",), "decode_near_ceiling": ("decode",), "decode_server_gap": ("decode",),
+           "per_request_overhead": ("residual",), "kernel_time_share_decode": ("decode",), "kernel_time_share_prefill": ("prefill",)}
+CONFIDENCE_WEIGHT = {"confirmed": 1.0, "likely": 0.8, "hypothesis": 0.5, "insufficient": 0.2}
+RANK_BASIS = ("Problems are ranked by the share of request time the candidate change can act on (an upper bound from the measured "
+              "prefill/decode/overhead shares, not a predicted gain) weighted by confidence (confirmed 1, likely 0.8, hypothesis 0.5); "
+              "problems whose share is not measurable follow, then context findings.")
+
+
+def phase_shares(arm):
+    sp = phase_split(arm["requests"]) if arm else None
+    if sp:
+        return {"prefill": _med(sp["prefill_share"]), "decode": _med(sp["decode_share"]), "residual": _med(sp["residual_share"]),
+                "basis": "per-request medians, client wall time" if sp["basis"] == "client_wall" else "per-request medians of server prompt+generation time (log)"}
+    m = (arm or {}).get("metrics")
+    if m:
+        return {"prefill": m["prefill_share_of_server_time"], "decode": m["decode_share_of_server_time"], "residual": None,
+                "basis": "server /metrics totals since start"}
+    return None
+
+
+def impact(f, shares):
+    aff = AFFECTS.get(f["id"])
+    if not aff:
+        return None
+    if aff == ("all",):
+        return {"affects": "the whole request", "bound_share_of_request": 1.0, "basis": "every request in the affected sessions/configuration"}
+    vals = [shares.get(p) for p in aff] if shares else [None]
+    if any(v is None for v in vals):
+        return {"affects": " + ".join(aff), "bound_share_of_request": None,
+                "basis": "the share of %s in a request is not in the evidence%s" % ("/".join(aff), " (a log has no client wall time)" if shares else "")}
+    return {"affects": " + ".join(aff), "bound_share_of_request": round(min(1.0, sum(vals)), 3), "basis": "share of %s (%s)" % (" + ".join(aff), shares["basis"])}
+
+
+def rank_key(f):
+    imp = f.get("impact") or {}
+    b = imp.get("bound_share_of_request")
+    problem = f["severity"] in ("high", "medium") and not f.get("superseded_by")
+    if problem and b is not None:
+        return (0, -b * CONFIDENCE_WEIGHT.get(f["confidence"], 0.2), CONFIDENCE_RANK.get(f["confidence"], 9))
+    if problem:
+        return (1, SEVERITY_RANK.get(f["severity"], 9), CONFIDENCE_RANK.get(f["confidence"], 9))
+    return (2, -(b or 0) * CONFIDENCE_WEIGHT.get(f["confidence"], 0.2), SEVERITY_RANK.get(f["severity"], 9))
+
+
 def diagnose(records, bandwidth_gbs=None, cfg=None):
     conditions = cache_conditions(records)
     ev = apply_local_config(collect(records), cfg)
@@ -926,7 +1257,7 @@ def diagnose(records, bandwidth_gbs=None, cfg=None):
     f = rule_coverage(ev)
     if f:
         findings.append(f)
-    for fn in (rule_phase, rule_residual, rule_microbatch, rule_vram):
+    for fn in (rule_offload, rule_phase, rule_residual, rule_microbatch, rule_vram):
         f = fn(ev, label, arm)
         if f:
             findings.append(f)
@@ -946,7 +1277,16 @@ def diagnose(records, bandwidth_gbs=None, cfg=None):
     fs = rule_profile(ev)
     if fs:
         findings.extend(fs)
-    findings.sort(key=lambda f: (SEVERITY_RANK.get(f["severity"], 9), CONFIDENCE_RANK.get(f["confidence"], 9)))
+    ids = {f["id"] for f in findings}
+    shares = phase_shares(arm)
+    for f in findings:
+        if f["id"] == "decode_below_ceiling" and "gpu_offload_partial" in ids:
+            f["superseded_by"] = "gpu_offload_partial"
+            f.setdefault("notes", []).append("Part of the model runs on the CPU (finding gpu_offload_partial): fix that first; this ceiling assumes all weights in VRAM.")
+        imp = impact(f, shares)
+        if imp:
+            f["impact"] = imp
+    findings.sort(key=rank_key)
     verdicts = []
     for r in ev["experiments"]:
         v = experiment_verdict(r)
@@ -962,12 +1302,12 @@ def diagnose(records, bandwidth_gbs=None, cfg=None):
         if prov.get("experiment_kind") == "server_overhead_flags" or any("--cache-ram" in str(a.get("args_override")) or "--ctx-checkpoints" in str(a.get("args_override"))
                                                                           for a in (r.get("spec_redacted") or {}).get("arms") or []):
             cp = cache_pattern_evidence(ev)
-            if not cp.get("available"):
-                gate = "production applicability unknown: no cache-pattern evidence for real traffic (add an `observe --log` record of the real server). The gain was measured on isolated requests with the prompt cache off."
+            if not cp.get("available") or cp.get("thin"):
+                gate = "production applicability unknown: no (or too little) cache-pattern evidence for real traffic (add an `observe --log` record of the real server). The gain was measured on isolated requests with the prompt cache off."
             elif cp["level"] == "low":
-                gate = "production applicability supported: real traffic reuses a median %.0f%% of each prompt (p90 %.0f%%), so little prefix reuse is lost." % (100 * cp["reused_share_median"], 100 * cp["reused_share_p90"])
+                gate = "production applicability supported: %s, so little prefix reuse is lost." % reuse_text(cp)
             else:
-                gate = "do not apply to production on this evidence: real traffic reuses a median %.0f%% of each prompt; removing the cache would cost more prompt processing than this saves." % (100 * cp["reused_share_median"])
+                gate = "do not apply to production on this evidence: %s; removing the cache would cost more prompt processing than this saves." % reuse_text(cp)
             v["production_gate"] = gate
             for row in v["arms"]:
                 if row["verdict"].startswith("keep"):
@@ -977,13 +1317,69 @@ def diagnose(records, bandwidth_gbs=None, cfg=None):
     tested = {v["tests_finding"]: v for v in verdicts if v.get("tests_finding")}
     for f in findings:
         if f["id"] in tested:
+            v = tested[f["id"]]
             f["confidence"] = "confirmed"
-            f.setdefault("notes", []).append("Tested by experiment %s; see its verdict above." % tested[f["id"]]["experiment"])
-    recommended = next((f for f in findings if f["id"] not in tested and f.get("experiment") and isinstance(f["experiment"].get("arms"), list) and f["severity"] in ("high", "medium")), None)
+            f.setdefault("notes", []).append("Tested by experiment %s; see its verdict above." % v["experiment"])
+            f["measured"] = {"status": "measured", "experiment": v["experiment"], "verdicts": ["%s: %s" % (r["arm"], r["verdict"]) for r in v["arms"]]}
+        elif isinstance((f.get("experiment") or {}).get("arms"), list):
+            f["measured"] = {"status": "not measured yet", "how": "hotpath propose <this diagnosis> --finding %s, then hotpath experiment <spec>" % f["id"]}
+        elif f.get("experiment"):
+            f["measured"] = {"status": "not measured yet", "how": f["experiment"].get("arms")}
+    recommended = next((f for f in findings if f["id"] not in tested and not f.get("superseded_by") and f.get("experiment")
+                        and isinstance(f["experiment"].get("arms"), list) and f["severity"] in ("high", "medium")), None)
+    obs = ev.get("observed_launch") or {}
     return {"kind": "diagnosis", "evidence_class": "hypothesis" if not ev["experiments"] else "controlled", "sources": ev["sources"], "diagnosed_arm": label,
-            "cache_conditions": conditions,
+            "cache_conditions": conditions, "phase_shares": shares, "rank_basis": RANK_BASIS,
+            "observed_launch": {"args_redacted": obs.get("argv_redacted"), "source": obs.get("settings_source"), "describe": obs.get("describe")} if obs else None,
             "baseline_args": (arm or {}).get("args"), "findings": findings, "experiment_verdicts": verdicts, "insufficient_evidence": insufficiencies(ev, arm),
             "recommended_next_experiment": {"finding": recommended["id"], **recommended["experiment"]} if recommended else None}
+
+
+def diagnosis_brief(d, path=None, discovery=None, top=5):
+    """The short form `inspect` prints: the top problems with what is known and what is not, and the exact next step."""
+    L = ["# Diagnosis of %s" % d.get("diagnosed_arm")]
+    if d.get("phase_shares"):
+        p = d["phase_shares"]
+        L.append("Time split: prefill %s, decode %s, other %s (%s)" % tuple(
+            ["%.0f%%" % (100 * p[k]) if p.get(k) is not None else "unknown" for k in ("prefill", "decode", "residual")] + [p["basis"]]))
+    if d.get("observed_launch"):
+        L.append("Running configuration: %s" % d["observed_launch"].get("describe"))
+    shown = [f for f in d["findings"] if f["severity"] in ("high", "medium") and not f.get("superseded_by")][:top] or d["findings"][:min(top, 3)]
+    L.append("")
+    for i, f in enumerate(shown, 1):
+        imp = f.get("impact") or {}
+        bound = (", at most %.0f%% of request time" % (100 * imp["bound_share_of_request"])) if imp.get("bound_share_of_request") is not None else ""
+        L.append("%d. %s  [%s, %s%s]" % (i, f["title"], f["severity"], f["confidence"], bound))
+        for k in (f.get("known") or [])[:2]:
+            L.append("   known: %s" % k)
+        if f.get("hypothesis"):
+            L.append("   not yet measured: %s" % f["hypothesis"])
+        e = f.get("experiment") or {}
+        if isinstance(e.get("arms"), list):
+            L.append("   verify: %s, arms %s" % (e.get("kind"), ", ".join(a["name"] for a in e["arms"])))
+        elif e.get("arms"):
+            L.append("   verify: %s" % e["arms"])
+    if not shown:
+        L.append("No problems found in this evidence.")
+    gaps = d.get("insufficient_evidence") or []
+    if gaps:
+        L += ["", "Not established by this evidence:"] + ["- %s" % g for g in gaps[:3]]
+    rec = d.get("recommended_next_experiment")
+    L += ["", "Next:"]
+    if rec:
+        out = "experiments/%s.json" % rec.get("kind", "next")
+        L.append("- hotpath propose %s --finding %s --out %s   (writes a one-variable spec and shows its plan; launches nothing)" % (path or "<diagnosis.json>", rec["finding"], out))
+        L.append("- hotpath experiment %s   (ACTIVE: launches its own llama-server per arm on port 8099, interleaved; your server is not touched)" % out)
+        if discovery:
+            from hotpath import discover as disc
+            note = disc.experiment_vram_note(discovery)
+            if note:
+                L.append("  VRAM: %s." % note)
+    else:
+        L.append("- no experiment to propose from this evidence; see what is not established above")
+    if path:
+        L.append("Full report: %s" % (str(path)[:-5] + ".md" if str(path).endswith(".json") else path))
+    return "\n".join(L)
 
 
 def diagnosis_markdown(d):
@@ -1034,21 +1430,35 @@ def diagnosis_markdown(d):
             lines.append("- caveat (from finding `%s`): %s" % (v.get("tests_finding"), c))
         lines.append("- scope: %s" % v.get("scope_note"))
         lines.append("")
-    lines += ["## Findings (ranked)", ""]
-    for f in d["findings"]:
-        lines += ["### %s  [%s, %s, %s]" % (f["title"], f["severity"], f["confidence"], f["evidence_class"]), "", "- id: `%s`" % f["id"],
-                  "- measurements: %s" % f["measurements"], "- why it matters: %s" % f["why_it_matters"]]
+    lines += ["## Findings (ranked)", "", d.get("rank_basis") or "", ""]
+    if d.get("observed_launch"):
+        lines += ["Running configuration (%s): %s" % (d["observed_launch"].get("source"), d["observed_launch"].get("describe")), ""]
+    for i, f in enumerate(d["findings"], 1):
+        lines += ["### %d. %s  [%s, %s, %s%s]" % (i, f["title"], f["severity"], f["confidence"], f["evidence_class"],
+                                                   ", superseded by %s" % f["superseded_by"] if f.get("superseded_by") else ""), "", "- id: `%s`" % f["id"]]
+        imp = f.get("impact") or {}
+        if imp:
+            lines.append("- acts on: %s; at most %s of request time (%s)" % (
+                imp["affects"], "%.0f%%" % (100 * imp["bound_share_of_request"]) if imp.get("bound_share_of_request") is not None else "an unmeasured share", imp["basis"]))
+        for k in f.get("known") or []:
+            lines.append("- known: %s" % k)
+        if f.get("hypothesis"):
+            lines.append("- hypothesis (not measured): %s" % f["hypothesis"])
+        lines += ["- measurements: %s" % f["measurements"], "- why it may matter: %s" % f["why_it_matters"]]
         if f.get("opportunity"):
             lines.append("- opportunity: %s" % f["opportunity"])
         if f.get("experiment"):
             e = f["experiment"]
-            lines.append("- experiment to confirm/reject: %s on `%s`; metric: %s" % (e.get("kind"), e.get("variable"), e.get("metric")))
+            lines.append("- verify with: %s on `%s`; metric: %s" % (e.get("kind"), e.get("variable"), e.get("metric")))
             if isinstance(e.get("arms"), list):
                 lines.append("  - arms: %s" % [a["name"] for a in e["arms"]])
             else:
                 lines.append("  - how: %s" % e.get("arms"))
         for r in f.get("risks") or []:
-            lines.append("- risk: %s" % r)
+            lines.append("- could regress: %s" % r)
+        if f.get("measured"):
+            m = f["measured"]
+            lines.append("- measured: %s" % ("yes, experiment %s: %s" % (m["experiment"], " | ".join(m["verdicts"])) if m["status"] == "measured" else "no (%s)" % m["how"]))
         for n in f.get("notes") or []:
             lines.append("- note: %s" % n)
         lines.append("")

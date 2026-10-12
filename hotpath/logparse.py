@@ -48,7 +48,7 @@ def parse_log(path, model_filter=None):
             m = RE_LOAD.search(line)
             if m:
                 cur = {"index": len(sessions) + 1, "first_line": lineno, "last_line": lineno,
-                       "model_basename": m.group(1).replace("\\", "/").rsplit("/", 1)[-1],
+                       "model_basename": m.group(1).replace("\\", "/").rsplit("/", 1)[-1], "model_path": m.group(1),
                        "launch": {}, "warnings": [], "errors": [], "requests": []}
                 sessions.append(cur)
                 pending = {}
@@ -146,6 +146,13 @@ def session_table(sessions):
             "n_ubatch": s["launch"].get("n_ubatch"),
             "compute_mib": s["launch"].get("compute_buffer_gpu_mib"),
             "model_mib": s["launch"].get("model_buffer_gpu_mib"),
+            "model_cpu_mib": s["launch"].get("model_buffer_cpu_mib"),
+            "kv_mib": s["launch"].get("kv_buffer_gpu_mib"),
+            "offloaded": s["launch"].get("offloaded_layers"),
+            "n_ctx": s["launch"].get("n_ctx"),
+            "flash_attn": s["launch"].get("flash_attn"),
+            "projected_mib": s["launch"].get("projected_mib"),
+            "free_at_start_mib": s["launch"].get("free_at_start_mib"),
             "requests": len(s["requests"]),
             "prefill_median_tps": (st["prefill_tps"] or {}).get("median"),
             "decode_median_tps": (st["decode_tps"] or {}).get("median"),

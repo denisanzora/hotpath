@@ -29,17 +29,35 @@ class _Reader:
         (n,) = self.rd("Q")
         return self.f.read(n).decode("utf-8", "replace")
 
+    def skip(self, t):
+        if t == 8:
+            (n,) = self.rd("Q")
+            self.f.seek(n, 1)
+        elif t == 9:
+            (et,) = self.rd("I")
+            (n,) = self.rd("Q")
+            if et in _SCALAR:
+                self.f.seek(n * struct.calcsize(_SCALAR[et]), 1)
+            else:
+                for _ in range(n):
+                    self.skip(et)
+        else:
+            self.f.seek(struct.calcsize(_SCALAR[t]), 1)
+
     def val(self, t, keep_arrays=8):
         if t == 8:
             return self.s()
         if t == 9:
             (et,) = self.rd("I")
             (n,) = self.rd("Q")
-            vals = []
-            for i in range(n):
-                v = self.val(et, keep_arrays)
-                if i < keep_arrays:
-                    vals.append(v)
+            vals = [self.val(et, keep_arrays) for _ in range(min(n, keep_arrays))]
+            # elements past the kept head (tokenizer vocabularies: 100k+ strings) are skipped, not decoded
+            if n > keep_arrays:
+                if et in _SCALAR:
+                    self.f.seek((n - keep_arrays) * struct.calcsize(_SCALAR[et]), 1)
+                else:
+                    for _ in range(n - keep_arrays):
+                        self.skip(et)
             return {"array_len": n, "head": vals}
         return self.rd(_SCALAR[t])[0]
 
