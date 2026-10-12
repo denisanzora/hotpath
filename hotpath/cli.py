@@ -386,9 +386,10 @@ def cmd_improve(args):
         print("note: interrupted improve session(s) can be continued instead of starting over: %s (`hotpath improve --resume NAME`; "
               "MCP: hotpath_improve with resume=NAME)" % ", ".join("%s (%d experiment(s) recorded)" % x for x in pending[-3:]))
     if args.resume:
-        rep = imp.improve(cfg, [], args.workload or "", out, _experiment_runner(cfg, args.wait_s), max_experiments=args.max_experiments,
+        rep = imp.improve(cfg, [], args.workload or "", out, None if args.dry_run else _experiment_runner(cfg, args.wait_s), max_experiments=args.max_experiments,
                           max_minutes=args.max_minutes, rounds=args.rounds, repetitions=args.repetitions, warmup=args.warmup, port=args.port,
-                          n_predict=args.n_predict, bandwidth_gbs=args.bandwidth_gbs, session=args.resume, resume=True, log=lambda m: print(m, flush=True))
+                          n_predict=args.n_predict, bandwidth_gbs=args.bandwidth_gbs, session=args.resume, resume=True, dry_run=args.dry_run,
+                          log=lambda m: print(m, flush=True))
         print("")
         print(imp.improvement_markdown(rep))
         print("wrote %s" % rep["path"])
@@ -430,7 +431,7 @@ def cmd_improve(args):
         shape = diag_mod.diagnose(records, cfg=cfg).get("traffic_shape")
     workload = choose_workload(args.workload, cfg, shape)
     print("starting point: %s" % start)
-    rep = imp.improve(cfg, records, workload, out, _experiment_runner(cfg, args.wait_s), max_experiments=args.max_experiments,
+    rep = imp.improve(cfg, records, workload, out, None if args.dry_run else _experiment_runner(cfg, args.wait_s), max_experiments=args.max_experiments,
                       max_minutes=args.max_minutes, rounds=args.rounds, repetitions=args.repetitions, warmup=args.warmup, port=args.port,
                       n_predict=args.n_predict, dry_run=args.dry_run, initial_args=shlex.split(args.args) if args.args else None, bandwidth_gbs=args.bandwidth_gbs,
                       log=lambda m: print(m, flush=True))

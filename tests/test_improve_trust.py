@@ -132,6 +132,48 @@ class TrustTests(unittest.TestCase):
         self.assertEqual([s["adopted"] for s in first["steps"]], [s["adopted"] for s in second["steps"]])
         self.assertGreater(n, 0)
 
+    def test_dry_run_resume_never_launches(self):
+        # found in a real OpenCode session: the passive plan tool with `resume` ran a pending step actively
+        runner = GuardedRunner()
+        first = self.run_loop(runner, max_experiments=1)
+        runner2 = GuardedRunner()
+        plan = self.run_loop(runner2, max_experiments=3, session=first["session"], resume=True, dry_run=True)
+        self.assertEqual(runner2.specs, [], "a dry run must never launch, also when resuming")
+        self.assertTrue(plan["stopped_because"].startswith(("dry run", "no further executable finding")), plan["stopped_because"])
+
+    def test_cli_dry_run_resume_never_launches(self):
+        # the MCP plan tool calls `improve --dry-run --resume NAME`; the CLI must not run anything for it
+        from hotpath import cli
+        from hotpath import experiment as ex
+        # an interrupted session: step 1 recorded, the validation run never happened
+        first = self.run_loop(GuardedRunner(raise_on=2), max_experiments=1)
+        cfg_path = os.path.join(self.dir, "hotpath.local.json")
+        with open(cfg_path, "w", encoding="utf-8") as f:
+            json.dump(self.cfg, f)
+        saved, saved_runner = ex.run, cli._experiment_runner
+        launched = []
+        ex.run = lambda *a, **k: launched.append("experiment.run")
+        cli._experiment_runner = lambda cfg, wait_s: (lambda spec, path: launched.append(spec["name"]) or (_ for _ in ()).throw(SystemExit("blocked")))
+        cwd = os.getcwd()
+        try:
+            os.chdir(self.dir)
+            cli.main(["--local", cfg_path, "--out", self.dir, "improve", "--resume", first["session"], "--dry-run", "--max-experiments", "3"])
+        finally:
+            ex.run, cli._experiment_runner = saved, saved_runner
+            os.chdir(cwd)
+        self.assertEqual(launched, [], "a dry run must never reach the experiment runner")
+
+    def test_a_running_session_cannot_be_resumed_by_a_second_process(self):
+        import os as _os
+        runner = GuardedRunner()
+        first = self.run_loop(runner, max_experiments=1)
+        lock = _os.path.join(self.dir, first["session"], "running.lock")
+        with open(lock, "w", encoding="utf-8") as f:
+            f.write(str(_os.getppid()))                    # another live process holds the session
+        with self.assertRaises(SystemExit) as cm:
+            self.run_loop(GuardedRunner(), max_experiments=1, session=first["session"], resume=True)
+        self.assertIn("running", str(cm.exception))
+
 
 def _ctx_ev(n_ctx=49152, parallel=1, reqs=None, flags=None):
     model = {"n_layer": 64, "total_bytes": 5935 << 20, "weight_bytes_streamed_per_decode_token": 5935 << 20, "kv_bytes_per_token_f16": 65536}

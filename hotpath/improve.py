@@ -242,6 +242,55 @@ def _reusing(runner, sdir, log):
     return run
 
 
+def _never_launch(spec, spec_path):
+    """The runner of a dry run: recorded experiments are reused by _reusing; anything else would launch, so it refuses."""
+    raise _DryRunStop(spec["name"])
+
+
+class _DryRunStop(Exception):
+    pass
+
+
+def _recorded(sdir, name):
+    return bool(sorted(Path(sdir).glob("experiment-%s-2*.json" % name)))
+
+
+def _pid_alive(pid):
+    """Whether a process exists, without signalling it (os.kill(pid, 0) on Windows sends CTRL_C_EVENT)."""
+    import os
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return False
+    if os.name == "nt":
+        import ctypes
+        k32 = ctypes.windll.kernel32
+        h = k32.OpenProcess(0x1000, False, pid)            # PROCESS_QUERY_LIMITED_INFORMATION
+        if not h:
+            return False
+        code = ctypes.c_ulong()
+        ok = k32.GetExitCodeProcess(h, ctypes.byref(code))
+        k32.CloseHandle(h)
+        return bool(ok) and code.value == 259              # STILL_ACTIVE
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+def _take_lock(sdir):
+    import os
+    lock = Path(sdir) / "running.lock"
+    if lock.is_file():
+        holder = lock.read_text(encoding="utf-8").strip()
+        if holder and holder != str(os.getpid()) and _pid_alive(holder):
+            raise SystemExit("error: session %s is running in another process (pid %s); wait for it (hotpath_job_status) or stop that job, then resume" % (
+                Path(sdir).name, holder))
+    lock.write_text(str(os.getpid()), encoding="utf-8")
+    return lock
+
+
 def _write_exp(rec, sdir, name):
     if rec.get("_reused_from"):
         return Path(sdir) / rec["_reused_from"]
@@ -271,7 +320,20 @@ def improve(cfg, start_records, workload, out_dir, runner, max_experiments=3, ma
         log("resuming %s: %d starting record(s), workload %s" % (session, len(start_records), Path(workload).name))
     elif not dry_run:
         state.write_text(json.dumps({"start_records": list(start_records), "workload": workload, "initial_args": initial_args}) + "\n", encoding="utf-8")
+    if dry_run:
+        runner = _never_launch          # a dry run reads what a session recorded and launches nothing, also when resuming
     runner = _reusing(runner, sdir, log)
+    lock = None if dry_run else _take_lock(sdir)
+    try:
+        return _improve(cfg, start_records, workload, out_dir, runner, max_experiments, max_minutes, rounds, repetitions, warmup, port, n_predict,
+                        dry_run, log, initial_args, bandwidth_gbs, session, sdir, identity, file_identity)
+    finally:
+        if lock is not None and lock.is_file():
+            lock.unlink()
+
+
+def _improve(cfg, start_records, workload, out_dir, runner, max_experiments, max_minutes, rounds, repetitions, warmup, port, n_predict, dry_run, log,
+             initial_args, bandwidth_gbs, session, sdir, identity, file_identity):
     problem = identity_problem(start_records, cfg, identity or (lambda path: file_identity(path) if Path(path).is_file() else None))
     if problem:
         return _early_report(session, out_dir, initial_args or [], "the records you started from", workload, max_experiments, max_minutes,
@@ -295,6 +357,8 @@ def improve(cfg, start_records, workload, out_dir, runner, max_experiments=3, ma
         t0 = time.time()
         try:
             brec = runner(bspec, str(bpath))
+        except _DryRunStop:
+            return _early_report(session, out_dir, args, source, workload, max_experiments, max_minutes, "dry run: nothing launched")
         except SystemExit as e:
             return _early_report(session, out_dir, args, source, workload, max_experiments, max_minutes, "baseline not run: %s" % e)
         baseline["minutes"] = round((time.time() - t0) / 60.0, 1)
@@ -357,7 +421,7 @@ def improve(cfg, start_records, workload, out_dir, runner, max_experiments=3, ma
             break
         spec_path = sdir / ("step-%d-%s.json" % (n, f["experiment"]["kind"]))
         spec_path.write_text(json.dumps(spec, indent=2) + "\n", encoding="utf-8")
-        if dry_run:
+        if dry_run and not _recorded(sdir, name):
             report["next_step"] = {"finding": f["id"], "title": f.get("title"), "spec": str(spec_path), "estimated_minutes": need,
                                    "arms": [a["name"] for a in spec["arms"]], "variable": f["experiment"].get("variable"), "port": port,
                                    "min_free_vram_mib": spec["preconditions"].get("min_free_vram_mib")}
@@ -377,6 +441,9 @@ def improve(cfg, start_records, workload, out_dir, runner, max_experiments=3, ma
         t0 = time.time()
         try:
             rec = runner(spec, str(spec_path))
+        except _DryRunStop:
+            stopped = "dry run: nothing launched"
+            break
         except SystemExit as e:
             steps.append({"step": n, "finding": f["id"], "title": f.get("title"), "experiment_kind": f["experiment"]["kind"], "experiment": name,
                           "adopted": False, "verdict": "not run", "why": str(e)})
@@ -677,9 +744,14 @@ def _result(cfg, original, cum, adopted_steps, records, workload, port, rounds, 
         return {"verdict": last["verdict"], "measured_by": last["measured_by"], "measured": last.get("measured"), "validated": True,
                 "validated_changes": [st["finding"] for st in kept], "basis": last["basis"]}
     first = tried[0]
-    return {"verdict": "not validated: %s; your original launch stays the recommendation%s" % (
-                first["why"].replace("not adopted: ", ""), ". Validation run: %s" % first["row"]["verdict"] if first.get("row") else ""),
-            "measured_by": first.get("measured_by"), "measured": first.get("measured"), "validated": False}
+    untried = [label for label, _ in candidates[len(tried):]]
+    note = ""
+    if untried:
+        note = (". Not validated, so not supported by any evidence: %s (the time budget ran out); `hotpath improve --resume %s --max-minutes N` validates them "
+                "without repeating the steps" % ("; ".join(untried), session))
+    return {"verdict": "not validated: %s; your original launch stays the recommendation%s%s" % (
+                first["why"].replace("not adopted: ", ""), ". Validation run: %s" % first["row"]["verdict"] if first.get("row") else "", note),
+            "measured_by": first.get("measured_by"), "measured": first.get("measured"), "validated": False, "not_validated": untried}
 
 
 def validate_decisions(cfg, original, report, records, port, rounds, repetitions, warmup, n_predict, budget, sdir, session, runner, log, shape):
@@ -826,6 +898,8 @@ def improvement_markdown(rec):
         head = "Validated improvement. " + (res.get("verdict") or "").split(" [")[0]
     elif res.get("validated") is False:
         head = (res.get("verdict") or "").split(" Validation run:")[0]
+        if res.get("not_validated"):
+            head += " Not validated (no evidence either way): %s." % "; ".join(res["not_validated"])
     else:
         head = res.get("verdict") or ""
     L += ["**%s**" % head, ""]
