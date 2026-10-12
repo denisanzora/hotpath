@@ -147,7 +147,8 @@ def holders_hint(pc):
         gpu = any("VRAM" in r or "util" in r for r in pc.get("reasons") or [])
         return ". No llama-server is running; %s: pass --wait-s N to wait" % (
             "another program is using the GPU (desktop activity counts too)" if gpu else "another program holds the port")
-    names = ", ".join("llama-server pid %s%s" % (p["pid"], " (port %s)" % ",".join(str(x[1]) for x in ports.get(p["pid"], [])) if ports.get(p["pid"]) else "")
+    names = ", ".join("llama-server pid %s%s%s" % (p["pid"], " (port %s)" % ",".join(str(x[1]) for x in ports.get(p["pid"], [])) if ports.get(p["pid"]) else "",
+                                                   " launched by another hotpath run" if p.get("launched_by_hotpath") else "")
                       for p in procs)
     return (". Running now: %s. hotpath does not stop, restart or reconfigure servers it did not start: stop it yourself if it may be interrupted, "
             "or pass --wait-s N to wait until the GPU is free" % names)
