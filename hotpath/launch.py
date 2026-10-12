@@ -71,12 +71,25 @@ def _is_value(tok):
         return False
 
 
+def canonical(tok):
+    """llama.cpp reads `_` as `-` in long options (`--log_file` is `--log-file`), so they are one argument here too."""
+    tok = str(tok)
+    if tok.startswith("--") and "_" in tok.split("=", 1)[0]:
+        head, sep, rest = tok.partition("=")
+        return head.replace("_", "-") + sep + rest
+    return tok
+
+
+SECRET_FLAGS = frozenset({"--api-key", "--hf-token", "-hft"})
+
+
 def split_args(argv):
     """[(flag, value_or_None), ...] for everything after the program name. `--flag=value` is split; boolean flags
-    and flags followed by another flag get None. Positionals are reported with flag None."""
+    and flags followed by another flag get None. Positionals are reported with flag None. Long options are canonical
+    (`--log_file` -> `--log-file`)."""
     out = []
     i = 0
-    toks = [str(a) for a in argv]
+    toks = [canonical(a) if str(a).startswith("--") else str(a) for a in argv]
     while i < len(toks):
         t = toks[i]
         if t.startswith("-") and not _is_value(t):
@@ -132,6 +145,7 @@ def parse(argv):
 
 def spellings(flag):
     """Every spelling of the same argument (`-ngl`, `--gpu-layers`, `--n-gpu-layers`), or just the flag itself."""
+    flag = canonical(flag)
     name = _SPELLING.get(flag)
     return set(FLAGS[name]) if name else {flag}
 
@@ -192,7 +206,7 @@ def redact(argv):
             continue
         out.append(flag)
         if value is not None:
-            out.append(_base(value) if (flag in PATH_FLAGS or "/" in value or "\\" in value) else value)
+            out.append("<redacted>" if flag in SECRET_FLAGS else (_base(value) if (flag in PATH_FLAGS or "/" in value or "\\" in value) else value))
     return out
 
 

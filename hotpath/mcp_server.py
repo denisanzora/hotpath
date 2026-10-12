@@ -62,7 +62,17 @@ def _roots():
     return roots
 
 
+def _no_unc(value, what):
+    """A network path (\\\\host\\share, //host/share) would make Windows contact that host, and send the user's credentials, just
+    to read it: refused for every path argument, including read-only ones."""
+    v = str(value)
+    if v.startswith(("\\\\", "//")) or v.lower().startswith(("\\\\?\\unc", "file:")):
+        raise ValueError("%s must be a local path, not a network path" % what)
+    return value
+
+
 def _inside_cwd(value, what):
+    _no_unc(value, what)
     p = Path(value).resolve()
     roots = _roots()
     if not any(r == p or r in p.parents for r in roots):
@@ -127,9 +137,9 @@ def _inspect(a):
     if a.get("server"):
         argv += ["--server", _loopback(a["server"], "server")]
     if a.get("log"):
-        argv += ["--log", a["log"]]       # read-only; may live outside the working directory
+        argv += ["--log", _no_unc(a["log"], "log")]       # read-only; may live outside the working directory
     for r in a.get("roots") or []:
-        argv += ["--root", r]
+        argv += ["--root", _no_unc(r, "roots")]
     if a.get("sample_seconds") is not None:
         argv += ["--sample-seconds", str(a["sample_seconds"])]
     if a.get("bandwidth_gbs"):
@@ -144,14 +154,14 @@ def _inspect(a):
 def _discover(a):
     argv = ["discover", "--no-exec-roots"]
     for r in a.get("roots") or []:
-        argv += ["--root", r]
+        argv += ["--root", _no_unc(r, "roots")]
     return argv
 
 
 @tool("hotpath_gguf_summary", "Summarize a GGUF model header: tensor types, bytes streamed per decoded token, optional bandwidth-bound decode ceiling. Reads only the header.",
       _s({"path": _STR, "bandwidth_gbs": {"type": "number"}}, ["path"]))
 def _gguf(a):
-    argv = ["gguf", a["path"]]
+    argv = ["gguf", _no_unc(a["path"], "path")]
     if a.get("bandwidth_gbs"):
         argv += ["--bandwidth-gbs", str(a["bandwidth_gbs"])]
     return argv
@@ -164,7 +174,7 @@ def _observe(a):
     if a.get("server"):
         argv += ["--server", _loopback(a["server"], "server")]
     if a.get("log"):
-        argv += ["--log", a["log"]]  # read-only; may live outside the working directory
+        argv += ["--log", _no_unc(a["log"], "log")]  # read-only; may live outside the working directory
     if a.get("sample_seconds") is not None:
         argv += ["--sample-seconds", str(a["sample_seconds"])]
     return argv
@@ -350,10 +360,10 @@ def _improve(a):
       _s({"server": _STR, "workload": _STR, "repetitions": _INT, "warmup": _INT, "label": _STR, "confirm": _CONFIRM, "timeout_s": _TIMEOUT,
           "wait_for_result_s": _RESULT_WAIT}, ["server", "workload", "confirm"]), active=True)
 def _measure(a):
-    argv = ["measure", "--server", a["server"], "--workload", _inside_cwd(a["workload"], "workload")]
+    argv = ["measure", "--server", _loopback(a["server"], "server"), "--workload", _inside_cwd(a["workload"], "workload")]
     for k, f in (("repetitions", "--repetitions"), ("warmup", "--warmup"), ("label", "--label")):
         if a.get(k) is not None:
-            argv += [f, str(a[k])]
+            argv += [f, _label(a[k]) if k == "label" else str(a[k])]
     return argv
 
 
@@ -362,7 +372,7 @@ def _measure(a):
 def _bench(a):
     argv = ["bench"]
     if a.get("model"):
-        argv += ["--model", a["model"]]
+        argv += ["--model", _no_unc(a["model"], "model")]
     for k in ("pp", "tg", "ub", "reps"):
         if a.get(k) is not None:
             argv += ["--" + k, str(a[k])]
@@ -379,18 +389,24 @@ def _kernels(a):
     if a.get("params"):
         argv += ["--params", a["params"]]
     if a.get("label"):
-        argv += ["--label", a["label"]]
+        argv += ["--label", _label(a["label"])]
     return argv
 
 
 @tool("hotpath_profile", "ACTIVE: Nsight Systems kernel-share profile of a decode-only (pp=0) or prefill-only (tg=0) llama-bench run. Requires confirm=true and HOTPATH_MCP_ALLOW_ACTIVE=1.",
       _s({"label": _STR, "pp": _INT, "tg": _INT, "ub": _INT, "confirm": _CONFIRM, "timeout_s": _TIMEOUT, "wait_for_result_s": _RESULT_WAIT}, ["label", "confirm"]), active=True)
 def _profile(a):
-    argv = ["profile", "--label", a["label"]]
+    argv = ["profile", "--label", _label(a["label"])]
     for k in ("pp", "tg", "ub"):
         if a.get(k) is not None:
             argv += ["--" + k, str(a[k])]
     return argv
+
+
+def _label(v):
+    """Labels become file names (records, profiler captures)."""
+    from hotpath.records import check_name
+    return check_name(str(v), "label")
 
 
 def _kill_tree(proc):
@@ -459,6 +475,7 @@ def _run_child(argv, timeout_s):
 
 JOBS = {}
 _JOBS_LOCK = threading.Lock()
+_START_LOCK = threading.Lock()
 
 
 class Job:
@@ -536,13 +553,15 @@ def _running_job():
 
 
 def start_job(name, argv, timeout_s, wait_s):
-    running = _running_job()
-    if running:
-        return ("refused: %s (%s) is still running and active jobs share the GPU; wait with hotpath_job_status(job_id=%r) or stop it with "
-                "hotpath_job_cancel." % (running.id, running.tool, running.id)), True
-    job = Job(name, argv, timeout_s)
-    with _JOBS_LOCK:
-        JOBS[job.id] = job
+    # the check and the start are one step: two calls arriving together must not both start a job
+    with _START_LOCK:
+        running = _running_job()
+        if running:
+            return ("refused: %s (%s) is still running and active jobs share the GPU; wait with hotpath_job_status(job_id=%r) or stop it with "
+                    "hotpath_job_cancel." % (running.id, running.tool, running.id)), True
+        job = Job(name, argv, timeout_s)
+        with _JOBS_LOCK:
+            JOBS[job.id] = job
     job.done.wait(max(0, min(int(wait_s), MAX_RESULT_WAIT_S)))
     return job.report()
 
@@ -591,14 +610,53 @@ def _job_call(name, args):
     return job.report()
 
 
+_LIMITS = {"max_minutes": (1, 24 * 60), "max_experiments": (0, 20), "wait_s": (0, 86400), "timeout_s": (1, 7 * 86400), "wait_for_result_s": (0, 600),
+           "rounds": (1, 20), "repetitions": (1, 50), "n_predict": (1, 32768), "port": (1024, 65535), "sample_seconds": (0, 600),
+           "n_prompts": (1, 1000), "limit": (1, 100000), "pp": (0, 1 << 20), "tg": (0, 1 << 20), "ub": (1, 1 << 16), "reps": (1, 1000),
+           "warmup": (0, 50), "bandwidth_gbs": (1, 100000)}
+
+
+def _type_errors(args, schema):
+    """Arguments of the wrong JSON type, or numbers that are not finite or out of range: answered with an error instead of
+    failing inside the tool (where a TypeError would leave the client waiting) or slipping past a budget check (NaN)."""
+    import math
+    out = []
+    for k, v in args.items():
+        t = ((schema.get("properties") or {}).get(k) or {}).get("type")
+        ok = True
+        if t == "integer":
+            ok = isinstance(v, int) and not isinstance(v, bool)
+        elif t == "number":
+            ok = isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
+        elif t == "string":
+            ok = isinstance(v, str)
+        elif t == "boolean":
+            ok = isinstance(v, bool)
+        elif t == "array":
+            ok = isinstance(v, list) and all(isinstance(x, (str if ((schema["properties"][k].get("items") or {}).get("type") == "string") else (int, str))) for x in v)
+        if not ok:
+            out.append("%s must be of type %s" % (k, t))
+            continue
+        if k in _LIMITS and isinstance(v, (int, float)) and not isinstance(v, bool):
+            lo, hi = _LIMITS[k]
+            if not lo <= v <= hi:
+                out.append("%s must be between %s and %s" % (k, lo, hi))
+    return out
+
+
 def call_tool(name, args):
     if name not in TOOLS:
         raise ValueError("unknown tool %s" % name)
     _desc, _schema, active, builder = TOOLS[name]
     args = args or {}
     # agents guess argument names; say exactly what this tool takes instead of failing on a missing key later
+    if not isinstance(args, dict):
+        return "error: arguments must be an object", True
     unknown = sorted(set(args) - set(_schema.get("properties") or {}))
     missing = [k for k in _schema.get("required") or [] if k not in args and k != "confirm"]    # confirm has its own refusal below
+    bad = _type_errors(args, _schema)
+    if bad and not unknown and not missing:
+        return "error: %s. Arguments of %s: %s." % ("; ".join(bad), name, ", ".join(sorted(_schema.get("properties") or {}))), True
     if unknown or missing:
         return ("error: %s%s%s. Arguments of %s: %s (required: %s)." % (
             "unknown argument(s) %s" % ", ".join(unknown) if unknown else "", "; " if unknown and missing else "",
@@ -659,6 +717,8 @@ def _tool_call(mid, p):
         text, is_err = call_tool(p.get("name"), p.get("arguments"))
     except (ValueError, KeyError, OSError) as e:
         text, is_err = "error: %s" % e, True
+    except Exception as e:  # noqa: BLE001 - every call gets an answer; a client waiting for a reply that never comes hangs
+        text, is_err = "error: internal error in %s: %s: %s" % (p.get("name"), type(e).__name__, e), True
     _reply(mid, {"content": [{"type": "text", "text": text}], "isError": bool(is_err)})
 
 

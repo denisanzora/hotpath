@@ -10,6 +10,16 @@ import urllib.error
 import urllib.request
 
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """hotpath talks to one local server; a redirect elsewhere is refused, not followed."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise urllib.error.HTTPError(req.full_url, code, "redirect refused (hotpath does not follow redirects): %s" % msg, headers, fp)
+
+
+_OPENER = urllib.request.build_opener(_NoRedirect)
+
+
 class ServerError(RuntimeError):
     pass
 
@@ -24,14 +34,14 @@ class RequestRejected(ServerError):
 
 def _get(url, timeout=10):
     req = urllib.request.Request(url, headers={"Accept": "application/json"})
-    with urllib.request.urlopen(req, timeout=timeout) as r:
+    with _OPENER.open(req, timeout=timeout) as r:
         return json.loads(r.read().decode("utf-8"))
 
 
 def _post(url, body, timeout=600):
     data = json.dumps(body).encode("utf-8")
     req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"}, method="POST")
-    with urllib.request.urlopen(req, timeout=timeout) as r:
+    with _OPENER.open(req, timeout=timeout) as r:
         raw = r.read().decode("utf-8")
         return json.loads(raw) if raw else {}
 

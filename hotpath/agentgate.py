@@ -113,10 +113,33 @@ def _is_ref(v):
 
 
 def spec_problems(spec):
-    """Everything in an unresolved spec (as written on disk) that an agent-run launch may not carry."""
+    """Everything in an unresolved spec (as written on disk) that an agent-run launch may not carry. Besides each field,
+    the full argument list every arm launches with is checked, so values cannot smuggle flags past a key check."""
     if not isinstance(spec, dict) or not isinstance(spec.get("arms"), list):
         return ["spec is not an experiment spec (needs an `arms` list)"]
     problems = []
+    try:
+        port = int(spec.get("port", 8099))
+        if not 1024 <= port <= 65535:
+            problems.append("port %s is outside 1024-65535" % port)
+    except (TypeError, ValueError):
+        problems.append("port %r is not a number" % spec.get("port"))
+    from hotpath.records import check_name
+    for n, what in [(spec.get("name"), "spec name")] + [(a.get("name") if isinstance(a, dict) else None, "arm name") for a in spec["arms"]]:
+        try:
+            check_name(n, what)
+        except ValueError as e:
+            problems.append(str(e))
+    for a in spec["arms"]:
+        if isinstance(a, dict):
+            argv = [str(x) for x in spec.get("common_args") or []]
+            for k, v in (a.get("args_override") or {}).items():
+                argv = launch.set_arg(argv, k, v)
+            for k in a.get("args_remove") or []:
+                argv = launch.remove_arg(argv, k)
+            for flag, value in launch.split_args(argv):
+                if flag is None:
+                    problems.append("arm %s: stray value %r in its launch arguments" % (a.get("name"), value))
 
     def fields(where, d):
         for k in ("binary", "model"):
@@ -166,6 +189,20 @@ def resolve_relative(target, relative_to_file):
     """`subset_of` is written relative to the working directory; an absolute path is taken as given."""
     p = Path(target)
     return str(p) if p.is_absolute() else str(Path.cwd() / p)
+
+
+AGENT_PRECONDITIONS = {"sample_seconds": 5, "max_gpu_util_pct": 10}
+
+
+def harden(spec):
+    """An agent-run spec keeps the idle-GPU and free-port preconditions whatever it says (it may make them stricter)."""
+    pre = dict(spec.get("preconditions") or {})
+    pre["sample_seconds"] = max(float(pre.get("sample_seconds") or 0), AGENT_PRECONDITIONS["sample_seconds"])
+    pre["max_gpu_util_pct"] = min(float(pre.get("max_gpu_util_pct", AGENT_PRECONDITIONS["max_gpu_util_pct"])), AGENT_PRECONDITIONS["max_gpu_util_pct"])
+    port = int(spec.get("port", 8099))
+    pre["ports_must_be_free"] = sorted({int(x) for x in pre.get("ports_must_be_free") or []} | {port})
+    spec["preconditions"] = pre
+    return spec
 
 
 def check_spec(spec, what="spec"):

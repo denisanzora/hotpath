@@ -188,6 +188,13 @@ def run(spec, out_dir, dry_run=False, wait_for_preconditions_s=0):
         return None
     # Everything that can be decided from the spec alone is validated first, so a spec that can never run fails at once
     # instead of after waiting (possibly minutes) for an idle GPU.
+    from hotpath.records import check_name
+    try:
+        check_name(spec.get("name"), "spec name")
+        for a in spec["arms"]:
+            check_name(a.get("name"), "arm name")
+    except ValueError as e:
+        raise SystemExit("error: %s" % e)
     workload = load_workload(spec["workload"])
     if workload.get("kind") != "requests":
         if spec.get("n_predict"):
@@ -216,6 +223,13 @@ def run(spec, out_dir, dry_run=False, wait_for_preconditions_s=0):
 
 def _run_locked(spec, out_dir, workload, wait_for_preconditions_s):
     pre = spec.get("preconditions") or {}
+    port = int(spec.get("port", 8099))
+    holder = gpu_mod.pid_listening_on(port)
+    if holder:
+        # whatever the preconditions say: a server already answers on this port, so hotpath's requests (and slot erases) would
+        # reach a server it did not start, such as the user's own
+        raise SystemExit("refused: port %d is already in use by pid %s; hotpath sends experiment requests only to the server it launches. Choose another "
+                         "port (the spec's `port`) or stop that process yourself" % (port, holder))
     t_end = time.time() + wait_for_preconditions_s
     while True:
         pc = check_preconditions(pre)
@@ -265,6 +279,10 @@ def _run_locked(spec, out_dir, workload, wait_for_preconditions_s):
                     arm_rec["ggml_cuda_dll"] = file_identity(str(sib))
             try:
                 srv.wait_healthy(base, timeout_s=int(spec.get("health_timeout_s", 600)), proc=proc)
+                owner = gpu_mod.pid_listening_on(port)
+                if owner != proc.pid:
+                    raise srv.ServerError("the server answering on port %d is pid %s, not the llama-server hotpath launched (pid %s); no requests sent" % (
+                        port, owner, proc.pid))
                 load_s = round(time.time() - t0, 1)
                 snap = srv.passive_snapshot(base)
                 pid = proc.pid

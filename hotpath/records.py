@@ -106,22 +106,38 @@ def new_record(kind, evidence_class, **fields):
     return rec
 
 
+SAFE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,159}$")
+
+
+def check_name(name, what="name"):
+    """Names become file names (records, server logs, slot directories): no path separators, no `..`."""
+    if not isinstance(name, str) or not SAFE_NAME.match(name) or ".." in name:
+        raise ValueError("%s %r must be letters, digits, '.', '_' or '-' (it becomes a file name)" % (what, name))
+    return name
+
+
 def write_record(rec, out_dir, stem):
+    check_name(stem, "record name")
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
     ts = _dt.datetime.now().strftime("%Y%m%d-%H%M%S")
     data = json.dumps(scrub(rec), indent=1, ensure_ascii=False)
     # Created exclusively: two records of the same kind written within one second (a diagnosis of two inputs run back
     # to back by an agent, say) must not overwrite each other. A numeric suffix keeps names unique; the .md companion
-    # takes its name from the returned path.
+    # takes its name from the returned path. The name is reserved first and the content moved into place in one step,
+    # so a process killed while writing leaves an empty file, never half a record.
     for n in range(0, 1000):
         path = out / ("%s-%s%s.json" % (stem, ts, "" if n == 0 else "-%d" % (n + 1)))
         try:
-            with open(path, "x", encoding="utf-8") as f:
-                f.write(data)
-            return path
+            with open(path, "x", encoding="utf-8"):
+                pass
         except FileExistsError:
             continue
+        tmp = path.with_name(path.name + ".tmp")
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(data)
+        os.replace(tmp, path)
+        return path
     raise RuntimeError("could not find a free record name for %s-%s" % (stem, ts))
 
 
@@ -160,5 +176,5 @@ def env_snapshot(keys=None):
     out = {}
     for k, v in os.environ.items():
         if k.startswith(("GGML_", "LLAMA_", "CUDA_")) or (keys and k in keys):
-            out[k] = v
+            out[k] = "<redacted>" if re.search(r"KEY|TOKEN|SECRET|PASSWORD", k.upper()) else v
     return out

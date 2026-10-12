@@ -341,13 +341,39 @@ class Budget:
         return self.max_minutes - self.minutes
 
 
+def build_problem(seen, cfg, identity):
+    """The observed server's build (executable and ggml/llama libraries, from its process) against the configured
+    runtime_binary's. None when they match or either is unknown."""
+    from hotpath.observe import build_identity
+    if not seen or not cfg.get("runtime_binary"):
+        return None
+    mine = build_identity(cfg["runtime_binary"], identity) or {}
+    key = lambda x: ((x or {}).get("size_bytes"), (x or {}).get("sha256_head64m"))
+    if not mine or not (mine.get("exe") or {}).get("size_bytes") or not (seen.get("exe") or {}).get("size_bytes"):
+        return None
+    differs = []
+    if key(seen.get("exe")) != key(mine.get("exe")):
+        differs.append("llama-server executable (%s vs %s)" % ((seen.get("exe") or {}).get("basename"), (mine.get("exe") or {}).get("basename")))
+    for name in sorted(set(seen.get("libraries") or {}) | set(mine.get("libraries") or {})):
+        if key((seen.get("libraries") or {}).get(name)) != key((mine.get("libraries") or {}).get(name)):
+            differs.append(name)
+    if differs:
+        return ("the observed server runs another llama-server build than runtime_binary in hotpath.local.json (different %s): experiments would "
+                "measure another setup than the one diagnosed. Point runtime_binary at the server's executable, or start from a new observation" % ", ".join(differs))
+    return None
+
+
 def identity_problem(records, cfg, identity):
     """Why evidence about the user's server cannot be carried into experiments with the configured model and binary, or None.
-    Compared on size and a hash of the first 64 MiB; a record without identity is not judged."""
+    Compared on size and a hash of the first 64 MiB; a record without identity is not judged. The build is the observed
+    server's own executable and libraries (its process), not the configured binary's identity."""
     for rec in records:
         if rec.get("kind") != "observation":
             continue
-        for key, cfg_key, what in (("model", "model_path", "model"), ("runtime_binary", "runtime_binary", "llama-server build")):
+        problem = build_problem(rec.get("server_build"), cfg, identity)
+        if problem:
+            return problem
+        for key, cfg_key, what in (("model", "model_path", "model"),):
             seen = rec.get(key) or {}
             seen = seen.get("identity") if key == "model" else seen
             if not seen or not seen.get("size_bytes") or not cfg.get(cfg_key):
@@ -446,6 +472,39 @@ def _check_saved_state(saved, sdir):
         raise SystemExit("refused to resume %s: %s" % (Path(sdir).name, e))
 
 
+def _spec_dir(sdir, dry_run):
+    """Where a run writes its spec files: the session directory, or for a dry run a subdirectory of its own, so a plan made
+    while the session runs never rewrites a file the running process uses."""
+    d = Path(sdir) / "dry-run" if dry_run else Path(sdir)
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+# flags of the user's launch that experiments leave out without changing what is computed: the network binding, files the
+# server writes, the model given another way (the configured model file, whose identity is checked), logging and endpoints
+PLUMBING_FLAGS = frozenset({"--host", "--port", "--log-file", "--api-key", "--api-key-file", "--ssl-key-file", "--ssl-cert-file", "--path", "--media-path",
+                            "--webui-config-file", "--slot-save-path", "--prompt-cache", "--prompt-cache-all", "--prompt-cache-ro", "-m", "--model",
+                            "-hf", "-hfr", "--hf-repo", "-hff", "--hf-file", "--hf-token", "-hft", "-mu", "--model-url", "-dr", "--docker-repo", "-a", "--alias",
+                            "--metrics", "--slots", "--no-slots", "--no-webui", "--webui", "--offline", "--props", "--api-prefix", "--threads-http",
+                            "-to", "--timeout", "-v", "--verbose", "--log-verbose", "--log-disable", "--log-colors", "--log-prefix", "--log-timestamps",
+                            "-lv", "--log-verbosity"})
+
+
+def left_out_of_measurement(observed, measured):
+    """Flags of the user's own launch line that the experiments did not run with, split into plumbing and the rest. The
+    rest (a draft model, a vision projector, adapters, template or grammar files, ...) changes what the server computes
+    or how much memory it needs, so a result measured without them does not describe a launch with them."""
+    if not observed:
+        return [], []
+    have = {f for f, _ in launch.split_args(measured) if f}
+    have_names = {launch._SPELLING.get(f, f) for f in have}
+    gone = []
+    for f, _v in launch.split_args(observed):
+        if f and f not in have and launch._SPELLING.get(f, f) not in have_names and f not in gone:
+            gone.append(f)
+    return [f for f in gone if f in PLUMBING_FLAGS], [f for f in gone if f not in PLUMBING_FLAGS]
+
+
 def _write_exp(rec, sdir, name):
     if rec.get("_reused_from"):
         return Path(sdir) / rec["_reused_from"]
@@ -516,7 +575,7 @@ def _improve(cfg, start_records, workload, out_dir, runner, max_experiments, max
         # nothing running and no log: measure the starting configuration on hotpath's own server first
         args, source = (list(initial_args), "command line") if initial_args else baseline_args_without_server(cfg)
         bspec = _apply_rq(baseline_spec(cfg, args, step_wl, port, repetitions, warmup, n_predict, "%s-baseline" % session), rq)
-        bpath = sdir / "baseline.json"
+        bpath = _spec_dir(sdir, dry_run) / "baseline.json"
         bpath.write_text(json.dumps(bspec, indent=2) + "\n", encoding="utf-8")
         baseline = {"spec": str(bpath), "args": args, "source": source}
         if dry_run:
@@ -591,13 +650,13 @@ def _improve(cfg, start_records, workload, out_dir, runner, max_experiments, max
         if need is not None and need > budget.time_left():
             stopped = "time budget: the next step (%s) needs about %.0f min and %.0f min are left" % (f["id"], need, max(0.0, budget.time_left()))
             break
-        spec_path = sdir / ("step-%d-%s.json" % (n, f["experiment"]["kind"]))
+        spec_path = _spec_dir(sdir, dry_run) / ("step-%d-%s.json" % (n, f["experiment"]["kind"]))
         spec_path.write_text(json.dumps(spec, indent=2) + "\n", encoding="utf-8")
         if dry_run and not _recorded(sdir, spec):
             report["next_step"] = {"finding": f["id"], "title": f.get("title"), "spec": str(spec_path), "estimated_minutes": need,
                                    "arms": [a["name"] for a in spec["arms"]], "variable": f["experiment"].get("variable"), "port": port,
                                    "min_free_vram_mib": spec["preconditions"].get("min_free_vram_mib")}
-            vw = rq["validation"] if rq else validation_workload(sdir, shape, _ctx_tokens(best["args"]), n_predict)[0]
+            vw = rq["validation"] if rq else validation_workload(_spec_dir(sdir, True), shape, _ctx_tokens(best["args"]), n_predict)[0]
             vest = prop.estimate_minutes({"workload": vw, "arms": [{}, {}], "rounds": rounds, "repetitions": repetitions, "warmup": warmup, "cooldown_s": 5},
                                          diag.get("rates"), load_s=_measured_load_s(records))
             report["validation_estimate_minutes"] = vest["minutes"] if vest else None
@@ -700,6 +759,17 @@ def _improve(cfg, start_records, workload, out_dir, runner, max_experiments, max
     if validated and report.get("validated_steps") and len(report["validated_steps"]) < len(adopted_steps):
         ch = _cum_change([st for st in adopted_steps if st["experiment"] in report["validated_steps"]])
         cum = {"args": dict(ch["args_override"]), "args_remove": set(ch["args_remove"]), "env": dict(ch["env_override"]), "env_remove": set(ch["env_remove"])}
+    plumbing, not_measured = left_out_of_measurement(observed, args0)
+    report["starting_point"]["left_out"] = {"plumbing": plumbing, "not_measured": not_measured}
+    if validated and not_measured:
+        # the validated run did not include these: applying its changes to the full launch line is not what was measured
+        report["result"]["validated"] = validated = False
+        report["result"]["verdict"] = ("not recommended automatically: the validated run measured your launch without %s (hotpath cannot run them in "
+                                       "its experiments), and those change what the server computes or how much memory it needs. Result without "
+                                       "them: %s" % (", ".join(not_measured), report["result"]["verdict"]))
+        report["decisions"].append({"step": "validation", "arm": "validated without %s" % ", ".join(not_measured), "change": _change_text(_cum_change(adopted_steps)),
+                                    "verdict": report["result"]["verdict"], "needs": "the measurement left out %s; check the change with them loaded" % ", ".join(not_measured),
+                                    "fidelity": None, "measured": report["result"].get("measured"), "decomposition": None})
     report["recommended"] = recommended_launch(observed or args0, cum if validated else {"args": {}, "args_remove": set(), "env": {}, "env_remove": set()},
                                                bool(observed), validated=validated, adopted=bool(adopted_steps))
     if not dry_run and budget.experiments:
@@ -1084,6 +1154,11 @@ def improvement_markdown(rec):
         L += ["%d faster option(s) need your decision (below)." % len(rec["decisions"]), ""]
     L += ["## What was found", "",
           "- Starting configuration: `%s` (%s)" % (" ".join(sp["args"]) or "(no arguments)", sp["source"])]
+    lo = sp.get("left_out") or {}
+    if lo.get("not_measured"):
+        L.append("  - not in the measured launch (hotpath cannot run them; results do not cover them): %s" % ", ".join(lo["not_measured"]))
+    if lo.get("plumbing"):
+        L.append("  - left out as plumbing (hotpath's server sets its own binding, model file and logging): %s" % ", ".join(lo["plumbing"]))
     b = rec.get("bottleneck")
     if b:
         L.append("- Biggest bottleneck: %s [%s, %s%s]" % (b["title"], b.get("severity"), b.get("confidence"),

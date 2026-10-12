@@ -37,6 +37,23 @@ def binary_identity(path, path_prepend=None):
     return ident
 
 
+BUILD_LIBRARIES = ("ggml-cuda.dll", "ggml.dll", "ggml-base.dll", "llama.dll", "libggml-cuda.so", "libggml.so", "libggml-base.so", "libllama.so")
+
+
+def build_identity(exe, identity=None):
+    """The identity of a llama-server build: its executable and the ggml/llama libraries next to it (two builds can share
+    an identical llama-server executable and differ only in ggml-cuda), each by size and a hash of its head."""
+    ident = identity or file_identity
+    if not exe or not Path(exe).is_file():
+        return None
+    out = {"exe": ident(str(exe)), "libraries": {}}
+    for name in BUILD_LIBRARIES:
+        p = Path(exe).parent / name
+        if p.is_file():
+            out["libraries"][name] = ident(str(p))
+    return out
+
+
 def _only_running_server():
     """Zero-config target: the single llama-server on this machine that answers on loopback. Several -> none chosen."""
     from hotpath import discover as disc
@@ -110,6 +127,9 @@ def observe(cfg, log_path=None, model_path=None, binary_path=None, base_url=None
     rec["runtime_binary"] = binary_identity(bp, cfg.get("path_prepend"))
     if lnch and lnch.get("exe") and bp and Path(bp).resolve() != Path(lnch["exe"]).resolve():
         rec["runtime_binary"]["note"] = "the running server's executable is %s, not this binary" % Path(lnch["exe"]).name
+    if lnch and lnch.get("exe"):
+        # the build the observed server actually runs (from its process), compared with the configured one before an experiment
+        rec["server_build"] = build_identity(lnch["exe"])
     props_model = ((rec["server"].get("props") or {}).get("model_basename"))
     candidates = [(model_path, "--model"), (ls.get("model"), "the running server's --model"), (cfg.get("model_path"), "model_path in hotpath.local.json")]
     mp, msrc = next(((m, s) for m, s in candidates if m and Path(m).is_file()), (None, None))

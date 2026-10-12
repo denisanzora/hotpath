@@ -1296,7 +1296,10 @@ def experiment_verdict(rec):
         n_rounds = int((rec.get("spec_redacted") or {}).get("rounds") or 1)
         small = n_prompts < 3 or n_rounds < 3
         scope = "on this machine and workload (%d prompts x %d rounds%s)" % (n_prompts, n_rounds, "; preliminary" if small else "")
-        all_identical = row["outputs"]["prompts_compared"] > 0 and row["outputs"]["identical"] == row["outputs"]["prompts_compared"]
+        unstable_c = sorted(str(pid) for pid, e in oe.items() if full in e and pid not in sampled and not e[full].get("stable_within_arm", True))
+        if unstable_c:
+            row["outputs"]["candidate_unstable_prompts"] = unstable_c
+        all_identical = row["outputs"]["prompts_compared"] > 0 and row["outputs"]["identical"] == row["outputs"]["prompts_compared"] and not unstable_c
         new_errors = row["request_errors"]["candidate"]["n"] - row["request_errors"]["baseline"]["n"]
         if row["failures"]:
             verdict = "reject: launch failures in this arm"
@@ -1433,6 +1436,7 @@ def arm_fidelity(base, cand, row, oe, full_label):
     from hotpath import fidelity
     validity_dropped = bool((row.get("validity") or {}).get("dropped"))
     reproducible = all(e.get("stable_within_reference", True) for e in oe.values() if full_label in e)
+    cand_reproducible = all(e[full_label].get("stable_within_arm", True) for e in oe.values() if full_label in e)
     bp, cp = base.get("probes") or {}, cand.get("probes") or {}
     prompts = {}
     k = min([x.get("k") or 0 for x in list(bp.values()) + list(cp.values()) if isinstance(x, dict) and x.get("k")] or [0])
@@ -1458,7 +1462,7 @@ def arm_fidelity(base, cand, row, oe, full_label):
                     "first_divergence_index": e[full_label].get("first_divergence_index")}
         basis = "token ids or output hashes only (no probability probes)"
     mismatch = [pid for pid, pr in list(bp.items()) + list(cp.items()) if isinstance(pr, dict) and pr.get("matches_timed") is False]
-    out = fidelity.classify_arm(prompts, validity_dropped=validity_dropped, baseline_reproducible=reproducible)
+    out = fidelity.classify_arm(prompts, validity_dropped=validity_dropped, baseline_reproducible=reproducible, candidate_reproducible=cand_reproducible)
     out.update({"basis": basis, "per_prompt": prompts})
     if mismatch:
         out["note"] = "probe outputs differ from the timed outputs on %s: the server is not deterministic for these prompts" % sorted(set(mismatch))[:5]

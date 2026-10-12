@@ -133,7 +133,7 @@ def is_equivalent(prompt_result):
     return prompt_result.get("class") in IDENTICAL
 
 
-def classify_arm(prompts, validity_dropped=False, baseline_reproducible=True, policy=None, policy_check=None):
+def classify_arm(prompts, validity_dropped=False, baseline_reproducible=True, policy=None, policy_check=None, candidate_reproducible=True):
     """One candidate arm against the baseline, over every compared prompt. `equivalent` is the only thing that may permit
     automatic adoption: identical tokens on every prompt, or differences that an operator-configured policy accepted after
     it was actually checked (policy_check: {"passed": bool, "basis": str})."""
@@ -151,6 +151,9 @@ def classify_arm(prompts, validity_dropped=False, baseline_reproducible=True, po
     if not baseline_reproducible:
         return dict(base, **{"class": "baseline not reproducible", "equivalent": False,
                              "why": "the baseline's own repeated outputs differ, so identity between arms says nothing"})
+    if not candidate_reproducible:
+        return dict(base, **{"class": "candidate not reproducible", "equivalent": False,
+                             "why": "the candidate's own repeated outputs differ from each other: one matching output is not evidence of the others"})
     if classes and all(c in IDENTICAL for c in classes):
         cls = "logprob-identical" if all(c == "logprob-identical" for c in classes) else "token-identical"
         return dict(base, **{"class": cls, "equivalent": True, "why": "identical tokens on all %d prompts" % len(classes)})

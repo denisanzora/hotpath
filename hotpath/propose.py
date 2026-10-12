@@ -107,7 +107,8 @@ RUNNER_OWNED_FLAGS = frozenset({
 def strip_runner_owned(args):
     """Drop runner-owned flags (and their values) from copied server arguments. Returns (kept_args, removed_flag_names);
     only flag names are reported, since their values are often private paths."""
-    args = [str(a) for a in args]
+    from hotpath import launch
+    args = [launch.canonical(a) for a in args]
     kept, removed, i = [], [], 0
     while i < len(args):
         flag = args[i].split("=", 1)[0]

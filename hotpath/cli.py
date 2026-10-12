@@ -180,7 +180,7 @@ def cmd_experiment(args):
     raw = None
     if agentgate.active() and not args.dry_run:
         try:
-            raw = agentgate.check_spec_file(args.spec)      # the MCP server checked the file; check what this process reads, too
+            raw = agentgate.harden(agentgate.check_spec_file(args.spec))   # the MCP server checked the file; check what this process reads, too
         except ValueError as e:
             raise SystemExit("refused: %s" % e)
     spec = exp_mod.load_spec(args.spec, cfg, raw=raw)
@@ -343,14 +343,16 @@ def _experiment_runner(cfg, wait_s):
     """Runs one spec file through the normal experiment runner (preconditions, own port, interleaving) and returns its
     record with the comparison attached; server logs go next to the spec."""
     def run(spec, spec_path):
-        raw = None
+        # the spec the loop built is the one launched (the file next to it is a copy for the user): nothing re-read from disk
+        raw = json.loads(json.dumps(spec))
         if agentgate.active():
-            # started by the MCP server: whatever wrote this spec (an agent, a saved session, the loop from an observed command
-            # line), it launches only what an agent-authored spec may carry, checked on the content that is launched
+            # started by the MCP server: whatever produced this spec (an agent, a saved session, the loop from an observed command
+            # line), it launches only what an agent-authored spec may carry, with the idle-GPU and free-port preconditions kept
             try:
-                raw = agentgate.check_spec_file(spec_path)
+                agentgate.check_spec(raw)
             except ValueError as e:
                 raise SystemExit("refused: %s" % e)
+            agentgate.harden(raw)
         resolved = exp_mod.load_spec(spec_path, cfg, raw=raw)
         for k in ("binary", "model"):
             if not resolved.get(k) or not Path(resolved[k]).exists():
