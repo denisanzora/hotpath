@@ -147,7 +147,15 @@ def collect(records):
                 ev["bench"].append({"n_prompt": row.get("n_prompt"), "n_gen": row.get("n_gen"), "n_ubatch": row.get("n_ubatch"), "n_batch": row.get("n_batch"),
                                     "avg_ts": row.get("avg_ts"), "stddev_ts": row.get("stddev_ts"), "model": row.get("model_filename") or row.get("model_type")})
         elif kind == "profile" and rec.get("kernels"):
-            ev["profiles"].append({"label": rec.get("label"), "mode": rec.get("mode") or {}, "by_class": rec.get("time_share_by_class_pct") or {},
+            # classes are recomputed from the kernel names with the current classifier, so an older record's coarser classes
+            # (a BF16 fallback GEMM filed as plain cuBLAS) do not hide what the profile shows
+            from hotpath.profile import classify
+            by_class = {}
+            for k in rec["kernels"]:
+                c = classify(k.get("name") or "")
+                by_class[c] = round(by_class.get(c, 0.0) + (k.get("time_pct") or 0.0), 2)
+            by_class = dict(sorted(by_class.items(), key=lambda kv: -kv[1])) if by_class else (rec.get("time_share_by_class_pct") or {})
+            ev["profiles"].append({"label": rec.get("label"), "mode": rec.get("mode") or {}, "by_class": by_class,
                                    "kernels": rec.get("kernels") or [], "kernel_count": rec.get("kernel_count")})
     return ev
 
@@ -720,6 +728,44 @@ def rule_offload(ev, label, arm):
                     notes=["The decode-ceiling comparison below assumes all weights in VRAM; with a partial offload it is not the first thing to fix."])
 
 
+BF16_SHARE_WORTH_NOTING = 0.005    # BF16 tensors holding at least this share of the weight bytes (norm vectors alone stay below)
+
+
+def rule_bf16_without_tensor_cores(ev, label, arm):
+    """A hardware constraint, from two passive facts: the GGUF stores matrices as BF16, and the GPU predates BF16 tensor
+    cores (compute capability 8.0). Matrix products with those tensors then take a conversion or fallback path; how much
+    of prefill that costs depends on the runtime build, so this stays a hypothesis until a prefill profile shows it."""
+    model = ev.get("model") or {}
+    bf = (model.get("tensor_types") or {}).get("BF16") or {}
+    cc = _f((ev.get("gpu") or {}).get("compute_cap"))
+    total = model.get("total_bytes") or 0
+    if not bf.get("count") or cc is None or cc >= 8.0 or not total or bf.get("bytes", 0) / total < BF16_SHARE_WORTH_NOTING:
+        return None
+    prof = next((p for p in ev.get("profiles") or [] if (p["mode"].get("tg") or 0) == 0 and (p["mode"].get("pp") or 0) > 0), None)
+    share = (prof or {}).get("by_class", {}).get("cublas_bf16_fallback_gemm") if prof else None
+    known = ["%d tensors (%.0f MiB, %.1f%% of the weights) are stored as BF16 in the GGUF" % (bf["count"], bf["bytes"] / (1 << 20), 100 * bf["bytes"] / total),
+             "the GPU has compute capability %s; BF16 tensor cores start at 8.0" % (ev.get("gpu") or {}).get("compute_cap")]
+    if prof and not share:
+        return _finding("bf16_without_tensor_cores", "BF16 tensors on a GPU without BF16 tensor cores: no BF16 fallback GEMM in the prefill profile", "info", "likely", "active",
+                        {"bf16_tensors": bf["count"], "compute_capability": cc, "profile": prof["label"]},
+                        "This runtime build does not spend prefill time in a BF16 fallback GEMM (it converts or routes these tensors otherwise); nothing to fix here.",
+                        known=known + ["prefill profile %s has no cublas_bf16_fallback_gemm class among its kernels" % prof["label"]])
+    if share is not None:
+        known.append("prefill profile %s: the BF16 fallback GEMM class takes %.1f%% of GPU kernel time" % (prof["label"], share))
+    return _finding("bf16_without_tensor_cores", "BF16 tensors on a GPU without BF16 tensor cores%s" % (" (%.0f%% of prefill GPU time in the profile)" % share if share else ""),
+                    "medium", "likely" if share and share >= 5 else "hypothesis", "passive" if share is None else "active",
+                    {"bf16_tensors": bf["count"], "bf16_mib": round(bf["bytes"] / (1 << 20)), "compute_capability": cc, "profile_bf16_share_pct": share},
+                    "Matrix products with BF16 weights cannot use tensor cores on this GPU; depending on the runtime build they are converted per call or run in a "
+                    "slower GEMM, which lands in prompt processing where batches are large.",
+                    experiment={"kind": "profile_prefill", "variable": "none (profiling run)",
+                                "arms": "hotpath profile --label prefill --pp 512 --tg 0 (ACTIVE): look for the cublas_bf16_fallback_gemm class. If it is large, compare a runtime build "
+                                        "with a BF16-to-F32 fallback, or a model variant with those tensors in F32, against the current one with `hotpath experiment` (a binary or model arm)",
+                                "metric": "GPU time share of the BF16 GEMM class in prefill; then prefill t/s in a controlled comparison"},
+                    risks=["A model variant with retyped tensors is a different file: check output equivalence; F16 can overflow where BF16 does not, F32 is exact but larger."],
+                    known=known,
+                    hypothesis="Part of prefill time goes to a BF16 conversion or fallback path that a GPU with BF16 tensor cores would not need.")
+
+
 def _bench_rows(ev, kind):
     rows = []
     for b in ev["bench"]:
@@ -1221,7 +1267,8 @@ def cache_conditions(records):
 AFFECTS = {"gpu_offload_partial": ("prefill", "decode"), "cpu_fallback_sessions": ("all",), "vram_pressure": ("all",),
            "microbatch_limits_prefill": ("prefill",), "microbatch_not_small": ("prefill",), "prefill_server_gap": ("prefill",),
            "decode_below_ceiling": ("decode",), "decode_near_ceiling": ("decode",), "decode_server_gap": ("decode",),
-           "per_request_overhead": ("residual",), "kernel_time_share_decode": ("decode",), "kernel_time_share_prefill": ("prefill",)}
+           "per_request_overhead": ("residual",), "kernel_time_share_decode": ("decode",), "kernel_time_share_prefill": ("prefill",),
+           "bf16_without_tensor_cores": ("prefill",)}
 CONFIDENCE_WEIGHT = {"confirmed": 1.0, "likely": 0.8, "hypothesis": 0.5, "insufficient": 0.2}
 RANK_BASIS = ("Problems are ranked by the share of request time the candidate change can act on (an upper bound from the measured "
               "prefill/decode/overhead shares, not a predicted gain) weighted by confidence (confirmed 1, likely 0.8, hypothesis 0.5); "
@@ -1270,7 +1317,7 @@ def run_rules(ev, label, arm, bandwidth_gbs=None):
     f = rule_coverage(ev)
     if f:
         findings.append(f)
-    for fn in (rule_offload, rule_phase, rule_residual, rule_microbatch, rule_vram):
+    for fn in (rule_offload, rule_phase, rule_residual, rule_microbatch, rule_vram, rule_bf16_without_tensor_cores):
         f = fn(ev, label, arm)
         if f:
             findings.append(f)
@@ -1303,6 +1350,28 @@ def run_rules(ev, label, arm, bandwidth_gbs=None):
     return findings, shares
 
 
+def traffic_shape(arm, label=None):
+    """The request shape of real traffic (a log or a measurement of the user's server, never hotpath's own experiment
+    workload): total prompt tokens per request (processed + reused from the cache) and generated tokens."""
+    if not arm or arm.get("evidence_class") not in ("passive", "active"):
+        return None
+    tot, gen = [], []
+    for r in arm.get("requests") or []:
+        p = _f(r.get("prompt_n"))
+        if p is None:
+            continue
+        c = _f(r.get("cache_n"))
+        tot.append(p + (c if c and c > 0 else 0))
+        if _f(r.get("predicted_n")):
+            gen.append(_f(r.get("predicted_n")))
+    if len(tot) < MIN_REQUESTS_FOR_SPLIT or not gen:
+        return None
+    pt, gn = percentiles(tot), percentiles(gen)
+    return {"prompt_tokens_p10": int(pt["p10"]), "prompt_tokens_median": int(pt["median"]), "prompt_tokens_p90": int(pt["p90"]),
+            "generated_tokens_median": int(gn["median"]), "requests": pt["n"],
+            "basis": "%d requests in %s, prompt tokens including those reused from the cache" % (pt["n"], label or arm.get("evidence_class"))}
+
+
 def _winner(rec, verdict):
     """The candidate arm a verdict found faster: a `keep`, else a `faster ... outputs differ` (which assumes the user
     accepts the difference). None when no candidate improved."""
@@ -1317,6 +1386,7 @@ def diagnose(records, bandwidth_gbs=None, cfg=None):
     conditions = cache_conditions(records)
     ev = apply_local_config(collect(records), cfg)
     label, arm = _baseline_arm(ev)
+    shape = traffic_shape(arm, label)
     base_findings, shares = run_rules(ev, label, arm, bandwidth_gbs)
     verdicts = []
     for r in ev["experiments"]:
@@ -1379,7 +1449,7 @@ def diagnose(records, bandwidth_gbs=None, cfg=None):
              "basis": "per-request medians of %s" % label}
     if not (rates["prefill_tps"] and rates["decode_tps"]) and (arm or {}).get("metrics"):
         rates = {"prefill_tps": arm["metrics"].get("prefill_tps"), "decode_tps": arm["metrics"].get("decode_tps"), "basis": "/metrics totals"}
-    return {"kind": "diagnosis", "rates": rates if rates["prefill_tps"] and rates["decode_tps"] else None, "evidence_class": "hypothesis" if not ev["experiments"] else "controlled", "sources": ev["sources"], "diagnosed_arm": label,
+    return {"kind": "diagnosis", "rates": rates if rates["prefill_tps"] and rates["decode_tps"] else None, "traffic_shape": shape, "evidence_class": "hypothesis" if not ev["experiments"] else "controlled", "sources": ev["sources"], "diagnosed_arm": label,
             "diagnosed_arm_reason": diagnosed_why, "cache_conditions": conditions, "phase_shares": shares, "rank_basis": RANK_BASIS,
             "observed_launch": {"args_redacted": obs.get("argv_redacted"), "source": obs.get("settings_source"), "describe": obs.get("describe")} if obs else None,
             "baseline_args": (arm or {}).get("args"), "baseline_from_verdict": baseline_from,

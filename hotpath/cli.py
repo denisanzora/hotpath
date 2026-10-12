@@ -81,6 +81,18 @@ def cmd_propose(args):
     from hotpath import propose as prop_mod
     cfg = load_local(args.local)
     workload = args.workload or cfg.get("workload")
+    shape = (load_record(args.diagnosis).get("traffic_shape") or None) if not workload else None
+    if not workload and shape:
+        # synthetic prompts sized like the real traffic the diagnosis saw (p10 / median / p90 prompt tokens, median output),
+        # so the experiment measures the request shape the user actually serves
+        sizes = [shape["prompt_tokens_p10"], shape["prompt_tokens_median"], shape["prompt_tokens_p90"]]
+        words = [max(20, int(round((t - 20) / 1.15))) for t in sizes]          # ~1.15 tokens per word of the synthetic vocabulary
+        n_predict = max(16, min(512, shape["generated_tokens_median"]))
+        workload = str(Path("workloads") / ("hotpath-shaped-%s-n%d.json" % ("-".join(str(w) for w in words), n_predict)))
+        if not Path(workload).exists():
+            wl_mod.save_workload(wl_mod.build_workload("hotpath-shaped", 3, words, seed=1, n_predict=n_predict, fmt="chatml"), workload)
+        print("no workload given; using synthetic prompts shaped like the observed traffic: %s (prompts of about %s tokens, %d generated; from %s)" % (
+            workload, "/".join(str(t) for t in sizes), n_predict, shape["basis"]))
     if not workload:
         workload = str(Path("workloads") / "hotpath-default.json")
         if not Path(workload).exists():

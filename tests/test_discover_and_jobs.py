@@ -100,6 +100,35 @@ class OffloadAndRankingTests(unittest.TestCase):
             self.assertIn("differ", src)
 
 
+class HardwareAndShapeTests(unittest.TestCase):
+    def _obs(self, cc="7.5", bf16_bytes=64 << 20):
+        o = _obs(ngl="99")
+        o["gpu"]["compute_cap"] = cc
+        o["model"]["summary"]["tensor_types"] = {"BF16": {"count": 96, "bytes": bf16_bytes}, "Q4_K": {"count": 300, "bytes": 6 << 30}}
+        return o
+
+    def _profile(self, names):
+        return {"kind": "profile", "evidence_class": "active", "created": "t", "label": "pf", "mode": {"pp": 512, "tg": 0},
+                "time_share_by_class_pct": {"cublas_gemm": 12.5},     # an older record's coarse class; names decide
+                "kernels": [{"name": n, "time_pct": p, "instances": 10, "avg_ns": 1e5} for n, p in names]}
+
+    def test_bf16_rule_states(self):
+        f = lambda recs: next((x for x in dg.diagnose(recs)["findings"] if x["id"] == "bf16_without_tensor_cores"), None)
+        self.assertIsNone(f([self._obs(cc="8.6")]))                                  # BF16 tensor cores present
+        self.assertIsNone(f([self._obs(bf16_bytes=1 << 20)]))                         # norm vectors only
+        self.assertEqual(f([self._obs()])["confidence"], "hypothesis")
+        hit = f([self._obs(), self._profile([("magma_sgemmEx_kernel<float, __nv_bfloat16, float>", 12.5), ("mul_mat_q", 70.0)])])
+        self.assertEqual((hit["confidence"], hit["measurements"]["profile_bf16_share_pct"]), ("likely", 12.5))
+        clean = f([self._obs(), self._profile([("mul_mat_q", 80.0)])])
+        self.assertEqual(clean["severity"], "info")
+
+    def test_traffic_shape_counts_cached_prompt_tokens_and_ignores_experiments(self):
+        arm = {"evidence_class": "passive", "requests": [{"prompt_n": 100, "cache_n": 133, "predicted_n": 48}] * 5}
+        s = dg.traffic_shape(arm, "log")
+        self.assertEqual((s["prompt_tokens_median"], s["generated_tokens_median"]), (233, 48))
+        self.assertIsNone(dg.traffic_shape(dict(arm, evidence_class="controlled")))
+
+
 class ImproveLoopTests(unittest.TestCase):
     def _exp(self, cand_wall):
         def reqs(wall, dec_ms):
