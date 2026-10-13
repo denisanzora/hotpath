@@ -257,7 +257,9 @@ def _run_locked(spec, out_dir, workload, wait_for_preconditions_s):
     private_probes = {}         # application requests: probe tokens stay in memory and only their comparison is recorded
     n_items = len(workload.get("items") or workload.get("prompts") or [])
     total = rounds * len(spec["arms"])
-    print("running %d launches, %d requests" % (total, total * n_items * (int(spec.get("warmup", 1)) + int(spec.get("repetitions", 2)))), flush=True)
+    # a cold pass of application requests warms up with its first request only (measure.run_requests_workload)
+    warm_items = 1 if (workload.get("kind") == "requests" and workload.get("cache_mode", "cold") == "cold") else n_items
+    print("running %d launches, %d requests" % (total, total * (warm_items * int(spec.get("warmup", 1)) + n_items * int(spec.get("repetitions", 2)))), flush=True)
     for rnd in range(rounds):
         for a in spec["arms"]:
             cmd, env, port = arm_launch(spec, a, out_dir)
