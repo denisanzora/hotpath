@@ -423,7 +423,11 @@ def _label(v):
 
 def _kill_tree(proc):
     if os.name == "nt":
-        subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)], capture_output=True, stdin=subprocess.DEVNULL)
+        from hotpath import safepath
+        try:
+            subprocess.run(safepath.resolve(["taskkill", "/F", "/T", "/PID", str(proc.pid)]), capture_output=True, stdin=subprocess.DEVNULL)
+        except OSError:
+            proc.kill()
     else:
         import signal
         try:
@@ -786,6 +790,9 @@ def handle(msg, threaded=False):
 
 
 def main():
+    from hotpath.config import SNAPSHOT_ENV, config_digest
+    # the operator's configuration as of now is the trust anchor for every child (see config.load_local)
+    os.environ[SNAPSHOT_ENV] = config_digest()
     print("hotpath MCP server %s on stdio (active tools %s)" % (__version__, "ENABLED" if _active_allowed() else "disabled"), file=sys.stderr)
     try:
         for line in sys.stdin:

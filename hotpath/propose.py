@@ -30,23 +30,47 @@ def _speed_settings(args):
     return {k: str(v) for k, v in s.items() if k not in _PATH_SETTINGS}
 
 
-def baseline_args(diagnosis_record, cfg, override=None):
+def tuning_only(args):
+    """The allowlisted tuning arguments of an argument list read from a record (an observed command line, an experiment's
+    arm), and the names of the others. A record is evidence, not an instruction: a flag that starts programs, reaches other
+    hosts or writes files is never carried from a file into a launch, whoever wrote the file."""
+    from hotpath import agentgate
+    from hotpath import launch
+    kept, dropped = [], []
+    for flag, value in launch.split_args(args):
+        if flag is None:
+            continue
+        if flag.split("=", 1)[0] in agentgate.ALLOWED_FLAGS:
+            kept.append(flag)
+            if value is not None:
+                kept.append(value)
+        else:
+            dropped.append(flag.split("=", 1)[0])
+    return kept, dropped
+
+
+def baseline_args(diagnosis_record, cfg, override=None, from_verdict=True):
     """Common arguments for the spec, so the baseline arm is the configuration that was diagnosed:
     explicit override > the arm the last verdict found faster > the diagnosed server's observed command line (or server_args in the config when it matches it, since
     the config keeps full paths) > server_args > the diagnosed experiment's arm args > defaults."""
     if override:
         return list(override), "command line"
     d = diagnosis_record or {}
-    if d.get("baseline_from_verdict") and d.get("baseline_args"):
-        # the improve step: the next experiment starts from the configuration the last verdict found faster
-        return list(d["baseline_args"]), d["baseline_from_verdict"]
+    if from_verdict and d.get("baseline_from_verdict") and d.get("baseline_args"):
+        # the manual improve step (propose after an experiment): the next experiment starts from the configuration the last
+        # verdict found faster. `hotpath improve` passes from_verdict=False: it always starts from the user's own launch
+        kept, dropped = tuning_only(d["baseline_args"])
+        return kept, d["baseline_from_verdict"] + (" (not carried from the record: %s)" % ", ".join(sorted(set(dropped))) if dropped else "")
     obs = d.get("observed_launch") or {}
     if obs.get("args_redacted"):
         from hotpath import launch
         if cfg.get("server_args") and _speed_settings(cfg["server_args"]) == _speed_settings(obs["args_redacted"]):
             return list(cfg["server_args"]), "hotpath.local.json server_args (same settings as the observed command line, %s)" % obs.get("source")
         kept, dropped = launch.drop_path_args(obs["args_redacted"])
+        kept, untrusted = tuning_only(kept)
         src = "the diagnosed server's observed command line (%s)" % obs.get("source")
+        if [f for f in untrusted if f not in RUNNER_OWNED_FLAGS]:
+            src += "; not carried from the record into a launch (only tuning settings are): %s" % ", ".join(sorted(set(f for f in untrusted if f not in RUNNER_OWNED_FLAGS)))
         if cfg.get("server_args"):
             src += "; server_args in hotpath.local.json differ from it and were not used"
         if [d for d in dropped if d not in RUNNER_OWNED_FLAGS]:
@@ -57,7 +81,7 @@ def baseline_args(diagnosis_record, cfg, override=None):
         return list(cfg["server_args"]), "hotpath.local.json server_args"
     arm = (diagnosis_record or {}).get("baseline_args")
     if arm:
-        return list(arm), "diagnosed experiment arm"
+        return tuning_only(arm)[0], "diagnosed experiment arm"
     return list(DEFAULT_COMMON_ARGS), "hotpath defaults (adapt --ctx-size and --gpu-layers to your model)"
 
 

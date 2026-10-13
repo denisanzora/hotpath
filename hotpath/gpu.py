@@ -6,9 +6,10 @@ because shared allocations (notably those attributed to dwm.exe) can be counted 
 """
 import json
 import platform
-import shutil
 import subprocess
 import time
+
+from hotpath import safepath
 
 # Peak theoretical memory bandwidth (GB/s), used only for roofline estimates. Keyed by the
 # nvidia-smi product name. Add entries or pass --bandwidth-gbs to override.
@@ -31,15 +32,16 @@ KNOWN_BANDWIDTH_GBS = {
 
 def _run(cmd, timeout=20):
     try:
-        # stdin is never inherited: under the MCP server it is the JSON-RPC pipe, and PowerShell waits for it to close
-        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, stdin=subprocess.DEVNULL)
+        # stdin is never inherited: under the MCP server it is the JSON-RPC pipe, and PowerShell waits for it to close;
+        # the program is resolved outside the working directory (safepath)
+        p = subprocess.run(safepath.resolve(cmd), capture_output=True, text=True, timeout=timeout, stdin=subprocess.DEVNULL)
         return p.returncode, p.stdout, p.stderr
     except (OSError, subprocess.TimeoutExpired) as e:
         return -1, "", str(e)
 
 
 def nvidia_smi_available():
-    return shutil.which("nvidia-smi") is not None
+    return safepath.which("nvidia-smi") is not None
 
 
 def gpu_static():

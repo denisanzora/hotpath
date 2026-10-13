@@ -6,10 +6,10 @@ only on a `keep` verdict: faster, consistent across prompts, identical outputs, 
 failure, and, for flags that trade prompt-cache reuse for overhead, real-traffic evidence that little reuse is lost.
 Anything else is reported and left for the user to decide.
 
-Speed-ups from separate steps are not multiplied together: when two or more changes were adopted, a final paired run
-compares the original launch with the improved one, and that run is the only basis for the cumulative claim. The
-result is a recommended launch line (the user's own, with the adopted changes); hotpath applies nothing to the user's
-server.
+Speed-ups from separate steps are not multiplied together: every adopted change is validated in a final paired run of the
+original launch against the improved one, on a broader workload, run by this process, and that run is the only basis for
+a recommendation. The recommended launch line is exactly the validated configuration (with the user's own model, port and
+logging flags); hotpath applies nothing to the user's server.
 """
 import json
 import time
@@ -175,17 +175,26 @@ def adoptable(row, verdict, arm=None, rec_arms=None, base_name=None, cfg=None):
     operator's checked output policy), no prompt regressing beyond its noise, no spill into system memory, VRAM headroom
     left, no change to what the server accepts (unless an operator's context policy set it) and, for cache flags, a
     production gate that supports it."""
-    faster_differ = row["verdict"].startswith("faster")
-    policy, check = _policy_check(row, cfg)
-    if not row["verdict"].startswith("keep") and not (faster_differ and check and check.get("passed")):
-        return False, "not adopted: the verdict is not keep (%s)" % row["verdict"].split(":")[0], faster_differ
+    v = row["verdict"]
+    faster_differ = v.startswith("faster")
+    if v.startswith("reject"):
+        return False, "not adopted: %s" % v.split(" [")[0], False
+    # a regression or a spill rejects a candidate whatever its verdict says about outputs, so a faster-but-different
+    # option is never offered for review when it is also slower somewhere or does not fit
     creg = class_regression(row)
     if creg:
-        return False, "not adopted: faster overall but the request class %s got slower beyond its own noise" % "; ".join(creg), False
+        return False, "not adopted: rejected because the request class %s got slower beyond its own noise" % "; ".join(creg), False
     reg = prompt_regression(row)
     if reg:
-        return False, "not adopted: faster overall but it regresses on %s beyond those prompts' own noise" % ", ".join(reg), False
+        return False, "not adopted: rejected because it regresses on %s beyond those prompts' own noise" % ", ".join(reg), False
     problem, decide = resource_check(rec_arms, base_name, row.get("arm"))
+    if problem and not decide:
+        return False, "not adopted: %s" % problem, False
+    policy, check = _policy_check(row, cfg)
+    if not v.startswith("keep") and not (faster_differ and check and check.get("passed")):
+        return False, "not adopted: the verdict is not keep (%s)" % v.split(":")[0], faster_differ
+    if v.startswith("keep") and (row.get("fidelity") or {}).get("equivalent") is False:
+        return False, "not adopted: the outputs are not established as identical (%s)" % (row.get("fidelity") or {}).get("class"), True
     if problem:
         return False, "not adopted: %s" % problem, decide
     if (arm or {}).get("request_override"):
@@ -587,6 +596,12 @@ def improve(cfg, start_records, workload, out_dir, runner, max_experiments=3, ma
         _check_saved_state(saved, sdir)
         start_records, workload, initial_args = saved["start_records"], saved["workload"], saved.get("initial_args")
         cache_mode = saved.get("cache_mode", cache_mode)
+        if initial_args:
+            # saved state is evidence of what was started, not an instruction: only tuning settings are carried into launches
+            initial_args, dropped = prop.tuning_only(initial_args)
+            if dropped:
+                log("note: %s/session.json starting arguments not carried into the resumed run (only tuning settings are): %s" % (
+                    session, ", ".join(sorted(set(dropped)))))
         log("resuming %s: %d starting record(s), workload %s" % (session, len(start_records), Path(workload).name))
     elif not dry_run:
         # starting arguments are kept without runner-owned flags (ports, files, keys): those never reach a launch anyway
@@ -656,14 +671,17 @@ def _improve(cfg, start_records, workload, out_dir, runner, max_experiments, max
         records = [brec]
         initial_args = args
     diag = dg.diagnose(records, bandwidth_gbs=bandwidth_gbs, cfg=cfg)
-    args0, source = prop.baseline_args(diag, cfg, initial_args)
+    args0, source = prop.baseline_args(diag, cfg, initial_args, from_verdict=False)
     if baseline:
         source = "%s, measured as the baseline on hotpath's own server" % baseline["source"]
     args0, removed = prop.strip_runner_owned(prop._strip_launch_prefix(args0))
     observed = (diag.get("observed_launch") or {}).get("args_redacted")
-    original = {"args": list(args0), "env": {}}
+    # the environment the user's server is declared to run with (launcher_env in hotpath.local.json): another process's
+    # environment cannot be read, so this is the operator's statement; experiments and the validation start from it
+    env0 = {str(k): str(v) for k, v in (cfg.get("launcher_env") or {}).items() if str(k).startswith(("GGML_", "LLAMA_", "CUDA_"))}
+    original = {"args": list(args0), "env": dict(env0)}
     shape = diag.get("traffic_shape")
-    best = {"args": list(args0), "env": {}, "label": None}
+    best = {"args": list(args0), "env": dict(env0), "label": None}
     cum = {"args": {}, "args_remove": set(), "env": {}, "env_remove": set()}
     steps, attempted, adopted_steps = [], set(), []
     budget = Budget(max_experiments, max_minutes)
@@ -768,8 +786,10 @@ def _improve(cfg, start_records, workload, out_dir, runner, max_experiments, max
                 row, ok, why = r, True, judged[r["arm"]][1]
                 break
         if not row and rows:
-            row = rows[0]
-            ok, why = judged[row["arm"]][0], judged[row["arm"]][1]
+            # the best non-control arm (a control arm only explains another arm's effect; it is never the change under test)
+            row = next((r for r in rows if not (arm_of.get(r["arm"]) or {}).get("control")), None)
+            if row is not None:
+                ok, why = False, judged[row["arm"]][1]
         # faster candidates that only the user can accept: a capacity change, outputs that differ, no VRAM headroom
         for r in rows:
             if (r is row and ok) or (arm_of.get(r["arm"]) or {}).get("control"):
@@ -788,7 +808,10 @@ def _improve(cfg, start_records, workload, out_dir, runner, max_experiments, max
                          "other_arms": [{"arm": r["arm"], "verdict": r["verdict"].split(":")[0],
                                          "why": ("control arm (%s): wall ratio %s, outputs %s" % (arm_of[r["arm"]]["control"], ((r.get("metrics") or {}).get("wall_ms") or {}).get("ratio"),
                                                                                                   (r.get("fidelity") or {}).get("class")))
-                                         if (arm_of.get(r["arm"]) or {}).get("control") else judged[r["arm"]][1]} for r in rows if r is not row]})
+                                         if (arm_of.get(r["arm"]) or {}).get("control") else judged[r["arm"]][1],
+                                         "control": bool((arm_of.get(r["arm"]) or {}).get("control")), "needs_decision": judged[r["arm"]][2],
+                                         "change": _change_text(arm_of.get(r["arm"]) or {}), "fidelity": (r.get("fidelity") or {}).get("class"),
+                                         "wall": ((r.get("metrics") or {}).get("wall_ms") or {}).get("ratio")} for r in rows if r is not row]})
             if ok:
                 arm = arm_of[row["arm"]]
                 best["args"], best["env"] = materialize(spec["common_args"], spec.get("env"), arm)
@@ -827,6 +850,7 @@ def _improve(cfg, start_records, workload, out_dir, runner, max_experiments, max
         ch = _cum_change([st for st in adopted_steps if st["experiment"] in report["validated_steps"]])
         cum = {"args": dict(ch["args_override"]), "args_remove": set(ch["args_remove"]), "env": dict(ch["env_override"]), "env_remove": set(ch["env_remove"])}
     plumbing, not_measured = left_out_of_measurement(observed, args0)
+    _ = plumbing
     report["starting_point"]["left_out"] = {"plumbing": plumbing, "not_measured": not_measured}
     if validated and not_measured:
         # the validated run did not include these: applying its changes to the full launch line is not what was measured
@@ -837,8 +861,11 @@ def _improve(cfg, start_records, workload, out_dir, runner, max_experiments, max
         report["decisions"].append({"step": "validation", "arm": "validated without %s" % ", ".join(not_measured), "change": _change_text(_cum_change(adopted_steps)),
                                     "verdict": report["result"]["verdict"], "needs": "the measurement left out %s; check the change with them loaded" % ", ".join(not_measured),
                                     "fidelity": None, "measured": report["result"].get("measured"), "decomposition": None})
-    report["recommended"] = recommended_launch(observed or args0, cum if validated else {"args": {}, "args_remove": set(), "env": {}, "env_remove": set()},
-                                               bool(observed), validated=validated, adopted=bool(adopted_steps))
+    differs = launch_diff(observed, args0) if observed else []
+    if differs:
+        report["starting_point"]["differs_from_observed"] = differs
+    report["recommended"] = recommended_launch(observed, original, cum if validated else {"args": {}, "args_remove": set(), "env": {}, "env_remove": set()},
+                                               validated=validated, adopted=bool(adopted_steps), plumbing=plumbing)
     if not dry_run and budget.experiments:
         validate_decisions(cfg, original, report, records, port, rounds, repetitions, warmup, n_predict, budget, sdir, session, runner, log, shape, rq)
     report["remaining"] = [{"id": f["id"], "title": f.get("title"), "confidence": f.get("confidence"), "next": (f.get("measured") or {}).get("how")}
@@ -855,6 +882,22 @@ def _improve(cfg, start_records, workload, out_dir, runner, max_experiments, max
 
 
 OUTCOME_ORDER = ("recommended", "needs_review", "rejected", "inconclusive")
+_REJECT_MARKERS = ("rejected because", "regress", "spills", "launch failures", "rejected", "validity dropped", "do not apply", "would cost more")
+_INCONCLUSIVE_MARKERS = ("insufficient evidence", "applicability unknown", "budget", "no comparison", "dry run")
+
+
+def outcome_bucket(verdict, why, needs_decision):
+    """Which outcome a measured candidate that was not recommended belongs to, from its verdict and the adoption check's
+    reason: a trade-off only the user can accept is needs_review; a regression, spill, failure or evidence against it is
+    rejected; too little evidence is inconclusive."""
+    v, w = (verdict or "").lower(), (why or "").lower()
+    if v.startswith("reject") or any(m in w for m in _REJECT_MARKERS):
+        return "rejected"
+    if any(m in w for m in _INCONCLUSIVE_MARKERS):
+        return "inconclusive"
+    if needs_decision or v.startswith("faster"):
+        return "needs_review"
+    return "inconclusive"
 OUTCOME_LABEL = {"recommended": "Recommended", "needs_review": "Needs review", "rejected": "Rejected", "inconclusive": "Inconclusive"}
 
 
@@ -878,35 +921,35 @@ def outcomes(report):
         out["needs_review"].append({"what": "%s%s" % ("step %s " % d["step"] if isinstance(d.get("step"), int) else "", d.get("arm")), "change": d.get("change"),
                                     "why": d.get("needs"), "fidelity": d.get("fidelity"), "wall": ((d.get("measured") or {}).get("wall_ms") or {}).get("ratio"),
                                     "validated_on_broad_workload": bool(d.get("validation"))})
+    first_validation = (report.get("validations") or [{}])[0]
     for st in report.get("steps") or []:
         what = "step %d %s" % (st["step"], st.get("candidate") or st["finding"])
         item = {"what": what, "change": _change_text(st["change"]) if st.get("change") else None, "why": st.get("why"), "fidelity": st.get("fidelity"),
                 "wall": (((st.get("measured") or {}).get("wall_ms") or {}).get("ratio"))}
         if st.get("adopted"):
-            if res.get("validated") and (not validated_steps or st["experiment"] in validated_steps):
+            if res.get("validated") and st["experiment"] in validated_steps:
                 out["recommended"].append(dict(item, why="validated: %s" % (res.get("verdict") or "").split(" [")[0]))
-            elif (st.get("step"), st.get("candidate")) in decided or any(d.get("step") == "validation" for d in report.get("decisions") or []):
-                continue                     # its fate is the validation decision listed under needs review
+            elif res.get("validated"):
+                out["inconclusive"].append(dict(item, why="kept by its step, but not part of the validated set (it did not pass alone or together)"))
+            elif any(d.get("step") == "validation" for d in report.get("decisions") or []):
+                pass                         # its fate is the validation decision listed under needs review
             elif "budget" in (res.get("verdict") or "") or res.get("not_validated"):
                 out["inconclusive"].append(dict(item, why="kept by its step, not validated: %s" % (res.get("verdict") or "")))
             else:
-                v = (res.get("verdict") or "").lower()
-                if any(w in v for w in ("regress", "reject", "slower")):
-                    bucket = "rejected"
-                elif "differ" in v or "near-tie" in v:
-                    bucket = "needs_review"
-                else:
-                    bucket = "inconclusive"
-                out[bucket].append(dict(item, why="kept by its step, but the validation did not pass: %s" % (res.get("verdict") or "")))
-            continue
-        if (st.get("step"), st.get("candidate")) in decided:
-            continue
-        verdict = (st.get("verdict") or "").lower()
-        why = (st.get("why") or "").lower()
-        if verdict.startswith("reject") or "regress" in why or "spills" in why or "would cost more" in why:
-            out["rejected"].append(item)
-        else:
-            out["inconclusive"].append(item)
+                b = first_validation.get("bucket") or "inconclusive"
+                out["recommended" if b == "recommended" else b].append(dict(item, why="kept by its step, but the validation did not pass: %s" % (res.get("verdict") or "")))
+        elif (st.get("step"), st.get("candidate")) not in decided and st.get("candidate"):
+            out[outcome_bucket(st.get("verdict"), st.get("why"), False)].append(item)
+        # every other arm the step measured, each in its own outcome (controls only explain another arm)
+        for o in st.get("other_arms") or []:
+            if o.get("control") or (st.get("step"), o["arm"]) in decided:
+                continue
+            why = o.get("why") or ""
+            if why.startswith("adopted"):
+                # passed the checks, but another arm of the same step was faster and was taken instead; never validated
+                why = "passed this step's checks, but %s was faster in the same step and was taken instead; not validated" % (st.get("candidate") or "another arm")
+            out[outcome_bucket(o.get("verdict"), why, o.get("needs_decision"))].append(
+                {"what": "step %d %s" % (st["step"], o["arm"]), "change": o.get("change"), "why": why, "fidelity": o.get("fidelity"), "wall": o.get("wall")})
     return out
 
 
@@ -946,7 +989,7 @@ def _early_report(session, out_dir, args, source, workload, max_experiments, max
     rec = new_record("improvement", "hypothesis", session=session, starting_point={"args": args, "source": source}, workload=Path(workload).name,
                      budget={"max_experiments": max_experiments, "max_minutes": max_minutes}, steps=[], stopped_because=stopped, next_step=next_step,
                      result={"verdict": "dry run: nothing measured" if next_step else "nothing measured", "measured_by": None},
-                     recommended=recommended_launch(args, {"args": {}, "args_remove": set(), "env": {}, "env_remove": set()}, False),
+                     recommended=recommended_launch(None, {"args": args, "env": {}}, {"args": {}, "args_remove": set(), "env": {}, "env_remove": set()}),
                      skipped_findings=[], remaining=[], experiments_run=0, minutes_used=0.0)
     path = write_record(rec, out_dir, "improvement")
     Path(str(path)[:-5] + ".md").write_text(improvement_markdown(rec), encoding="utf-8")
@@ -1118,7 +1161,9 @@ def _result(cfg, original, cum, adopted_steps, records, workload, port, rounds, 
         tried.append(out)
         if out.get("validated") or out.get("stop"):
             break
-        if out.get("row") and (out["row"].get("verdict") or "").startswith(("faster", "keep")):
+        if out.get("row") and out.get("bucket") == "needs_review":
+            # a validation that failed on outputs, capacity or headroom is the user's decision; one that regressed, spilled or was
+            # too small to judge is not offered as an option
             report["decisions"].append({"step": "validation", "arm": label, "change": _change_text(_cum_change(steps_)), "verdict": out["row"]["verdict"],
                                         "needs": out["why"].replace("not adopted: ", ""), "fidelity": (out["row"].get("fidelity") or {}).get("class"),
                                         "measured": _metric_line(out["row"]), "decomposition": None})
@@ -1236,7 +1281,7 @@ def _validate(cfg, original, steps_, records, port, rounds, repetitions, warmup,
     row = (v or {}).get("arms", [None])[0] if v else None
     if not row:
         return dict(base, measured_by=name, verdict="not validated: the validation run produced no comparison", why="not adopted: no comparison")
-    ok, why, _ = adoptable(row, v, improved, rec.get("arms"), "original", cfg)
+    ok, why, decide = adoptable(row, v, improved, rec.get("arms"), "original", cfg)
     ident = validation_identity(rec, cfg)
     if ok and ident:
         ok, why = False, "not adopted: %s" % ident
@@ -1247,6 +1292,7 @@ def _validate(cfg, original, steps_, records, port, rounds, repetitions, warmup,
             "fidelity": row.get("fidelity"), "passed": ok, "why": why, "classes": row.get("classes"), "fields": row.get("fields"),
             "request_errors": row.get("request_errors")}
     return dict(base, measured_by=name, row=row, why=why, verdict=row["verdict"], measured=_metric_line(row), validated=ok, confirmation=conf,
+                bucket="recommended" if ok else outcome_bucket(row["verdict"], why, decide),
                 basis="one paired run of your original launch against the launch with %s, on a broader workload (%s)" % (
                     ", ".join(st["finding"] for st in steps_), vbasis))
 
@@ -1270,23 +1316,59 @@ def validation_identity(rec, cfg):
     return None
 
 
-def recommended_launch(user_args, cum, observed, validated=True, adopted=False):
-    """The user's own launch line with the adopted changes, plus the environment changes; and the line to go back to.
-    Flags the user set that the loop did not change (port, host, log file, model) stay as they were."""
-    revert = [str(a) for a in user_args]
-    args = [str(a) for a in user_args]
-    changes = []
+_PLUMBING_SETTINGS = ("model", "host", "port", "log_file", "hf_repo", "alias")
+
+
+def _setting_map(argv):
+    out = {}
+    for flag, value in launch.split_args(argv or []):
+        if flag is None:
+            continue
+        key = launch._SPELLING.get(flag, flag)
+        if key in _PLUMBING_SETTINGS or flag in PLUMBING_FLAGS:
+            continue
+        out[key] = (flag, value)
+    return out
+
+
+def launch_diff(before, after):
+    """Settings that differ between two launch lines (plumbing such as model, host, port and log file aside):
+    [{flag, from, to}]."""
+    b, a = _setting_map(before), _setting_map(after)
+    out = []
+    for key in sorted(set(b) | set(a)):
+        fb, vb = b.get(key, (None, None))
+        fa, va = a.get(key, (None, None))
+        if key not in b:
+            out.append({"flag": fa, "from": "not set (build default)", "to": va if va is not None else "set"})
+        elif key not in a:
+            out.append({"flag": fb, "from": vb if vb is not None else "set", "to": "removed"})
+        elif str(vb) != str(va):
+            out.append({"flag": fa, "from": vb, "to": va})
+    return out
+
+
+def recommended_launch(observed, original, cum, validated=True, adopted=False, plumbing=()):
+    """The launch line to apply and the one to go back to. The line to apply is exactly the configuration the validation
+    measured (the original arm with the validated changes), with the user's own plumbing (model, host, port, log file,
+    ...) taken from their observed command line; the revert line is their observed command line (or, when no server was
+    observed, the configuration the run started from). `changes` lists every difference between the two."""
+    start = [str(a) for a in original["args"]]
+    revert = [str(a) for a in (observed or start)]
+    plumb = []
+    if observed:
+        for flag, value in launch.split_args(observed):
+            if flag is not None and flag in set(plumbing):
+                plumb += [flag] + ([value] if value is not None else [])
+    measured = list(start)
     for flag, value in cum["args"].items():
-        name = launch._SPELLING.get(flag)
-        before = launch.get(args, name) if name else None
-        args = launch.set_arg(args, flag, value)
-        changes.append({"flag": flag, "from": before if before is not None else "not set (build default)", "to": str(value)})
+        measured = launch.set_arg(measured, flag, value)
     for flag in sorted(cum["args_remove"]):
-        name = launch._SPELLING.get(flag)
-        before = launch.get(args, name) if name else None
-        args = launch.remove_arg(args, flag)
-        changes.append({"flag": flag, "from": before, "to": "removed"})
+        measured = launch.remove_arg(measured, flag)
+    args = plumb + measured if (cum["args"] or cum["args_remove"] or cum["env"] or cum["env_remove"]) else revert
+    changes = launch_diff(revert, args) if args is not revert else []
     env = [{"variable": k, "to": v} for k, v in sorted(cum["env"].items())] + [{"variable": k, "to": "unset"} for k in sorted(cum["env_remove"])]
+    observed = bool(observed)
     if adopted and not validated:
         note = ("No change is recommended: the adopted changes did not pass the final validation, so your original launch stays (shown below). "
                 "hotpath did not change your server.")
@@ -1296,7 +1378,8 @@ def recommended_launch(user_args, cum, observed, validated=True, adopted=False):
     else:
         note = "No change is recommended; your original launch stays. hotpath did not change your server."
     return {"args": args, "changes": changes, "env": env, "revert_args": revert,
-            "basis": "your server's observed command line (paths shown as file names)" if observed else "the arguments the loop started from",
+            "basis": ("the configuration the validation measured, with your server's own model, port and logging flags (paths shown as file names)"
+                      if observed else "the configuration the validation measured"),
             "note": note}
 
 
@@ -1345,6 +1428,9 @@ def improvement_markdown(rec):
         L += ["Next useful measurement:"] + ["- %s" % x for x in rec["next_measurement"]] + [""]
     L += ["## What was found", "",
           "- Starting configuration: `%s` (%s)" % (" ".join(sp["args"]) or "(no arguments)", sp["source"])]
+    if sp.get("differs_from_observed"):
+        L.append("  - differs from your server's observed launch in: %s (the run measured and validated the configuration above; the apply "
+                 "line below is that configuration)" % ", ".join("%s %s -> %s" % (c["flag"], c["from"], c["to"]) for c in sp["differs_from_observed"]))
     lo = sp.get("left_out") or {}
     if lo.get("not_measured"):
         L.append("  - not in the measured launch (hotpath cannot run them; results do not cover them): %s" % ", ".join(lo["not_measured"]))

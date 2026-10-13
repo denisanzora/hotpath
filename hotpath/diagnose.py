@@ -1136,22 +1136,28 @@ def request_cache_state(r):
 
 
 def _verified(reqs, state):
-    """Only the requests whose own state matches the comparison basis; the rest are excluded, not averaged in."""
-    keep = [r for r in reqs if request_cache_state(r) == state]
+    """Only the requests whose own state matches the comparison basis; the rest are excluded, not averaged in. For a warm
+    comparison every request with a known state counts (an application sequence has cold requests too, and dropping the
+    ones a change made cold would hide its cost); whether the arms reused alike is checked per prompt."""
+    if state == "warm":
+        keep = [r for r in reqs if request_cache_state(r) in ("warm", "cold")]
+    else:
+        keep = [r for r in reqs if request_cache_state(r) == state]
     return keep, len(reqs) - len(keep)
 
 
 def prompt_reuse_differs(base_reqs, cand_reqs, tolerance=0.10):
     """Warm comparisons: arms must reuse about the same number of cached tokens per prompt, or the difference in reuse,
-    not the change under test, drives prefill and wall time. Returns the prompt ids whose median cache_n differs."""
+    not the change under test, drives prefill and wall time. Every request with a known cache state counts (a request
+    that went cold reused 0 tokens), so a prompt that lost all its reuse in one arm differs. Returns those prompt ids."""
     def med(reqs):
         out = {}
         for r in reqs:
-            if request_cache_state(r) == "warm":
+            if request_cache_state(r) in ("warm", "cold"):
                 out.setdefault(r.get("prompt_id"), []).append(float(r["cache_n"]))
         return {k: percentiles(v)["median"] for k, v in out.items()}
     a, b = med(base_reqs), med(cand_reqs)
-    return sorted(p for p in a if p in b and a[p] and abs(b[p] - a[p]) / a[p] > tolerance)
+    return sorted(p for p in a if p in b and (abs(b[p] - a[p]) / a[p] > tolerance if a[p] else b[p] > 0))
 
 
 def arm_cache_evidence(arm):
@@ -1307,16 +1313,23 @@ def experiment_verdict(rec):
         small = n_prompts < 3 or n_rounds < 3
         scope = "on this machine and workload (%d prompts x %d rounds%s)" % (n_prompts, n_rounds, "; preliminary" if small else "")
         unstable_c = sorted(str(pid) for pid, e in oe.items() if full in e and pid not in sampled and not e[full].get("stable_within_arm", True))
+        unstable_b = sorted(str(pid) for pid, e in oe.items() if full in e and pid not in sampled and not e.get("stable_within_reference", True))
         if unstable_c:
             row["outputs"]["candidate_unstable_prompts"] = unstable_c
-        all_identical = row["outputs"]["prompts_compared"] > 0 and row["outputs"]["identical"] == row["outputs"]["prompts_compared"] and not unstable_c
-        new_errors = row["request_errors"]["candidate"]["n"] - row["request_errors"]["baseline"]["n"]
+        if unstable_b:
+            row["outputs"]["baseline_unstable_prompts"] = unstable_b
+        # identity means something only when both arms reproduce their own outputs
+        all_identical = row["outputs"]["prompts_compared"] > 0 and row["outputs"]["identical"] == row["outputs"]["prompts_compared"] and \
+            not unstable_c and not unstable_b
+        rejected_b = {r.get("prompt_id") for r in all_b if r.get("error")}
+        newly_rejected = sorted({r.get("prompt_id") for r in all_c if r.get("error")} - rejected_b)
+        new_errors = len([r for r in all_c if r.get("error") and r.get("prompt_id") in newly_rejected])
         if row["failures"]:
             verdict = "reject: launch failures in this arm"
         elif new_errors > 0:
             e = row["request_errors"]["candidate"]
-            verdict = "reject: the server rejected %d of %d requests in this arm (%s) that the baseline served: this configuration cannot serve your requests" % (
-                e["n"], len(all_c), ", ".join("%s x%d" % kv for kv in sorted(e["types"].items())))
+            verdict = "reject: the server rejected %d of %d requests in this arm (%s; requests %s) that the baseline served: this configuration cannot serve your requests" % (
+                new_errors, len(all_c), ", ".join("%s x%d" % kv for kv in sorted(e["types"].items())), ", ".join(str(p) for p in newly_rejected[:5]))
         elif row.get("validity", {}).get("dropped"):
             key = row["validity"]["decided_on"]
             verdict = "reject: output validity dropped on %s (%s/%s -> %s/%s): a decision-level difference, whatever the speed" % (
@@ -1326,6 +1339,9 @@ def experiment_verdict(rec):
             verdict = "inconclusive %s: %s; only decode and validity are comparable here" % (scope, comp["detail"])
         elif w.get("call") == "improvement" and all_identical:
             verdict = "keep %s: %.1f%% wall improvement, same direction on %d/%d prompts, identical outputs (%s)" % (scope, 100 * (1 - w["ratio"]), w["consistent_direction"], w["prompts"], basis)
+        elif w.get("call") == "improvement" and (unstable_b or unstable_c):
+            verdict = "faster %s, but %s own repeated outputs differ on %s, so output identity cannot be judged" % (
+                scope, "the baseline's" if unstable_b else "the candidate's", ", ".join((unstable_b or unstable_c)[:5]))
         elif w.get("call") == "improvement" and not row["outputs"]["prompts_compared"] and row["outputs"].get("sampled_not_compared"):
             verdict = "faster %s, but every compared request samples (temperature above 0), so output identity cannot be judged: validity and decision fields are the evidence" % scope
         elif w.get("call") == "improvement":
@@ -1410,9 +1426,9 @@ def class_metrics(metrics, base_reqs):
 
 
 def field_agreement(base_reqs, cand_reqs, decision_fields=None):
-    """Structured outputs compared field by field: per schema property, on how many requests the candidate produced the
-    same value as the baseline (from value hashes; no output text), and whether the baseline's own repetitions agreed with
-    each other. Decision fields are the operator's `decision_fields` when configured, else the schema's enum, boolean and
+    """Structured outputs compared field by field: per schema property, on how many requests every repetition of the
+    candidate produced the value every repetition of the baseline produced (from keyed value hashes; no output text), and
+    whether the baseline's own repetitions agreed with each other. Decision fields are the operator's `decision_fields` when configured, else the schema's enum, boolean and
     number fields, labelled as not confirmed to be what the application decides on."""
     def by_prompt(reqs):
         out = {}
@@ -1425,13 +1441,18 @@ def field_agreement(base_reqs, cand_reqs, decision_fields=None):
     if not pids:
         return None
     by_field = {}
+
+    def same(pid, k):
+        # every repetition of the baseline gives one value, and every repetition of the candidate gives that value
+        ref = b[pid][0]["fields"].get(k)
+        return all(x["fields"].get(k) == ref for x in b[pid]) and all(x["fields"].get(k) == ref for x in c[pid])
     for pid in pids:
-        bf, cf = b[pid][0]["fields"], c[pid][0]["fields"]
+        bf = b[pid][0]["fields"]
         kinds = b[pid][0].get("field_kinds") or {}
-        for k, h in bf.items():
+        for k in bf:
             e = by_field.setdefault(k, {"kind": kinds.get(k), "compared": 0, "agree": 0, "baseline_unstable": 0})
             e["compared"] += 1
-            e["agree"] += int(cf.get(k) == h)
+            e["agree"] += int(same(pid, k))
             e["baseline_unstable"] += int(len({x["fields"].get(k) for x in b[pid]}) > 1)
     cls_of = {r.get("prompt_id"): r.get("class") for r in base_reqs}
     if isinstance(decision_fields, dict):
@@ -1445,7 +1466,7 @@ def field_agreement(base_reqs, cand_reqs, decision_fields=None):
         chosen = {pid: auto for pid in pids}
         basis = "schema fields of kind enum/boolean/number, not confirmed as the fields your application decides on (set decision_fields)"
     judged = [pid for pid in pids if chosen[pid]]
-    same = [pid for pid in judged if all(c[pid][0]["fields"].get(f) == b[pid][0]["fields"].get(f) for f in chosen[pid])]
+    same = [pid for pid in judged if all(same(pid, f) for f in chosen[pid])]
     return {"requests": len(pids), "by_field": by_field, "decision_basis": basis,
             "decision_fields": sorted({f for pid in judged for f in chosen[pid]}),
             "decisions_judged": len(judged), "decisions_equal": len(same),

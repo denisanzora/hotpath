@@ -6,9 +6,10 @@ exactly what to install and how the recipe would run, so the path stays concrete
 """
 import glob
 import os
-import shutil
 import subprocess
 from pathlib import Path
+
+from hotpath import safepath
 
 
 def _search(exe, patterns):
@@ -17,7 +18,7 @@ def _search(exe, patterns):
     The install-location patterns are best effort. Only the Windows layout has been exercised;
     on Linux, put the tool on PATH if it is not found.
     """
-    p = shutil.which(exe)
+    p = safepath.which(exe)
     if p:
         return Path(p)
     suffix = ".exe" if os.name == "nt" else ""
@@ -101,7 +102,7 @@ class TestBackendOpsAdapter(ToolAdapter):
             for cand in self.build_dir.glob("**/test-backend-ops*"):
                 if cand.is_file() and cand.suffix in ("", ".exe"):
                     return cand
-        p = shutil.which("test-backend-ops")
+        p = safepath.which("test-backend-ops")
         return Path(p) if p else None
 
     def recipe(self, mode, op_filter, backend="CUDA0", params_regex=None):
@@ -124,7 +125,7 @@ class LlamaBenchAdapter(ToolAdapter):
             for name in ("llama-bench.exe", "llama-bench"):
                 if (self.bin_dir / name).is_file():
                     return self.bin_dir / name
-        p = shutil.which("llama-bench")
+        p = safepath.which("llama-bench")
         return Path(p) if p else None
 
     def recipe(self, model, ngl=99, ub=512, pp=512, tg=128, reps=5):
@@ -140,7 +141,7 @@ def env_with_path(path_prepend=None):
 
 
 def run_recipe(cmd, timeout=3600, path_prepend=None):
-    p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, env=env_with_path(path_prepend), stdin=subprocess.DEVNULL)
+    p = subprocess.run(safepath.resolve(cmd), capture_output=True, text=True, timeout=timeout, env=env_with_path(path_prepend), stdin=subprocess.DEVNULL)
     return {"cmd": [str(c) for c in cmd], "returncode": p.returncode, "stdout": p.stdout[-20000:], "stderr": p.stderr[-5000:]}
 
 

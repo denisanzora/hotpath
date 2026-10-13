@@ -177,6 +177,9 @@ def _port_free(port):
 
 
 def _launch(cmd, env, log_path):
+    from hotpath import safepath
+    if not Path(cmd[0]).is_absolute() and not Path(cmd[0]).parent.parts:
+        cmd = safepath.resolve(cmd)            # a bare runtime_binary name: from PATH, never the working directory
     log = open(log_path, "ab")
     kw = {}
     if os.name == "nt":
@@ -361,9 +364,8 @@ def probe_requests(base, workload, k, timed_requests, request_override=None):
     `top_logprobs`, completion: `n_probs`) and the prompt cache off. Returns (private probes with tokens, for comparison in
     memory only; public per-request facts for the record: probe length, whether it reproduced the timed output). Requests
     that sample (temperature above 0) are not probed: identity is not expected for them."""
-    import hashlib
     from hotpath import fidelity
-    from hotpath.measure import _content, apply_request_override
+    from hotpath.measure import _content, apply_request_override, output_digest
     from hotpath.workload import is_sampled
     private, public = {}, {}
     for it in workload["items"]:
@@ -384,7 +386,7 @@ def probe_requests(base, workload, k, timed_requests, request_override=None):
             continue
         pr = fidelity.probe_from_chat_response(resp) if chat else fidelity.probe_from_response(resp)
         content, _stop = _content(resp)
-        h = hashlib.sha256(content.encode("utf-8")).hexdigest()[:16]
+        h = output_digest(content, workload)
         timed = [r.get("output_sha256") for r in timed_requests if r.get("prompt_id") == it["id"] and r.get("output_sha256")]
         public[it["id"]] = {"k": pr["k"], "n_tokens": len(pr["tokens"]), "matches_timed": (h == timed[0]) if timed else None}
         private[it["id"]] = pr

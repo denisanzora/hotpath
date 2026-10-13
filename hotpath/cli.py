@@ -389,6 +389,8 @@ def _last_observation(out, server_url, max_age_h=24):
             age = _dt.datetime.now(_dt.timezone.utc) - _dt.datetime.fromisoformat(rec["created"])
         except (KeyError, ValueError, TypeError):
             continue
+        if age.total_seconds() < -300:
+            continue                       # dated in the future: not an observation hotpath made
         return (p, rec) if age.total_seconds() < max_age_h * 3600 else None
     return None
 

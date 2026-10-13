@@ -202,6 +202,12 @@ def output_fields(content, schema, key=None):
     return fields, kinds
 
 
+def output_digest(content, workload):
+    """The identity hash of an application output: keyed with the run's secret (see _field_key), so outputs compare between
+    the arms of one run while a short output (an enum, a score) cannot be recovered by hashing likely candidates."""
+    return hmac.new(_field_key(workload), content.encode("utf-8"), hashlib.sha256).hexdigest()[:16]
+
+
 def _field_key(workload):
     """The per-run key of output field hashes: set by the experiment runner for all arms of one run (in memory only)."""
     if not workload.get("_field_key"):
@@ -299,12 +305,12 @@ def run_requests_workload(base, workload, repetitions=3, warmup=1, request_overr
             t = resp.get("timings", {})
             content, stop = _content(resp)
             rec = {"phase": phase, "rep": rep, "prompt_id": it["id"], "prompt_sha256": it["sha256"], "endpoint": it["endpoint"],
-                   "class": request_class(it), "sampled": is_sampled(body),
+                   "class": request_class(it), "sampled": is_sampled(body), "output_hash": "keyed per run",
                    "prompt_n": t.get("prompt_n"), "cache_n": t.get("cache_n"), "cache_state": cache_state(t),
                    "prompt_ms": t.get("prompt_ms"), "prompt_tps": t.get("prompt_per_second"),
                    "predicted_n": t.get("predicted_n"), "predicted_ms": t.get("predicted_ms"), "predicted_tps": t.get("predicted_per_second"),
                    "wall_ms": resp.get("_wall_ms"), "stop_type": stop, "tokens": None,
-                   "output_sha256": hashlib.sha256(content.encode("utf-8")).hexdigest()[:16], "output_chars": len(content),
+                   "output_sha256": output_digest(content, workload), "output_chars": len(content),
                    "output_text": content if store_outputs else None, "gpu_before": before, "gpu_after": after}
             # validity is judged against the application's own request (the workload item), not the arm's edited body:
             # an arm that drops the schema is still measured on whether its output satisfies what the application requires

@@ -21,7 +21,6 @@ import json
 import os
 import re
 import shlex
-import shutil
 import struct
 import subprocess
 import sys
@@ -34,6 +33,7 @@ from urllib.parse import urlparse
 from hotpath import gguf as gguf_mod
 from hotpath import gpu as gpu_mod
 from hotpath import launch
+from hotpath import safepath
 
 SERVER_NAMES = ("llama-server",)
 SIBLING_TOOLS = ("llama-bench", "llama-perplexity", "test-backend-ops", "llama-cli", "llama-fit-params")
@@ -95,7 +95,7 @@ def _win_argv(cmdline):
 def _run(cmd, timeout=20, env=None):
     try:
         # stdin is never inherited: under the MCP server it is the JSON-RPC pipe, and PowerShell waits for it to close
-        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, env=env, errors="replace", stdin=subprocess.DEVNULL)
+        p = subprocess.run(safepath.resolve(cmd), capture_output=True, text=True, timeout=timeout, env=env, errors="replace", stdin=subprocess.DEVNULL)
         return p.returncode, p.stdout or "", p.stderr or ""
     except (OSError, subprocess.TimeoutExpired) as e:
         return None, "", str(e)
@@ -454,7 +454,7 @@ def windows_dependency_check(bin_dir, path_prepend=None):
 
 def linux_dependency_check(binary):
     """`ldd` on the binary and its ggml CUDA library: shared libraries reported as not found (untested outside Windows)."""
-    if not shutil.which("ldd"):
+    if not safepath.which("ldd"):
         return {"note": "ldd not available; shared-library dependencies not checked"}
     targets = [Path(binary)] + [p for p in Path(binary).parent.glob("libggml-cuda*.so*")]
     missing = set()
@@ -726,7 +726,7 @@ def discover(cfg=None, roots=(), run_found=True, run_in_roots=True, max_depth=MA
     if cfg.get("runtime_binary"):
         cands.append((cfg["runtime_binary"], "hotpath.local.json runtime_binary"))
     for n in names:
-        w = shutil.which(n)
+        w = safepath.which(n)
         if w:
             cands.append((w, "PATH"))
     log.search("llama-server on PATH", "PATH", sum(1 for _, o in cands if o == "PATH"))
