@@ -222,7 +222,39 @@ def _metric_line(row):
     if row.get("vram_delta_mib") is not None:
         out["vram_delta_mib"] = row["vram_delta_mib"]
     out["outputs"] = row.get("outputs")
+    fa = row.get("fields") or {}
+    if fa.get("decisions_judged"):
+        out["decisions"] = {"equal": fa["decisions_equal"], "judged": fa["decisions_judged"], "basis": fa.get("decision_basis"),
+                            "differing_fields": sorted(k for k, e in (fa.get("by_field") or {}).items()
+                                                       if e.get("kind") in ("categorical", "number") and e["agree"] < e["compared"]),
+                            "other_fields_differing": sorted(k for k, e in (fa.get("by_field") or {}).items()
+                                                             if e.get("kind") not in ("categorical", "number") and e["agree"] < e["compared"])}
+    if row.get("classes"):
+        out["classes"] = {c: (m.get("wall_ms") or {}).get("ratio") for c, m in row["classes"].items()}
     return out
+
+
+def _evidence_lines(measured, indent="   "):
+    """The application-level evidence of a measurement, for the report: decision fields and request classes."""
+    L = []
+    dec = (measured or {}).get("decisions")
+    if dec:
+        L.append("%s- decision fields: equal on %d of %d requests%s%s" % (
+            indent, dec["equal"], dec["judged"], "; differing: %s" % ", ".join(dec["differing_fields"]) if dec.get("differing_fields") else "",
+            " (%s)" % ("configured decision_fields" if (dec.get("basis") or "").startswith("configured") else
+                       "enum/boolean/number fields of the schema, not confirmed as what your application decides on")))
+        if dec.get("other_fields_differing"):
+            L.append("%s- free-text or structured fields that differ: %s" % (indent, ", ".join(dec["other_fields_differing"])))
+    if (measured or {}).get("classes"):
+        L.append("%s- wall-time ratio per request class: %s" % (indent, ", ".join("%s %s" % kv for kv in sorted(measured["classes"].items()))))
+    return L
+
+
+def _settings_note(change):
+    """An arm that changes several settings at once says so: its effect is not attributable to one of them."""
+    n = len((change or {}).get("args_override") or {}) + len((change or {}).get("args_remove") or []) + \
+        len((change or {}).get("env_override") or {}) + len((change or {}).get("env_remove") or [])
+    return "changes %d settings together, so its effect (and any output difference) is not attributable to one of them" % n if n > 1 else None
 
 
 def _measured_load_s(records):
@@ -1365,8 +1397,11 @@ def improvement_markdown(rec):
             L.append("   - %s: %s" % ("kept" if st["adopted"] else "not kept", why))
             if st.get("fidelity"):
                 L.append("   - outputs: %s" % st["fidelity"])
+            L += _evidence_lines(st.get("measured"))
             if st.get("change"):
                 L.append("   - change: %s" % _change_text(st["change"]))
+                if _settings_note(st["change"]):
+                    L.append("   - note: this %s" % _settings_note(st["change"]))
             for o in st.get("other_arms") or []:
                 L.append("   - %s %s: %s" % ("" if o["why"].startswith("control arm") else "other arm", o["arm"], o["why"].replace("not adopted: ", "")))
         L.append("")
@@ -1380,6 +1415,9 @@ def improvement_markdown(rec):
                                                                   _fmt(w.get("candidate"), "wall_ms"), same,
                                                                   " (%s)" % d["fidelity"] if d.get("fidelity") else ""))
             L.append("  - trade-off: %s" % d["needs"])
+            L += _evidence_lines(d.get("measured"), indent="  ")
+            if _settings_note(d.get("change_spec")):
+                L.append("  - note: this option %s" % _settings_note(d["change_spec"]))
             if d.get("decomposition"):
                 L.append("  - %s" % d["decomposition"]["reading"])
             if d.get("validation"):
