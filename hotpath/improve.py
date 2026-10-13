@@ -925,7 +925,12 @@ def outcomes(report):
                 out["inconclusive"].append(dict(item, why="kept by its step, not validated: %s" % (res.get("verdict") or "")))
             else:
                 v = (res.get("verdict") or "").lower()
-                bucket = "rejected" if any(w in v for w in ("regress", "reject", "slower")) else "needs_review" if "outputs differ" in v or "near-tie" in v or "differ" in v                     else "inconclusive"
+                if any(w in v for w in ("regress", "reject", "slower")):
+                    bucket = "rejected"
+                elif "differ" in v or "near-tie" in v:
+                    bucket = "needs_review"
+                else:
+                    bucket = "inconclusive"
                 out[bucket].append(dict(item, why="kept by its step, but the validation did not pass: %s" % (res.get("verdict") or "")))
             continue
         if (st.get("step"), st.get("candidate")) in decided:
