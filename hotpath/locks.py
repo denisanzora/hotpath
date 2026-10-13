@@ -194,7 +194,8 @@ class gpu_work:
                 _held["depth"] += 1
                 return self
         lock = FileLock(gpu_lock_path())
-        content = dict(me(), kind=self.kind, detail=self.detail, cwd=str(Path.cwd()), since=time.strftime("%Y-%m-%d %H:%M:%S"))
+        content = dict(me(), kind=self.kind, detail=self.detail, cwd=str(Path.cwd()), since=time.strftime("%Y-%m-%d %H:%M:%S"),
+                       job=os.environ.get("HOTPATH_JOB_ID"))
         t_end = time.time() + self.wait_s
         while not lock.try_acquire(content):
             holder = lock.holder()

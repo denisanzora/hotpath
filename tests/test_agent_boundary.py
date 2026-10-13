@@ -252,7 +252,7 @@ class LockTests(unittest.TestCase):
             with locks.gpu_work("experiment", "mine"):
                 pass
         self.assertIn("other-run", str(cm.exception))
-        self.assertIn(str(p.pid), str(cm.exception))
+        self.assertIn("hotpath pid", str(cm.exception))       # the holder's own pid (in a venv, Popen.pid is the launcher's)
 
     def test_a_dead_holder_leaves_no_lock_behind(self):
         p = self._holder("gpu")
@@ -280,7 +280,7 @@ class LockTests(unittest.TestCase):
         p = self._holder("session", d)
         with self.assertRaises(SystemExit) as cm:
             locks.take_session(d)
-        self.assertIn(str(p.pid), str(cm.exception))
+        self.assertIn("running in another process", str(cm.exception))
         p.kill()
         p.wait(10)
         lk = locks.take_session(d)

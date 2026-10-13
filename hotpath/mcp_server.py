@@ -513,8 +513,11 @@ class Job:
         self.cancelled = False
         kw = {"start_new_session": True} if os.name != "nt" else {}
         self._out, self._err = open(self.out_path, "w", encoding="utf-8"), open(self.err_path, "w", encoding="utf-8")
-        self.proc = subprocess.Popen(_child_argv(argv), stdout=self._out, stderr=self._err, stdin=subprocess.DEVNULL,
-                                     env=_child_env(), **kw)
+        env = _child_env()
+        # the job's id, so its GPU-lock entry is recognized as this server's job (a venv's python.exe starts the interpreter
+        # as a child process, so the pid hotpath sees is not the lock holder's)
+        env["HOTPATH_JOB_ID"] = self.id
+        self.proc = subprocess.Popen(_child_argv(argv), stdout=self._out, stderr=self._err, stdin=subprocess.DEVNULL, env=env, **kw)
         self.done = threading.Event()
         threading.Thread(target=self._watch, daemon=True).start()
 
@@ -624,9 +627,9 @@ def _job_call(name, args):
         from hotpath import locks
         with _JOBS_LOCK:
             rows = ["%s  %s  %s" % (j.id, j.tool, j.state()) for j in JOBS.values()]
-            mine = {j.proc.pid for j in JOBS.values() if not j.done.is_set()}
+            mine = {j.id for j in JOBS.values() if not j.done.is_set()}
         holder = locks.gpu_holder()
-        if holder and holder.get("pid") not in mine:
+        if holder and holder.get("job") not in mine:
             # a job of an earlier MCP server (another session or client), or a CLI run: it holds the GPU and this server cannot poll it
             rows.append("GPU in use by %s; not a job of this server: its records are in that working directory (results/local/), and an "
                         "improve session there can be continued with resume once it ends" % locks.describe(holder))
