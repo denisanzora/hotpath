@@ -5,7 +5,7 @@ tooling reports them; hotpath does not sum per-process counters into a paging ve
 because shared allocations (notably those attributed to dwm.exe) can be counted more than once.
 """
 import json
-import platform
+import os
 import subprocess
 import time
 
@@ -154,7 +154,7 @@ def windows_process_gpu_counters(pid):
     These are the WDDM counters Task Manager shows. 'shared usage' for a process is the
     best available indicator that *that process* has allocations living in system memory.
     """
-    if platform.system() != "Windows" or not pid:
+    if os.name != "nt" or not pid:
         return {}
     ps = (
         "$p='pid_%d_*';" % int(pid) +
@@ -184,7 +184,7 @@ def windows_process_gpu_counters(pid):
 
 def windows_adapter_memory():
     """Adapter-wide dedicated/shared usage. Reported as-is; not a paging verdict."""
-    if platform.system() != "Windows":
+    if os.name != "nt":
         return {}
     ps = (
         "$r=@{};"
@@ -206,7 +206,7 @@ def windows_adapter_memory():
 
 def pid_listening_on(port):
     """PID of the process listening on a local TCP port, or None."""
-    if platform.system() == "Windows":
+    if os.name == "nt":
         rc, out, _ = _run(["netstat", "-ano", "-p", "tcp"])
         if rc != 0:
             return None

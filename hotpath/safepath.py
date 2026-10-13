@@ -55,6 +55,24 @@ def resolve(cmd):
     return [found] + cmd[1:]
 
 
+def absolute_entries(entries):
+    """PATH entries made absolute against the working directory: a program runs in its own directory, where a relative
+    entry would name another directory (and the libraries it should provide would be missing)."""
+    return [str(Path(str(e)).absolute()) if str(e) and not os.path.isabs(str(e)) else str(e) for e in entries or []]
+
+
+def os_description():
+    """platform.platform() without running a program: on Windows, Python 3.10's platform module runs `cmd /c ver` in the
+    current directory to read a version that sys.getwindowsversion() already holds."""
+    import platform
+    import sys
+    if os.name != "nt":
+        return platform.platform()
+    v = sys.getwindowsversion()
+    major, minor, build = getattr(v, "platform_version", None) or (v.major, v.minor, v.build)
+    return "Windows-%s-%d.%d.%d-SP%d" % (major if minor == 0 else "%d.%d" % (major, minor), major, minor, build, v.service_pack_major)
+
+
 def program_dir(program):
     """The directory a program runs in: its own, never the working directory."""
     return str(Path(program).absolute().parent)

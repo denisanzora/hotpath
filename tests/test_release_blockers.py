@@ -17,7 +17,9 @@
   C  a configured relative program path with a directory part could not be run;
   D  arms of a finding read from a diagnosis file reached a launch with any argument;
   E  outputs of two runs compared as different because their hashes are keyed per run;
-  F  the loop, the validation and the recommended line each accumulated the adopted changes their own way."""
+  F  the loop, the validation and the recommended line each accumulated the adopted changes their own way;
+  P  request bodies, records and server logs were kept out of version control only by this repository's own .gitignore,
+     and a request-body workload named without a directory was written into the working directory."""
 import json
 import os
 import subprocess
@@ -390,6 +392,98 @@ class OneAccumulationTests(unittest.TestCase):
     def test_the_no_server_baseline_runs_with_the_declared_environment(self):
         spec = im.baseline_spec({}, ["--ctx-size", "4096"], "w.json", 8099, 2, 1, None, "b", env={"GGML_CUDA_DISABLE_GRAPHS": "1"})
         self.assertEqual(spec["env"], {"GGML_CUDA_DISABLE_GRAPHS": "1"})
+
+
+
+class PrivateDirectoryTests(unittest.TestCase):
+    """P"""
+
+    BODY = {"messages": [{"role": "user", "content": "SECRET-PROMPT"}], "temperature": 0, "max_tokens": 8}
+
+    def test_directories_hotpath_creates_are_excluded_and_others_untouched(self):
+        from hotpath import records
+        with tempfile.TemporaryDirectory() as td, _InDir(td):
+            records.private_dir(os.path.join("results", "local", "improve-x"))
+            self.assertTrue(os.path.isfile(os.path.join("results", ".gitignore")))
+            self.assertFalse(os.path.exists(os.path.join("results", "local", ".gitignore")))
+            os.mkdir("mine")
+            records.private_dir("mine")
+            records.private_dir(".")
+            self.assertFalse(os.path.exists(os.path.join("mine", ".gitignore")))
+            self.assertFalse(os.path.exists(".gitignore"))
+
+    def test_an_agent_named_workload_of_request_bodies_goes_to_workloads(self):
+        from hotpath import mcp_server
+        with tempfile.TemporaryDirectory() as td, _InDir(td):
+            with open("cap.jsonl", "w", encoding="utf-8") as f:
+                f.write(json.dumps(self.BODY) + "\n")
+            argv = mcp_server._workload({"out_file": "app.json", "from_requests": "cap.jsonl"})
+            self.assertEqual(os.path.normcase(argv[1]), os.path.normcase(os.path.join("workloads", "app.json")))
+
+    @unittest.skipUnless(safepath.which("git"), "git is not installed")
+    def test_request_bodies_and_records_stay_out_of_the_users_repository(self):
+        from hotpath import cli
+        from hotpath import records
+        git = safepath.which("git")
+        with tempfile.TemporaryDirectory() as td, _InDir(td):
+            subprocess.run([git, "init", "-q"], check=True, cwd=td)
+            with open("cap.jsonl", "w", encoding="utf-8") as f:
+                f.write(json.dumps(self.BODY) + "\n")
+            with open(os.devnull, "w") as null:
+                saved, sys.stdout = sys.stdout, null
+                try:
+                    self.assertEqual(cli.main(["workload", "app.json", "--from-requests", "cap.jsonl"]), 0)
+                finally:
+                    sys.stdout = saved
+            records.write_record({"kind": "x"}, os.path.join("results", "local"), "rec")
+            self.assertTrue(os.path.isfile(os.path.join("workloads", "app.json")))
+            st = subprocess.run([git, "status", "--porcelain", "--untracked-files=all"], capture_output=True, text=True, cwd=td).stdout
+            self.assertEqual(st.split(), ["??", "cap.jsonl"], "only the user's own capture file is untracked: %r" % st)
+
+
+
+class OwnDirectoryFollowUpTests(unittest.TestCase):
+    """A, follow-up: what changes meaning once a program runs in its own directory"""
+
+    def test_relative_path_prepend_entries_are_made_absolute(self):
+        from hotpath import experiment as ex
+        with tempfile.TemporaryDirectory() as td, _InDir(td):
+            spec = {"binary": sys.executable, "model": "m.gguf", "path_prepend": ["cuda/bin", os.path.abspath(td)], "arms": [{"name": "a"}]}
+            _cmd, env, _port = ex.arm_launch(spec, spec["arms"][0], td)
+            first = env["PATH"].split(os.pathsep)[:2]
+            self.assertEqual(first, [os.path.join(os.getcwd(), "cuda", "bin"), os.path.abspath(td)])
+
+    def test_tools_found_in_a_relative_directory_are_absolute(self):
+        from hotpath.adapters import LlamaBenchAdapter
+        with tempfile.TemporaryDirectory() as td, _InDir(td):
+            os.mkdir("bin")
+            open(os.path.join("bin", "llama-bench.exe"), "w").close()
+            self.assertTrue(LlamaBenchAdapter("bin").locate().is_absolute())
+
+    def test_the_os_description_runs_no_program(self):
+        from hotpath import records
+        started = []
+        saved = subprocess.Popen.__init__
+
+        def spy(self_, *a, **k):
+            started.append(a[0] if a else k.get("args"))
+            return saved(self_, *a, **k)
+        import platform
+        subprocess.Popen.__init__ = spy
+        saved_caches = (getattr(platform, "_uname_cache", None), dict(getattr(platform, "_platform_cache", {})))
+        platform._uname_cache, platform._platform_cache = None, {}       # what a fresh process sees
+        try:
+            desc = records.host_identity()["os"]
+        finally:
+            subprocess.Popen.__init__ = saved
+            platform._uname_cache, platform._platform_cache = saved_caches
+        self.assertEqual(started, [])
+        self.assertTrue(desc)
+
+    def test_a_forged_finding_cannot_remove_the_environment(self):
+        finding = {"id": "f", "experiment": {"kind": "x", "arms": [{"name": "a"}, {"name": "b", "env_remove": ["PATH", "SystemRoot"]}]}}
+        with self.assertRaises(ValueError):
+            prop.build_spec(finding, {}, ["--ctx-size", "4096"], "w.json")
 
 
 if __name__ == "__main__":

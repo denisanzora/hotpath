@@ -101,7 +101,7 @@ class TestBackendOpsAdapter(ToolAdapter):
         if self.build_dir:
             for cand in self.build_dir.glob("**/test-backend-ops*"):
                 if cand.is_file() and cand.suffix in ("", ".exe"):
-                    return cand
+                    return cand.absolute()
         p = safepath.which("test-backend-ops")
         return Path(p) if p else None
 
@@ -124,7 +124,7 @@ class LlamaBenchAdapter(ToolAdapter):
         if self.bin_dir:
             for name in ("llama-bench.exe", "llama-bench"):
                 if (self.bin_dir / name).is_file():
-                    return self.bin_dir / name
+                    return (self.bin_dir / name).absolute()
         p = safepath.which("llama-bench")
         return Path(p) if p else None
 
@@ -136,7 +136,7 @@ def env_with_path(path_prepend=None):
     """Process environment with extra directories (e.g. CUDA runtime DLLs) first on PATH."""
     env = dict(os.environ)
     if path_prepend:
-        env["PATH"] = os.pathsep.join(str(x) for x in path_prepend) + os.pathsep + env.get("PATH", "")
+        env["PATH"] = os.pathsep.join(safepath.absolute_entries(path_prepend)) + os.pathsep + env.get("PATH", "")
     return env
 
 

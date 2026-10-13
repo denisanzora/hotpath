@@ -19,7 +19,7 @@ from hotpath import diagnose as dg
 from hotpath import launch
 from hotpath import locks
 from hotpath import propose as prop
-from hotpath.records import new_record, write_record
+from hotpath.records import new_record, private_dir, write_record
 
 # experiment kinds the loop can run unattended: one variable, arms given as argument/environment overrides
 EXECUTABLE_KINDS = frozenset({"gpu_layers", "ubatch_sweep", "cuda_graphs", "server_overhead_flags", "request_shape"})
@@ -538,8 +538,7 @@ def _spec_dir(sdir, dry_run):
     """Where a run writes its spec files: the session directory, or for a dry run a subdirectory of its own, so a plan made
     while the session runs never rewrites a file the running process uses."""
     d = Path(sdir) / "dry-run" if dry_run else Path(sdir)
-    d.mkdir(parents=True, exist_ok=True)
-    return d
+    return private_dir(d)
 
 
 # flags of the user's launch that experiments leave out without changing what is computed: the network binding, files the
@@ -586,8 +585,7 @@ def improve(cfg, start_records, workload, out_dir, runner, max_experiments=3, ma
         base_name, k = session, 2
         while (Path(out_dir) / session).exists():
             session, k = "%s-%d" % (base_name, k), k + 1
-    sdir = Path(out_dir) / session
-    sdir.mkdir(parents=True, exist_ok=True)
+    sdir = private_dir(Path(out_dir) / session)
     state = sdir / "session.json"
     if resume:
         if not state.is_file():
@@ -840,9 +838,10 @@ def _improve(cfg, start_records, workload, out_dir, runner, max_experiments, max
                                runner, dry_run, bandwidth_gbs, log, report, shape, rq)
     report["minutes_used"] = round(budget.minutes, 1)
     validated = report["result"].get("validated")
+    validated_change = report["result"].pop("validated_change", None)
     if validated:
         # the line to apply is built from the change the passing validation's improved arm ran with, nothing else
-        cum = _as_cum(report["result"].pop("validated_change"))
+        cum = _as_cum(validated_change)
     plumbing, not_measured = left_out_of_measurement(observed, args0)
     _ = plumbing
     report["starting_point"]["left_out"] = {"plumbing": plumbing, "not_measured": not_measured}
@@ -852,7 +851,7 @@ def _improve(cfg, start_records, workload, out_dir, runner, max_experiments, max
         report["result"]["verdict"] = ("not recommended automatically: the validated run measured your launch without %s (hotpath cannot run them in "
                                        "its experiments), and those change what the server computes or how much memory it needs. Result without "
                                        "them: %s" % (", ".join(not_measured), report["result"]["verdict"]))
-        report["decisions"].append({"step": "validation", "arm": "validated without %s" % ", ".join(not_measured), "change": _change_text(_cum_change(adopted_steps)),
+        report["decisions"].append({"step": "validation", "arm": "validated without %s" % ", ".join(not_measured), "change": _change_text(validated_change),
                                     "verdict": report["result"]["verdict"], "needs": "the measurement left out %s; check the change with them loaded" % ", ".join(not_measured),
                                     "fidelity": None, "measured": report["result"].get("measured"), "decomposition": None})
     differs = launch_diff(observed, args0) if observed else []

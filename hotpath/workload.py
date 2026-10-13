@@ -217,8 +217,34 @@ def subset(parent_path, item_ids, name, basis):
     return {"name": name, "kind": "requests", "subset_of": str(parent_path), "item_ids": list(item_ids), "basis": basis}
 
 
+def requests_workload_path(path):
+    """Where a workload of request bodies is written: a file named without a directory (or directly in the working
+    directory) goes to workloads/, which hotpath excludes from version control; an explicit directory is kept."""
+    p = Path(path)
+    if p.parent == Path(".") or p.absolute().parent == Path.cwd().absolute():
+        return Path("workloads") / p.name
+    return p
+
+
+def in_private_dir(path):
+    """Whether `path` is below a directory hotpath excluded from version control (one holding its .gitignore)."""
+    from hotpath.records import PRIVATE_GITIGNORE
+    for d in Path(path).absolute().parents:
+        g = d / ".gitignore"
+        try:
+            if g.is_file() and g.read_text(encoding="utf-8") == PRIVATE_GITIGNORE:
+                return True
+        except OSError:
+            pass
+    return False
+
+
 def save_workload(w, path):
-    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    from hotpath.records import private_dir
+    if w.get("kind") == "requests" or Path(path).parent.name == "workloads":
+        private_dir(Path(path).parent)
+    else:
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
         json.dump(w, f, indent=1)
 

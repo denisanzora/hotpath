@@ -55,7 +55,8 @@ PATH_FLAGS = frozenset({
     "-m", "--model", "--log-file", "--slot-save-path", "--prompt-cache", "--lora", "--lora-scaled", "--control-vector", "--control-vector-scaled",
     "--mmproj", "-mm", "-md", "--model-draft", "--chat-template-file", "--grammar-file", "--json-schema-file", "-jf", "--ssl-key-file",
     "--ssl-cert-file", "--api-key-file", "--path", "--media-path", "--webui-config-file", "--models-dir", "--models-preset", "-f", "--file",
-    "--model-vocoder", "-mv", "--logits-file",
+    "--model-vocoder", "-mv", "--logits-file", "--log-prompts-dir", "--mcp-servers-config", "-lcs", "--lookup-cache-static", "-lcd",
+    "--lookup-cache-dynamic",
 })
 
 _SPELLING = {s: name for name, spellings in FLAGS.items() for s in spellings}

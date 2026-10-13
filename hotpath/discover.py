@@ -456,7 +456,7 @@ def linux_dependency_check(binary):
     """`ldd` on the binary and its ggml CUDA library: shared libraries reported as not found (untested outside Windows)."""
     if not safepath.which("ldd"):
         return {"note": "ldd not available; shared-library dependencies not checked"}
-    targets = [Path(binary)] + [p for p in Path(binary).parent.glob("libggml-cuda*.so*")]
+    targets = [Path(binary).absolute()] + [p.absolute() for p in Path(binary).parent.glob("libggml-cuda*.so*")]
     missing = set()
     for t in targets:
         rc, out, _ = _run(["ldd", str(t)], timeout=15)
@@ -477,7 +477,7 @@ def run_version(binary, log, path_prepend=None):
     """`binary --version`: the version line and whether the program starts at all. Recorded in the executed list."""
     env = dict(os.environ)
     if path_prepend:
-        env["PATH"] = os.pathsep.join(str(x) for x in path_prepend) + os.pathsep + env.get("PATH", "")
+        env["PATH"] = os.pathsep.join(safepath.absolute_entries(path_prepend)) + os.pathsep + env.get("PATH", "")
     t0 = time.time()
     rc, out, err = _run([str(binary), "--version"], timeout=15, env=env)
     lines = [ln.strip() for ln in (out + "\n" + err).splitlines() if ln.strip()]

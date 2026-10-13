@@ -153,11 +153,15 @@ def cmd_workload(args):
             w = wl_mod.workload_from_requests(args.from_requests, name=args.name if args.name != "synthetic" else "requests", limit=args.limit)
         except ValueError as e:
             raise SystemExit("error: %s" % e)
-        wl_mod.save_workload(w, args.out_file)
+        out = wl_mod.requests_workload_path(args.out_file)
+        wl_mod.save_workload(w, str(out))
         ident = wl_mod.workload_identity(w)
-        print("wrote %s: %d application request bodies (%s), fields %s" % (args.out_file, ident["n_prompts"], ", ".join(ident["endpoints"]), ident["fields_present"]))
-        print("The workload file holds your request bodies; keep it local (workloads/ is gitignored here). Records store hashes, counts and timings only, "
-              "unless the spec sets store_outputs.")
+        print("wrote %s: %d application request bodies (%s), fields %s" % (out, ident["n_prompts"], ", ".join(ident["endpoints"]), ident["fields_present"]))
+        print(("The workload file holds your request bodies. Its directory is excluded from version control (hotpath wrote a .gitignore there)."
+               if wl_mod.in_private_dir(out) else
+               "The workload file holds your request bodies and is outside a directory hotpath excludes from version control: keep it out of any "
+               "repository yourself (a file name without a directory goes to workloads/, which is excluded).") +
+              " Records store hashes, counts and timings only, unless the spec sets store_outputs.")
         return 0
     w = wl_mod.build_workload(args.name, args.n_prompts, args.words, seed=args.seed, n_predict=args.n_predict, fmt=args.format)
     wl_mod.save_workload(w, args.out_file)
@@ -578,7 +582,8 @@ def cmd_tools(args):
     import platform
     from hotpath import gpu as gpu_mod
     cfg = load_local(args.local)
-    print("hotpath %s, Python %s, %s" % (__version__, platform.python_version(), platform.platform()))
+    from hotpath import safepath
+    print("hotpath %s, Python %s, %s" % (__version__, platform.python_version(), safepath.os_description()))
     if cfg.get("_missing"):
         print("config:            not found (%s). Run `hotpath init` to create one; commands that need paths will ask for them." % cfg["_path"])
     else:

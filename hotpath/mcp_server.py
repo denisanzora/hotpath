@@ -233,6 +233,9 @@ def _compare(a):
           "from_requests": _STR, "limit": _INT}, ["out_file"]))
 def _workload(a):
     out = _no_local_config_name(_inside_cwd(a["out_file"], "out_file"), "out_file")
+    if a.get("from_requests"):
+        from hotpath.workload import requests_workload_path
+        out = str(requests_workload_path(out))
     # a new .json file only: an agent may write a workload, never replace an existing file (the user's captured workload,
     # a spec, a record or anything else in the working directory)
     if not out.lower().endswith(".json"):
@@ -509,8 +512,8 @@ class Job:
     def __init__(self, tool_name, argv, timeout_s):
         self.id = "job-" + uuid.uuid4().hex[:8]
         self.tool, self.argv, self.timeout_s = tool_name, argv, timeout_s
-        d = Path("results/local/jobs")
-        d.mkdir(parents=True, exist_ok=True)
+        from hotpath.records import private_dir
+        d = private_dir("results/local/jobs")
         self.out_path, self.err_path = d / (self.id + ".out"), d / (self.id + ".err")
         self.started = time.time()
         self.ended = None

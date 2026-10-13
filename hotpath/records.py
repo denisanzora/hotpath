@@ -25,10 +25,15 @@ def now_iso():
     return _dt.datetime.now(_dt.timezone.utc).astimezone().isoformat(timespec="seconds")
 
 
+def _os_description():
+    from hotpath import safepath
+    return safepath.os_description()
+
+
 def host_identity():
     return {
         "hostname_hash": hashlib.sha256(socket.gethostname().encode()).hexdigest()[:12],
-        "os": platform.platform(),
+        "os": _os_description(),
         "python": platform.python_version(),
     }
 
@@ -143,10 +148,30 @@ def check_name(name, what="name"):
     return name
 
 
+PRIVATE_GITIGNORE = ("# Written by hotpath: this directory holds local data (request bodies, records, server logs).\n"
+                     "# It is excluded from version control; delete this file only if you mean to publish its contents.\n*\n")
+
+
+def private_dir(path):
+    """Create directory `path` for hotpath's local data and return it. The topmost directory hotpath creates gets a
+    .gitignore that excludes everything below it, so request bodies, records and server logs stay out of whatever
+    repository the working directory belongs to, whatever that repository's own ignore rules say. Directories that
+    already exist are left as they are (the working directory itself is never marked)."""
+    p = Path(path)
+    created = [q for q in [p] + list(p.parents) if not q.exists()]
+    p.mkdir(parents=True, exist_ok=True)
+    if created:
+        try:
+            with open(created[-1] / ".gitignore", "x", encoding="utf-8") as f:
+                f.write(PRIVATE_GITIGNORE)
+        except OSError:
+            pass
+    return p
+
+
 def write_record(rec, out_dir, stem):
     check_name(stem, "record name")
-    out = Path(out_dir)
-    out.mkdir(parents=True, exist_ok=True)
+    out = private_dir(out_dir)
     ts = _dt.datetime.now().strftime("%Y%m%d-%H%M%S")
     data = json.dumps(scrub(rec), indent=1, ensure_ascii=False)
     # Created exclusively: two records of the same kind written within one second (a diagnosis of two inputs run back

@@ -20,7 +20,7 @@ from hotpath import locks
 from hotpath import server as srv
 from hotpath.measure import run_workload, summarize_requests
 from hotpath.observe import binary_identity
-from hotpath.records import env_snapshot, file_identity, new_record, redact_args, redact_env, redact_path
+from hotpath.records import env_snapshot, file_identity, new_record, private_dir, redact_args, redact_env, redact_path
 from hotpath.workload import load_workload, workload_identity
 
 
@@ -72,7 +72,8 @@ def arm_launch(spec, arm, out_dir=None):
     env = dict(os.environ)
     # directories to put first on PATH (e.g. the CUDA runtime DLLs a native build needs); values resolve via the local config
     if spec.get("path_prepend"):
-        env["PATH"] = os.pathsep.join(spec["path_prepend"]) + os.pathsep + env.get("PATH", "")
+        from hotpath import safepath
+        env["PATH"] = os.pathsep.join(safepath.absolute_entries(spec["path_prepend"])) + os.pathsep + env.get("PATH", "")
     env.update({k: str(v) for k, v in (spec.get("env") or {}).items()})
     env.update({k: str(v) for k, v in (arm.get("env_override") or {}).items()})
     for k in arm.get("env_remove") or []:
@@ -273,14 +274,13 @@ def _run_locked(spec, out_dir, workload, wait_for_preconditions_s):
         time.sleep(60)
     ssp = slot_save_path_for(spec, None, out_dir)
     if ssp:
-        Path(ssp).mkdir(parents=True, exist_ok=True)
+        private_dir(ssp)
     rounds = int(spec.get("rounds", 3))
     rec = new_record("experiment", "controlled", name=spec["name"], spec_redacted=json.loads(plan_json(spec)),
                      preconditions_result=pc, workload=workload_identity(workload),
                      gpu=gpu_mod.gpu_static(), binary=binary_identity(spec["binary"], spec.get("path_prepend")), model=file_identity(spec["model"]),
                      env_baseline=env_snapshot(), arms={}, launches=[])
-    out = Path(out_dir)
-    out.mkdir(parents=True, exist_ok=True)
+    out = private_dir(out_dir)           # server logs and records: local data
     for a in spec["arms"]:
         rec["arms"][a["name"]] = {"requests": [], "warmup_requests": [], "gpu_snapshots": [], "launches": 0, "launch_facts": [], "failures": []}
     rec["cache_mode"] = workload.get("cache_mode", "cold")
