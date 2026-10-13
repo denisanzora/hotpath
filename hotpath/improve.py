@@ -272,6 +272,17 @@ def requests_plan(workload, sdir, cfg, cache_mode=None, step_per_class=2, valida
         groups = {}
         for it in w["items"]:
             groups.setdefault(wl.request_class(it), []).append(it)
+        if len(groups) > max_steps and any(not it.get("class_labelled") for it in w["items"]):
+            # derived classes this fine-grained (a system message that varies per request, say) are not request classes:
+            # regroup by endpoint and schema only
+            coarse = {}
+            for it in w["items"]:
+                coarse.setdefault("/".join(wl.request_class(it).split("/")[:2]), []).append(it)
+            groups = coarse
+        if len(groups) > max_steps:
+            # still more classes than the step cap: the most frequent classes, the rest reported as not covered
+            keep = sorted(groups, key=lambda c: (-len(groups[c]), c))[:max_steps]
+            groups = {c: groups[c] for c in keep}
         for c in groups:
             groups[c].sort(key=lambda it: (wl.request_size(it), order[it["id"]]))
         n_cls = len(groups)
@@ -413,11 +424,22 @@ def identity_problem(records, cfg, identity):
     return None
 
 
-def spec_fingerprint(spec):
-    """What makes two runs of a step the same experiment: launch arguments, environment, arms, sizes, cache mode and the
-    workload's content (its set hash), not the spec's file name. A record is reused on resume only for this exact spec."""
+def spec_fingerprint(spec, cfg=None):
+    """What makes two runs of a step the same experiment: launch arguments, environment, arms, sizes, cache mode, decision
+    fields, the workload's content (its set hash) and the files the ${key} references resolve to (size and modification
+    time of the configured binary and model), not the spec's file name. A record is reused on resume only for this exact spec."""
     import hashlib
+    import os as _os
     from hotpath.workload import load_workload, workload_identity
+
+    def files(v):
+        if isinstance(v, str) and v.startswith("${") and v.endswith("}") and cfg:
+            v = cfg.get(v[2:-1])
+        try:
+            st = _os.stat(str(v))
+            return [Path(str(v)).name, st.st_size, int(st.st_mtime)]
+        except (OSError, TypeError, ValueError):
+            return [str(v)]
     try:
         w = workload_identity(load_workload(spec["workload"]))
         wl = [w.get("set_hash"), w.get("n_predict")]
@@ -427,17 +449,20 @@ def spec_fingerprint(spec):
     body = {"binary": spec.get("binary"), "model": spec.get("model"), "common_args": [str(a) for a in spec.get("common_args") or []],
             "env": spec.get("env") or {}, "arms": [{k: a.get(k) for k in keep if a.get(k) is not None} for a in spec.get("arms") or []],
             "sizes": [spec.get(k) for k in ("rounds", "repetitions", "warmup", "n_predict", "probe_top_k", "ignore_eos")],
-            "cache_mode": spec.get("cache_mode"), "schema_validation": spec.get("schema_validation"), "workload": wl}
+            "cache_mode": spec.get("cache_mode"), "schema_validation": spec.get("schema_validation"), "workload": wl,
+            "decision_fields": spec.get("decision_fields"), "files": [files(spec.get("binary")), files(spec.get("model"))] +
+            [[a.get("name"), files(a["binary"]) if a.get("binary") else None, files(a["model"]) if a.get("model") else None] for a in spec.get("arms") or []
+             if a.get("binary") or a.get("model")]}
     return hashlib.sha256(json.dumps(body, sort_keys=True, default=str).encode("utf-8")).hexdigest()[:16]
 
 
-def _matching_record(sdir, spec):
+def _matching_record(sdir, spec, cfg=None):
     """(path, None) for the newest record in the session made from this exact spec, else (None, why the recorded ones do
     not count, or None when there are none)."""
     done = sorted(Path(sdir).glob("experiment-%s-2*.json" % spec["name"]))
     if not done:
         return None, None
-    fp = spec_fingerprint(spec)
+    fp = spec_fingerprint(spec, cfg)
     for p in reversed(done):
         try:
             rec = json.loads(p.read_text(encoding="utf-8"))
@@ -448,11 +473,11 @@ def _matching_record(sdir, spec):
     return None, "it was recorded for a different spec (another starting point, workload or hotpath version), so it is not evidence for this one"
 
 
-def _reusing(runner, sdir, log):
+def _reusing(runner, sdir, log, cfg=None):
     """A runner that returns the record already in the session directory for this exact spec (resume), else runs it and
     stamps the record with the spec's fingerprint."""
     def run(spec, spec_path):
-        found, why = _matching_record(sdir, spec)
+        found, why = _matching_record(sdir, spec, cfg)
         if found:
             log("  reusing %s (completed earlier in this session)" % found.name)
             rec = json.loads(found.read_text(encoding="utf-8"))
@@ -461,8 +486,9 @@ def _reusing(runner, sdir, log):
         if why:
             log("  not reusing the recorded %s: %s" % (spec["name"], why))
         rec = runner(spec, spec_path)
-        rec["spec_fingerprint"] = spec_fingerprint(spec)
+        rec["spec_fingerprint"] = spec_fingerprint(spec, cfg)
         return rec
+    run.cfg = cfg
     return run
 
 
@@ -475,8 +501,8 @@ class _DryRunStop(Exception):
     pass
 
 
-def _recorded(sdir, spec):
-    return _matching_record(sdir, spec)[0] is not None
+def _recorded(sdir, spec, cfg=None):
+    return _matching_record(sdir, spec, cfg)[0] is not None
 
 
 def _check_saved_state(saved, sdir):
@@ -561,11 +587,13 @@ def improve(cfg, start_records, workload, out_dir, runner, max_experiments=3, ma
         cache_mode = saved.get("cache_mode", cache_mode)
         log("resuming %s: %d starting record(s), workload %s" % (session, len(start_records), Path(workload).name))
     elif not dry_run:
-        state.write_text(json.dumps({"start_records": list(start_records), "workload": workload, "initial_args": initial_args, "cache_mode": cache_mode}) + "\n",
+        # starting arguments are kept without runner-owned flags (ports, files, keys): those never reach a launch anyway
+        saved_args = prop.strip_runner_owned(initial_args)[0] if initial_args else initial_args
+        state.write_text(json.dumps({"start_records": list(start_records), "workload": workload, "initial_args": saved_args, "cache_mode": cache_mode}) + "\n",
                          encoding="utf-8")
     if dry_run:
         runner = _never_launch          # a dry run reads what a session recorded and launches nothing, also when resuming
-    runner = _reusing(runner, sdir, log)
+    runner = _reusing(runner, sdir, log, cfg)
     lock = None if dry_run else locks.take_session(sdir)
     try:
         return _improve(cfg, start_records, workload, out_dir, runner, max_experiments, max_minutes, rounds, repetitions, warmup, port, n_predict,
@@ -599,6 +627,9 @@ def _improve(cfg, start_records, workload, out_dir, runner, max_experiments, max
     if not records:
         # nothing running and no log: measure the starting configuration on hotpath's own server first
         args, source = (list(initial_args), "command line") if initial_args else baseline_args_without_server(cfg)
+        args, removed_b = prop.strip_runner_owned(args)
+        if removed_b:
+            source += "; left out (the runner sets its own binding, model and files): %s" % ", ".join(sorted(set(removed_b)))
         bspec = _apply_rq(baseline_spec(cfg, args, step_wl, port, repetitions, warmup, n_predict, "%s-baseline" % session), rq)
         bpath = _spec_dir(sdir, dry_run) / "baseline.json"
         bpath.write_text(json.dumps(bspec, indent=2) + "\n", encoding="utf-8")
@@ -677,7 +708,7 @@ def _improve(cfg, start_records, workload, out_dir, runner, max_experiments, max
             break
         spec_path = _spec_dir(sdir, dry_run) / ("step-%d-%s.json" % (n, f["experiment"]["kind"]))
         spec_path.write_text(json.dumps(spec, indent=2) + "\n", encoding="utf-8")
-        if dry_run and not _recorded(sdir, spec):
+        if dry_run and not _recorded(sdir, spec, cfg):
             report["next_step"] = {"finding": f["id"], "title": f.get("title"), "spec": str(spec_path), "estimated_minutes": need,
                                    "arms": [a["name"] for a in spec["arms"]], "variable": f["experiment"].get("variable"), "port": port,
                                    "min_free_vram_mib": spec["preconditions"].get("min_free_vram_mib")}
@@ -844,8 +875,8 @@ def outcomes(report):
         if st.get("adopted"):
             if res.get("validated") and (not validated_steps or st["experiment"] in validated_steps):
                 out["recommended"].append(dict(item, why="validated: %s" % (res.get("verdict") or "").split(" [")[0]))
-            elif (st.get("step"), st.get("candidate")) in decided:
-                continue
+            elif (st.get("step"), st.get("candidate")) in decided or any(d.get("step") == "validation" for d in report.get("decisions") or []):
+                continue                     # its fate is the validation decision listed under needs review
             elif "budget" in (res.get("verdict") or "") or res.get("not_validated"):
                 out["inconclusive"].append(dict(item, why="kept by its step, not validated: %s" % (res.get("verdict") or "")))
             else:

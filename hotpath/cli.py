@@ -178,9 +178,13 @@ def cmd_measure(args):
 def cmd_experiment(args):
     cfg = load_local(args.local)
     raw = None
-    if agentgate.active() and not args.dry_run:
+    if agentgate.active():
+        # the MCP server checked the file; check what this process reads, too. Dry runs as well: a plan resolves ${key}
+        # references and prints them, so a spec that may not run may not be planned either
         try:
-            raw = agentgate.harden(agentgate.check_spec_file(args.spec))   # the MCP server checked the file; check what this process reads, too
+            raw = agentgate.check_spec_file(args.spec)
+            if not args.dry_run:
+                agentgate.harden(raw)
         except ValueError as e:
             raise SystemExit("refused: %s" % e)
     spec = exp_mod.load_spec(args.spec, cfg, raw=raw)

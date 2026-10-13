@@ -1280,15 +1280,15 @@ def experiment_verdict(rec):
         if bv or cv:
             # decide on the full-schema check only if EVERY judged request in both arms got it; otherwise on required keys,
             # and say so. Rates, not counts: an arm with fewer requests (a failed round) is not "less valid".
-            full = bool(bv and cv and bv.get("schema_checked") == bv.get("judged") and cv.get("schema_checked") == cv.get("judged"))
-            key = "schema_valid" if full else "schema_required_present"
+            full_schema = bool(bv and cv and bv.get("schema_checked") == bv.get("judged") and cv.get("schema_checked") == cv.get("judged"))
+            key = "schema_valid" if full_schema else "schema_required_present"
             rate = lambda v, k: (v.get(k) or 0) / v["judged"] if v and v.get("judged") else None
             rb, rc = rate(bv, key), rate(cv, key)
             jb, jc = rate(bv, "valid_json"), rate(cv, "valid_json")
             eps = 1e-9
             dropped = bool((rb is not None and rc is not None and rc < rb - eps) or (jb is not None and jc is not None and jc < jb - eps) or (bv and not cv))
             row["validity"] = {"baseline": bv, "candidate": cv, "level": (bv.get("validation_level") or cv.get("validation_level")), "decided_on": key,
-                               "downgraded_from_full": (not full) and any((v.get("schema_checked") or 0) > 0 for v in (bv, cv)),
+                               "downgraded_from_full": (not full_schema) and any((v.get("schema_checked") or 0) > 0 for v in (bv, cv)),
                                "dropped": dropped}
         row["fidelity"] = arm_fidelity(base, cand, row, oe, full)
         w = row["metrics"].get("wall_ms", {})

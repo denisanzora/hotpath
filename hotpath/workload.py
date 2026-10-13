@@ -47,6 +47,9 @@ def _body_hash(body):
     return hashlib.sha256(json.dumps(body, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()[:16]
 
 
+REQUEST_ENDPOINTS = ("/v1/chat/completions", "/chat/completions", "/completion", "/completions", "/v1/completions")
+
+
 def request_class(item):
     """The request class of an application request: the label the capture gave it (`class` or `stage`), else one derived
     from its shape: endpoint, the JSON schema's name (or grammar / free text) and a short hash of the system message, so
@@ -92,6 +95,9 @@ def load_workload(path):
     if w.get("subset_of"):
         # a subset names items of another requests workload by id and holds no request bodies itself, so the user's prompts
         # stay in the one file they keep in workloads/ (never in a results or session directory)
+        with open(w["subset_of"], "r", encoding="utf-8") as f:
+            if json.load(f).get("subset_of"):
+                raise ValueError("subset_of must name a workload of requests, not another subset (%s)" % w["subset_of"])
         parent = load_workload(w["subset_of"])
         if parent.get("kind") != "requests":
             raise ValueError("subset_of must name a requests workload, %s is not one" % w["subset_of"])
@@ -108,6 +114,9 @@ def load_workload(path):
         for it in w["items"]:
             it.setdefault("sha256", _body_hash(it["body"]))
             it.setdefault("endpoint", "/v1/chat/completions" if "messages" in it["body"] else "/completion")
+            if it["endpoint"] not in REQUEST_ENDPOINTS:
+                # a workload sends inference requests, nothing else (a slot save or a props change is not a request to measure)
+                raise ValueError("item %s: endpoint %r is not one of %s" % (it.get("id"), it["endpoint"], ", ".join(REQUEST_ENDPOINTS)))
             it["class"] = request_class(it)
         return w
     for p in w["prompts"]:
@@ -158,6 +167,7 @@ def workload_from_requests(path, name="requests", limit=None):
               "body": body, "sha256": _body_hash(body)}
         if label:
             it["class"] = str(label)[:60]
+            it["class_labelled"] = True
         it["class"] = request_class(it)
         items.append(it)
         if limit and len(items) >= limit:

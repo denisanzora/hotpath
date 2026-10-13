@@ -5,8 +5,9 @@
   whichever working directory, client or MCP server it runs from. Two agents (say Claude Code and OpenCode, each with
   its own MCP server) could otherwise both pass the idle-GPU precondition within the same few seconds and measure each
   other. It is reentrant within a process: the improve loop holds it for the whole session.
-- Both are created exclusively (O_EXCL) and name their holder by pid and process start time, so a lock whose holder
-  died is recognized as stale even when Windows reuses the pid.
+- Both are OS file locks (msvcrt.locking on Windows, flock elsewhere): the operating system releases them when the holder
+  exits or dies, so a crash leaves no stale lock and two processes can never both hold one. A holder file next to each lock
+  names the holder by pid and process start time, for messages.
 - A process the MCP server started watches that server (HOTPATH_PARENT_PID): if the server is killed outright (no stdin
   close, no cleanup), the child stops the llama-servers it launched and exits instead of running on unattended.
 
@@ -88,47 +89,78 @@ def _read(path):
     return out if isinstance(out, dict) else None
 
 
-def _create(path, content):
-    fd = os.open(str(path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-    with os.fdopen(fd, "w", encoding="utf-8") as f:
-        f.write(json.dumps(content))
+class FileLock:
+    """An exclusive OS lock on a file (msvcrt.locking on Windows, flock elsewhere). The operating system releases it when
+    the holder exits or dies, so there are no stale locks to detect, and two processes can never both hold it. Who holds
+    it is written next to it (`<lock>.holder`), for messages only."""
 
+    def __init__(self, path):
+        self.path = Path(path)
+        self.fh = None
 
-def acquire_file(path, content):
-    """Create `path` exclusively for this process. Returns None on success, or the live holder's record. A lock whose
-    holder is gone (or is this very process, from an earlier interrupted call) is replaced."""
-    path = Path(path)
-    for _ in range(3):
+    def try_acquire(self, holder):
+        fh = open(self.path, "a+b")
         try:
-            _create(path, content)
-            return None
-        except FileExistsError:
-            holder = _read(path)
-            mine = isinstance(holder, dict) and holder.get("pid") == os.getpid()
-            if holder_alive(holder) and not mine:
-                return holder
-            try:
-                path.unlink()
-            except FileNotFoundError:
-                pass
-            except OSError:
-                return holder or {"pid": None}
-    return _read(path) or {"pid": None}
-
-
-def release_file(path):
-    path = Path(path)
-    holder = _read(path)
-    if isinstance(holder, dict) and holder.get("pid") == os.getpid():
+            if os.name == "nt":
+                import msvcrt
+                fh.seek(0)
+                msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            fh.close()
+            return False
+        self.fh = fh
         try:
-            path.unlink()
+            self.holder_path().write_text(json.dumps(holder), encoding="utf-8")
         except OSError:
             pass
+        return True
+
+    def holder_path(self):
+        return self.path.with_name(self.path.name + ".holder")
+
+    def release(self):
+        if self.fh is None:
+            return
+        try:
+            try:
+                self.holder_path().unlink()
+            except OSError:
+                pass
+            if os.name == "nt":
+                import msvcrt
+                self.fh.seek(0)
+                try:
+                    msvcrt.locking(self.fh.fileno(), msvcrt.LK_UNLCK, 1)
+                except OSError:
+                    pass
+            else:
+                import fcntl
+                fcntl.flock(self.fh.fileno(), fcntl.LOCK_UN)
+        finally:
+            self.fh.close()
+            self.fh = None
+
+    def holder(self):
+        """Who holds the lock, as far as its holder file says (None when that process is gone)."""
+        h = _read(self.holder_path())
+        return h if holder_alive(h) else None
+
+
+def legacy_holder(path):
+    """A lock file in the format before OS locks (a bare pid or a JSON holder written into the lock file itself) whose
+    process still runs: an older hotpath may be driving the session."""
+    h = _read(path)
+    if isinstance(h, dict) and h.get("pid") != os.getpid() and holder_alive(h) and "kind" not in h:
+        return h
+    return None
 
 
 # ---- the GPU lock -----------------------------------------------------------------------------------------------------
 
-_held = {"depth": 0, "path": None}
+_held = {"depth": 0, "lock": None}
 _held_lock = threading.Lock()
 
 
@@ -137,14 +169,13 @@ def gpu_lock_path():
 
 
 def gpu_holder():
-    """The process that holds the GPU lock now, or None."""
-    h = _read(gpu_lock_path())
-    return h if holder_alive(h) else None
+    """The process that holds the GPU lock now, by its holder file (read only; the lock itself is not touched)."""
+    return FileLock(gpu_lock_path()).holder()
 
 
 def describe(holder):
     if not holder:
-        return "nobody"
+        return "another hotpath process"
     return "hotpath pid %s (%s%s, since %s, working directory %s)" % (
         holder.get("pid"), holder.get("kind") or "?", ": %s" % holder["detail"] if holder.get("detail") else "", holder.get("since") or "?",
         holder.get("cwd") or "?")
@@ -162,13 +193,11 @@ class gpu_work:
             if _held["depth"]:
                 _held["depth"] += 1
                 return self
-        path = gpu_lock_path()
+        lock = FileLock(gpu_lock_path())
         content = dict(me(), kind=self.kind, detail=self.detail, cwd=str(Path.cwd()), since=time.strftime("%Y-%m-%d %H:%M:%S"))
         t_end = time.time() + self.wait_s
-        while True:
-            holder = acquire_file(path, content)
-            if holder is None:
-                break
+        while not lock.try_acquire(content):
+            holder = lock.holder()
             if time.time() >= t_end:
                 raise SystemExit("refused: another hotpath process is using the GPU: %s. One hotpath process does GPU work at a time on this "
                                  "machine (experiments would measure each other); wait for it, stop it (hotpath_job_cancel for an MCP job), "
@@ -176,7 +205,7 @@ class gpu_work:
             self.log("waiting for the GPU: %s" % describe(holder))
             time.sleep(min(30.0, max(1.0, t_end - time.time())))
         with _held_lock:
-            _held["depth"], _held["path"] = 1, path
+            _held["depth"], _held["lock"] = 1, lock
         return self
 
     def __exit__(self, *exc):
@@ -184,22 +213,22 @@ class gpu_work:
             _held["depth"] -= 1
             if _held["depth"] > 0:
                 return False
-            path, _held["path"] = _held["path"], None
+            lock, _held["lock"] = _held["lock"], None
             _held["depth"] = 0
-        if path:
-            release_file(path)
+        if lock:
+            lock.release()
         return False
 
 
 def release_all():
-    """Drop every lock this process holds (used when exiting abnormally)."""
+    """Drop every lock this process holds (used when exiting abnormally; the OS would release them at exit anyway)."""
     with _held_lock:
-        path, _held["path"], _held["depth"] = _held["path"], None, 0
-    if path:
-        release_file(path)
-    for p in list(_session_locks):
-        release_file(p)
-        _session_locks.discard(p)
+        lock, _held["lock"], _held["depth"] = _held["lock"], None, 0
+    if lock:
+        lock.release()
+    for lk in list(_session_locks):
+        lk.release()
+        _session_locks.discard(lk)
 
 
 # ---- session locks ----------------------------------------------------------------------------------------------------
@@ -208,18 +237,20 @@ _session_locks = set()
 
 
 def take_session(sdir):
-    lock = Path(sdir) / "running.lock"
-    holder = acquire_file(lock, dict(me(), since=time.strftime("%Y-%m-%d %H:%M:%S")))
-    if holder is not None:
+    path = Path(sdir) / "running.lock"
+    old = legacy_holder(path)
+    lock = FileLock(path)
+    if old is not None or not lock.try_acquire(dict(me(), since=time.strftime("%Y-%m-%d %H:%M:%S"))):
+        holder = old or lock.holder() or {}
         raise SystemExit("error: session %s is running in another process (pid %s); wait for it (hotpath_job_status) or stop that job, then resume" % (
-            Path(sdir).name, holder.get("pid")))
+            Path(sdir).name, holder.get("pid", "unknown")))
     _session_locks.add(lock)
     return lock
 
 
 def drop_session(lock):
-    release_file(lock)
-    _session_locks.discard(Path(lock))
+    lock.release()
+    _session_locks.discard(lock)
 
 
 # ---- processes hotpath started, and the parent that started hotpath ---------------------------------------------------

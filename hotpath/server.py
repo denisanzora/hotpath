@@ -17,7 +17,8 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
         raise urllib.error.HTTPError(req.full_url, code, "redirect refused (hotpath does not follow redirects): %s" % msg, headers, fp)
 
 
-_OPENER = urllib.request.build_opener(_NoRedirect)
+# loopback only: no redirects and no proxy (an HTTP_PROXY or a system proxy would otherwise receive the request bodies)
+_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect)
 
 
 class ServerError(RuntimeError):

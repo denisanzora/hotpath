@@ -20,7 +20,7 @@ from hotpath import locks
 from hotpath import server as srv
 from hotpath.measure import run_workload, summarize_requests
 from hotpath.observe import binary_identity
-from hotpath.records import env_snapshot, file_identity, new_record, redact_args, redact_path
+from hotpath.records import env_snapshot, file_identity, new_record, redact_args, redact_env, redact_path
 from hotpath.workload import load_workload, workload_identity
 
 
@@ -97,7 +97,7 @@ def plan(spec):
     lines = ["Experiment: %s" % spec["name"], "Rounds: %d, arms: %d -> server launches: %d%s" % (
                  rounds, len(arms), rounds * len(arms), ", requests: %d (%d per launch, warmups included)" % (per_launch * rounds * len(arms), per_launch) if per_launch else ""),
              "Binary: %s" % redact_path(spec["binary"]), "Model: %s" % redact_path(spec["model"]),
-             "Common args: %s" % " ".join(redact_args(spec.get("common_args", []))), "Env: %s" % (spec.get("env") or {}),
+             "Common args: %s" % " ".join(redact_args(spec.get("common_args", []))), "Env: %s" % redact_env(spec.get("env") or {}),
              "Workload: %s, n_predict %s, repetitions %s, warmup %s" % (redact_path(spec["workload"]), spec.get("n_predict") or ("%s (from the workload)" % wl_np if wl_np else "per request body"),
                                                                        spec.get("repetitions", 2), spec.get("warmup", 1)),
              "Preconditions: %s" % (spec.get("preconditions") or {}), ""]
@@ -113,6 +113,7 @@ def plan(spec):
             shown[0] = "%s(%s)" % (redact_path(cmd[0]), redact_path(str(Path(cmd[0]).parent.parent.parent)))
         ov = {k: env.get(k) for k in (spec.get("env") or {})}
         ov.update(a.get("env_override") or {})
+        ov = redact_env(ov)
         req = "   request_override=%s" % a["request_override"] if a.get("request_override") else ""
         lines.append("arm %-12s %s   env=%s%s" % (a["name"], " ".join(shown), ov, req))
     return "\n".join(lines)
@@ -157,6 +158,19 @@ def holders_hint(pc):
                       for p in procs)
     return (". Running now: %s. hotpath does not stop, restart or reconfigure servers it did not start: stop it yourself if it may be interrupted, "
             "or pass --wait-s N to wait until the GPU is free" % names)
+
+
+def _port_free(port):
+    """Whether nothing listens on the loopback port: a bind test, which needs no netstat or lsof."""
+    import socket
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        s.bind(("127.0.0.1", int(port)))
+        return True
+    except OSError:
+        return False
+    finally:
+        s.close()
 
 
 def _launch(cmd, env, log_path):
@@ -224,7 +238,7 @@ def run(spec, out_dir, dry_run=False, wait_for_preconditions_s=0):
 def _run_locked(spec, out_dir, workload, wait_for_preconditions_s):
     pre = spec.get("preconditions") or {}
     port = int(spec.get("port", 8099))
-    holder = gpu_mod.pid_listening_on(port)
+    holder = gpu_mod.pid_listening_on(port) or (None if _port_free(port) else "unknown")
     if holder:
         # whatever the preconditions say: a server already answers on this port, so hotpath's requests (and slot erases) would
         # reach a server it did not start, such as the user's own
@@ -274,7 +288,7 @@ def _run_locked(spec, out_dir, workload, wait_for_preconditions_s):
                 # per-arm identity: arms may differ only by binary or model, and version strings can be identical across builds
                 arm_rec["binary"] = binary_identity(cmd[0], spec.get("path_prepend"))
                 arm_rec["model"] = file_identity(cmd[2])
-                arm_rec["env_ggml"] = {k: v for k, v in env.items() if k.startswith(("GGML_", "LLAMA_"))}
+                arm_rec["env_ggml"] = redact_env({k: v for k, v in env.items() if k.startswith(("GGML_", "LLAMA_"))})
                 arm_rec["args"] = [redact_path(cmd[0]), "--model", redact_path(cmd[2])] + redact_args(cmd[3:])
                 sib = Path(cmd[0]).parent / "ggml-cuda.dll"
                 if sib.is_file():
@@ -282,7 +296,7 @@ def _run_locked(spec, out_dir, workload, wait_for_preconditions_s):
             try:
                 srv.wait_healthy(base, timeout_s=int(spec.get("health_timeout_s", 600)), proc=proc)
                 owner = gpu_mod.pid_listening_on(port)
-                if owner != proc.pid:
+                if owner is not None and owner != proc.pid:
                     raise srv.ServerError("the server answering on port %d is pid %s, not the llama-server hotpath launched (pid %s); no requests sent" % (
                         port, owner, proc.pid))
                 load_s = round(time.time() - t0, 1)

@@ -9,7 +9,9 @@ cache_n), the wall time, and the generated token ids, so prefill, generation, an
 latency are kept apart and outputs can be compared across arms.
 """
 import hashlib
+import hmac
 import json
+import os
 import time
 
 from hotpath import gpu as gpu_mod
@@ -175,10 +177,11 @@ def field_kind(prop):
             "array": "structure"}.get(t, "other")
 
 
-def output_fields(content, schema):
-    """Per property the schema declares at the top level: a short hash of the output's value (or "missing"), and the
+def output_fields(content, schema, key=None):
+    """Per property the schema declares at the top level: a short keyed hash of the output's value (or "missing"), and the
     property's kind. Lets two arms' outputs be compared field by field (did the same decision come out?) without storing
-    output text; keys the schema does not declare are output content and are not recorded."""
+    output text; keys the schema does not declare are output content and are not recorded. The key is a per-run secret
+    kept in memory only, so a short value (an enum, a boolean, a score) cannot be recovered by hashing candidates."""
     if not isinstance(schema, dict) or not isinstance(schema.get("properties"), dict) or not schema["properties"]:
         return None, None
     try:
@@ -191,8 +194,19 @@ def output_fields(content, schema):
     for k, prop in schema["properties"].items():
         k = str(k)
         kinds[k] = field_kind(prop)
-        fields[k] = hashlib.sha256(json.dumps(obj[k], sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()[:12] if k in obj else "missing"
+        if k not in obj:
+            fields[k] = "missing"
+            continue
+        raw = json.dumps(obj[k], sort_keys=True, ensure_ascii=False).encode("utf-8")
+        fields[k] = hmac.new(key, raw, hashlib.sha256).hexdigest()[:12] if key else hashlib.sha256(raw).hexdigest()[:12]
     return fields, kinds
+
+
+def _field_key(workload):
+    """The per-run key of output field hashes: set by the experiment runner for all arms of one run (in memory only)."""
+    if not workload.get("_field_key"):
+        workload["_field_key"] = os.urandom(16)
+    return workload["_field_key"]
 
 
 def cache_state(timings):
@@ -296,7 +310,7 @@ def run_requests_workload(base, workload, repetitions=3, warmup=1, request_overr
             # an arm that drops the schema is still measured on whether its output satisfies what the application requires
             rec.update(_validity(content, _schema_of(it["body"]), schema_mode))
             rec["validity_schema_from"] = "workload item" if _schema_of(it["body"]) is not None else None
-            rec["fields"], rec["field_kinds"] = output_fields(content, _schema_of(it["body"]))
+            rec["fields"], rec["field_kinds"] = output_fields(content, _schema_of(it["body"]), _field_key(workload))
             (out["warmup_requests"] if phase == "warmup" else out["requests"]).append(rec)
             if progress:
                 progress("%s rep %d %s: prompt_n=%s cache_n=%s (%s) pp=%s t/s tg=%s t/s (%s tok) wall=%s ms valid_json=%s schema_valid=%s" % (

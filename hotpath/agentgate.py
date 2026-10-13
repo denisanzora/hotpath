@@ -28,8 +28,11 @@ _TUNING_SETTINGS = ("n_gpu_layers", "ctx_size", "batch_size", "ubatch_size", "pa
 VALUE_FLAGS = frozenset(s for name in _TUNING_SETTINGS for s in launch.FLAGS[name]) | frozenset({
     "--reasoning-format", "--reasoning-budget", "--chat-template", "--cache-reuse", "-dt", "--defrag-thold", "-lm", "--load-mode",
     "-n", "--n-predict", "--keep", "--threads-http", "-to", "--timeout", "-sps", "--slot-prompt-similarity", "--numa", "--prio", "--poll",
-    "--prio-batch", "--poll-batch", "-fitc", "--fit-ctx", "-fitt", "--fit-target", "--log-colors", "-lv", "--log-verbosity",
+    "--prio-batch", "--poll-batch", "-fitc", "--fit-ctx", "-fitt", "--fit-target", "--log-colors",
     "-ctkd", "-ctvd", "--cache-type-k-draft", "--cache-type-v-draft",
+    "--temp", "--top-k", "--top-p", "--min-p", "--typical", "--repeat-penalty", "--repeat-last-n", "--presence-penalty", "--frequency-penalty",
+    "-s", "--seed", "--samplers", "--sampling-seq", "--mirostat", "--mirostat-lr", "--mirostat-ent", "--dry-multiplier", "--dry-base",
+    "--dry-allowed-length", "--dry-penalty-last-n", "--xtc-probability", "--xtc-threshold", "--top-nsigma",
 })
 BOOLEAN_FLAGS = frozenset({
     "--metrics", "--slots", "--no-slots", "--no-webui", "-cb", "--cont-batching", "-nocb", "--no-cont-batching", "--jinja", "--no-jinja",
@@ -37,8 +40,9 @@ BOOLEAN_FLAGS = frozenset({
     "--no-kv-offload", "--warmup", "--no-warmup", "--check-tensors", "--perf", "--no-perf", "--context-shift", "--no-context-shift",
     "--op-offload", "--no-op-offload", "--offline", "-dio", "--direct-io", "-ndio", "--no-direct-io", "--repack", "-nr", "--no-repack",
     "--no-host", "--cache-idle-slots", "--no-cache-idle-slots", "--cache-prompt", "--no-cache-prompt", "-fa-off", "--log-disable",
-    "--log-timestamps", "--no-log-timestamps", "--log-prefix", "--no-log-prefix", "-v", "--verbose", "--log-verbose",
+    "--log-timestamps", "--no-log-timestamps", "--log-prefix", "--no-log-prefix",
 })
+# not allowed although harmless to the GPU: -v/--verbose/-lv write prompts and outputs into the server log
 ALLOWED_FLAGS = VALUE_FLAGS | BOOLEAN_FLAGS
 
 # environment variables: runtime tuning knobs only. Not GGML_* or CUDA_* wholesale: GGML_BACKEND_PATH and
@@ -75,7 +79,15 @@ def roots():
     return out
 
 
+def is_network_path(value):
+    v = str(value)
+    return v.startswith(("\\\\", "//")) or v.lower().startswith(("\\\\?\\unc", "file:"))
+
+
 def inside_roots(value, what):
+    if is_network_path(value):
+        # refused before anything resolves it: resolving a \\host\share path makes Windows contact that host
+        raise ValueError("%s must be a local path, not a network path" % what)
     p = Path(value).resolve()
     rs = roots()
     if not any(r == p or r in p.parents for r in rs):
@@ -118,6 +130,34 @@ def spec_problems(spec):
     if not isinstance(spec, dict) or not isinstance(spec.get("arms"), list):
         return ["spec is not an experiment spec (needs an `arms` list)"]
     problems = []
+    refs_ok = {("spec", "binary"), ("spec", "model"), ("spec", "path_prepend")}
+
+    def refs(where, v, path=()):
+        # ${key} references resolve from the operator's config; anywhere but these fields they would carry configuration values
+        # (private paths, keys, server_args) into a launch or into a passive plan's output
+        if isinstance(v, str) and "${" in v and (where, path[0] if path else None) not in refs_ok and not (where.startswith("arm ") and path in (("binary",), ("model",))):
+            problems.append("%s: %s uses a ${...} reference; only binary, model and path_prepend may" % (where, ".".join(path) or "a value"))
+        elif isinstance(v, dict):
+            for k, x in v.items():
+                refs(where, x, path + (str(k),))
+        elif isinstance(v, list):
+            for x in v:
+                refs(where, x, path)
+    for k, v in spec.items():
+        if k != "arms":
+            refs("spec", v, (k,))
+    for a in spec["arms"]:
+        if isinstance(a, dict):
+            for k, v in a.items():
+                refs("arm %s" % a.get("name"), v, (k,))
+    for a in spec["arms"]:
+        if not isinstance(a, dict):
+            continue
+        for k, t in (("args_override", dict), ("args_remove", list), ("env_override", dict), ("env_remove", list), ("request_override", dict)):
+            if a.get(k) is not None and not isinstance(a[k], t):
+                problems.append("arm %s: %s must be %s" % (a.get("name"), k, "an object" if t is dict else "a list"))
+    if problems:
+        return problems
     try:
         port = int(spec.get("port", 8099))
         if not 1024 <= port <= 65535:
@@ -177,12 +217,13 @@ def workload_problems(path):
             w = json.load(f)
     except (OSError, ValueError):
         return []       # the runner reports an unreadable workload itself
+    out = []
     if isinstance(w, dict) and w.get("subset_of"):
         try:
             inside_roots(resolve_relative(w["subset_of"], path), "the workload's subset_of")
         except ValueError as e:
             return [str(e)]
-    return []
+    return out
 
 
 def resolve_relative(target, relative_to_file):

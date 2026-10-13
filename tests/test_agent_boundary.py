@@ -205,57 +205,86 @@ class ResumeIntegrityTests(unittest.TestCase):
         self.assertTrue(plan["stopped_because"].startswith("dry run"), plan["stopped_because"])
 
 
+HOLDER = """
+import sys, time
+sys.path.insert(0, %r)
+from hotpath import locks
+if sys.argv[1] == "gpu":
+    with locks.gpu_work("experiment", "other-run"):
+        print("held", flush=True)
+        time.sleep(60)
+else:
+    locks.take_session(sys.argv[2])
+    print("held", flush=True)
+    time.sleep(60)
+"""
+
+
 class LockTests(unittest.TestCase):
-    """failures 5 and 6"""
+    """failures 5 and 6, with a real second process holding the lock"""
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         os.environ["HOTPATH_GPU_LOCK_DIR"] = self.tmp.name
+        self.procs = []
 
     def tearDown(self):
+        for p in self.procs:
+            if p.poll() is None:
+                p.kill()
+                p.wait(10)
+            p.stdout.close()
         os.environ.pop("HOTPATH_GPU_LOCK_DIR", None)
         locks.release_all()
         self.tmp.cleanup()
 
-    def _foreign_live_holder(self):
-        return {"pid": os.getppid(), "start": locks.process_start(os.getppid()), "kind": "experiment", "detail": "other-run"}
+    def _holder(self, *args):
+        here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        p = subprocess.Popen([sys.executable, "-c", HOLDER % here] + list(args), stdout=subprocess.PIPE, stdin=subprocess.DEVNULL, text=True,
+                             env=dict(os.environ))
+        self.procs.append(p)
+        self.assertEqual(p.stdout.readline().strip(), "held")
+        return p
 
-    def test_gpu_lock_refuses_while_another_live_process_holds_it_and_names_it(self):
-        with open(locks.gpu_lock_path(), "w", encoding="utf-8") as f:
-            json.dump(self._foreign_live_holder(), f)
+    def test_gpu_lock_refuses_while_another_process_holds_it_and_names_it(self):
+        p = self._holder("gpu")
         with self.assertRaises(SystemExit) as cm:
             with locks.gpu_work("experiment", "mine"):
                 pass
         self.assertIn("other-run", str(cm.exception))
-        self.assertIn(str(os.getppid()), str(cm.exception))
+        self.assertIn(str(p.pid), str(cm.exception))
 
-    def test_a_stale_or_recycled_pid_lock_is_replaced(self):
-        holder = self._foreign_live_holder()
-        holder["start"] = "123"                                        # the pid exists, but it is another process now
-        with open(locks.gpu_lock_path(), "w", encoding="utf-8") as f:
-            json.dump(holder, f)
+    def test_a_dead_holder_leaves_no_lock_behind(self):
+        p = self._holder("gpu")
+        p.kill()
+        p.wait(10)
         with locks.gpu_work("experiment", "mine"):
-            self.assertEqual(json.load(open(locks.gpu_lock_path()))["pid"], os.getpid())
-        self.assertFalse(locks.gpu_lock_path().exists())
+            self.assertEqual(locks.gpu_holder()["pid"], os.getpid())
+        self.assertIsNone(locks.gpu_holder())
+
+    def test_a_holder_file_without_a_lock_is_not_a_holder(self):
+        with open(str(locks.gpu_lock_path()) + ".holder", "w", encoding="utf-8") as f:
+            json.dump({"pid": os.getppid(), "start": locks.process_start(os.getppid()), "kind": "experiment"}, f)
+        with locks.gpu_work("experiment", "mine"):
+            pass
 
     def test_reentrant_within_one_process(self):
         with locks.gpu_work("improve", "session"):
             with locks.gpu_work("experiment", "step"):
                 pass
-            self.assertTrue(locks.gpu_lock_path().exists(), "the inner release must not drop the outer hold")
-        self.assertFalse(locks.gpu_lock_path().exists())
+            self.assertEqual((locks.gpu_holder() or {}).get("pid"), os.getpid(), "the inner release must not drop the outer hold")
+        self.assertIsNone(locks.gpu_holder())
 
-    def test_session_lock_is_exclusive_and_atomic(self):
+    def test_session_lock_is_exclusive_and_released_by_a_dying_holder(self):
         d = self.tmp.name
-        with open(os.path.join(d, "running.lock"), "w", encoding="utf-8") as f:
-            json.dump(self._foreign_live_holder(), f)
-        with self.assertRaises(SystemExit):
+        p = self._holder("session", d)
+        with self.assertRaises(SystemExit) as cm:
             locks.take_session(d)
-        os.remove(os.path.join(d, "running.lock"))
+        self.assertIn(str(p.pid), str(cm.exception))
+        p.kill()
+        p.wait(10)
         lk = locks.take_session(d)
-        self.assertTrue(os.path.exists(lk))
         locks.drop_session(lk)
-        self.assertFalse(os.path.exists(lk))
 
 
 class OrphanTests(unittest.TestCase):

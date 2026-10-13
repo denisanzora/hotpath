@@ -236,8 +236,9 @@ def listening_ports():
 
 
 def _get(url, timeout=3.0, text=False):
+    from hotpath.server import _OPENER
     req = urllib.request.Request(url, headers={"Accept": "text/plain" if text else "application/json"})
-    with urllib.request.urlopen(req, timeout=timeout) as r:
+    with _OPENER.open(req, timeout=timeout) as r:
         raw = r.read().decode("utf-8", "replace")
         return raw if text else json.loads(raw)
 

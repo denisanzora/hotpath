@@ -431,6 +431,15 @@ def _kill_tree(proc):
             proc.kill()
 
 
+def _child_argv(argv):
+    """`python -m hotpath` puts the working directory first on sys.path, so a .py file an agent wrote there (argparse.py,
+    json.py) would run inside every child. Children run isolated (-I: no working directory, user site or PYTHON*
+    variables on the path) with this hotpath's own location added explicitly."""
+    pkg_parent = str(Path(__file__).resolve().parent.parent)
+    boot = "import sys; sys.path.insert(0, %r); from hotpath.cli import main; sys.exit(main(sys.argv[1:]))" % pkg_parent
+    return [sys.executable, "-I", "-c", boot] + list(argv)
+
+
 def _child_env():
     from hotpath import locks
     env = dict(os.environ)
@@ -470,7 +479,7 @@ def _run_child(argv, timeout_s):
         kw["start_new_session"] = True
     t0 = time.time()
     # stdin=DEVNULL: the child must never read (or wait on) this server's JSON-RPC pipe
-    proc = subprocess.Popen([sys.executable, "-m", "hotpath"] + argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, stdin=subprocess.DEVNULL,
+    proc = subprocess.Popen(_child_argv(argv), stdout=subprocess.PIPE, stderr=subprocess.PIPE, stdin=subprocess.DEVNULL,
                             text=True, encoding="utf-8", errors="replace", env=_child_env(), **kw)
     try:
         out, err = proc.communicate(timeout=timeout_s)
@@ -502,7 +511,7 @@ class Job:
         self.cancelled = False
         kw = {"start_new_session": True} if os.name != "nt" else {}
         self._out, self._err = open(self.out_path, "w", encoding="utf-8"), open(self.err_path, "w", encoding="utf-8")
-        self.proc = subprocess.Popen([sys.executable, "-m", "hotpath"] + argv, stdout=self._out, stderr=self._err, stdin=subprocess.DEVNULL,
+        self.proc = subprocess.Popen(_child_argv(argv), stdout=self._out, stderr=self._err, stdin=subprocess.DEVNULL,
                                      env=_child_env(), **kw)
         self.done = threading.Event()
         threading.Thread(target=self._watch, daemon=True).start()
@@ -778,9 +787,17 @@ def main():
             if not line:
                 continue
             try:
-                handle(json.loads(line), threaded=True)
+                msg = json.loads(line)
             except json.JSONDecodeError:
                 _reply(None, error={"code": -32700, "message": "parse error"})
+                continue
+            if not isinstance(msg, dict):
+                _reply(None, error={"code": -32600, "message": "invalid request: not a JSON-RPC object"})
+                continue
+            try:
+                handle(msg, threaded=True)
+            except Exception as e:  # noqa: BLE001 - one bad message must not end the server
+                _reply(msg.get("id"), error={"code": -32603, "message": "internal error: %s" % type(e).__name__})
     finally:
         # input ended: answer the calls already received (a piped client still reads them; each is bounded by its own
         # timeout), then stop the jobs this server started, so no experiment keeps the GPU without anyone to report to

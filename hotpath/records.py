@@ -87,9 +87,31 @@ def scrub(obj):
     return obj
 
 
+SECRET_ARG_FLAGS = ("--api-key", "--hf-token", "-hft")
+
+
 def redact_args(args):
-    """Redact command-line values that look like filesystem paths (e.g. --lora, --mmproj, --log-file)."""
-    return [redact_path(a) if (isinstance(a, str) and not a.startswith("-") and ("/" in a or "\\" in a)) else a for a in args]
+    """Redact command-line values that look like filesystem paths (e.g. --lora, --mmproj, --log-file), and the values of
+    secret arguments (--api-key, --hf-token)."""
+    out, hide = [], False
+    for a in args:
+        if hide:
+            out.append("<redacted>")
+            hide = False
+            continue
+        s = str(a)
+        flag = s.split("=", 1)[0].replace("_", "-") if s.startswith("--") else s
+        if flag in SECRET_ARG_FLAGS:
+            out.append(flag + "=<redacted>" if "=" in s else s)
+            hide = "=" not in s
+            continue
+        out.append(redact_path(a) if (isinstance(a, str) and not a.startswith("-") and ("/" in a or "\\" in a)) else a)
+    return out
+
+
+def redact_env(env):
+    """Environment values with secret-looking names replaced."""
+    return {k: ("<redacted>" if re.search(r"KEY|TOKEN|SECRET|PASSWORD", str(k).upper()) else v) for k, v in (env or {}).items()}
 
 
 def new_record(kind, evidence_class, **fields):
@@ -109,9 +131,14 @@ def new_record(kind, evidence_class, **fields):
 SAFE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,159}$")
 
 
+_DEVICE_NAMES = {"CON", "PRN", "AUX", "NUL"} | {"COM%d" % i for i in range(1, 10)} | {"LPT%d" % i for i in range(1, 10)}
+
+
 def check_name(name, what="name"):
-    """Names become file names (records, server logs, slot directories): no path separators, no `..`."""
-    if not isinstance(name, str) or not SAFE_NAME.match(name) or ".." in name:
+    """Names become file names (records, server logs, slot directories): no path separators, no `..`, no trailing dot,
+    no Windows device name."""
+    if not isinstance(name, str) or not SAFE_NAME.fullmatch(name) or ".." in name or name.endswith(".") or \
+            name.split(".")[0].upper() in _DEVICE_NAMES:
         raise ValueError("%s %r must be letters, digits, '.', '_' or '-' (it becomes a file name)" % (what, name))
     return name
 
