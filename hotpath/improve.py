@@ -481,7 +481,16 @@ def _reusing(runner, sdir, log, cfg=None):
         rec = runner(spec, spec_path)
         rec["spec_fingerprint"] = spec_fingerprint(spec, cfg)
         return rec
+
+    def fresh(spec, spec_path):
+        # a run whose record may grant a recommendation: always executed by this process, never taken from disk, where
+        # a file is only as trustworthy as whoever could write to the session directory
+        rec = runner(spec, spec_path)
+        rec["spec_fingerprint"] = spec_fingerprint(spec, cfg)
+        rec["run_owned"] = {"pid": __import__("os").getpid(), "session": Path(sdir).name}
+        return rec
     run.cfg = cfg
+    run.fresh = fresh
     return run
 
 
@@ -744,6 +753,9 @@ def _improve(cfg, start_records, workload, out_dir, runner, max_experiments, max
         verdict = next((v for v in diag.get("experiment_verdicts") or [] if v["experiment"] == rec["name"]), None)
         step = {"step": n, "finding": f["id"], "title": f.get("title"), "experiment_kind": f["experiment"]["kind"], "experiment": name,
                 "record": rpath.name, "arms": [a["name"] for a in spec["arms"]], "estimated_minutes": need}
+        if rec.get("_reused_from"):
+            # measured earlier in this session (a resumed run): it chooses what the validation tests, never what is recommended
+            step["reused_from_disk"] = rec["_reused_from"]
         rows = _rank_rows(verdict) if verdict else []
         arm_of = {a["name"]: a for a in spec["arms"]}
         base_name = spec["arms"][0]["name"]
@@ -1119,7 +1131,7 @@ def _result(cfg, original, cum, adopted_steps, records, workload, port, rounds, 
         if len(kept) < len(adopted_steps):
             last["verdict"] += " (validated without %s, which did not pass alone or together)" % ", ".join(st["finding"] for st in adopted_steps if st not in kept)
         return {"verdict": last["verdict"], "measured_by": last["measured_by"], "measured": last.get("measured"), "validated": True,
-                "validated_changes": [st["finding"] for st in kept], "basis": last["basis"]}
+                "validated_changes": [st["finding"] for st in kept], "basis": last["basis"] + "; run by this process against the configured model and build"}
     first = tried[0]
     untried = [label for label, _ in candidates[len(tried):]]
     note = ""
@@ -1210,7 +1222,11 @@ def _validate(cfg, original, steps_, records, port, rounds, repetitions, warmup,
                                                 ", about %.0f min" % est["minutes"] if est else ""))
     t0 = time.time()
     try:
-        rec = runner(spec, str(path))
+        # a validation is the only evidence that can make a change "recommended": it is run by this process every time, also
+        # on resume (a validation record on disk could have been written by anyone who can write to the session directory)
+        rec = (runner.fresh if hasattr(runner, "fresh") else runner)(spec, str(path))
+    except _DryRunStop:
+        return dict(base, verdict="not validated: dry run", why="not adopted: dry run", stop=True)
     except SystemExit as e:
         return dict(base, verdict="not validated: %s" % e, why="not adopted: %s" % e, stop=True)
     finally:
@@ -1221,6 +1237,9 @@ def _validate(cfg, original, steps_, records, port, rounds, repetitions, warmup,
     if not row:
         return dict(base, measured_by=name, verdict="not validated: the validation run produced no comparison", why="not adopted: no comparison")
     ok, why, _ = adoptable(row, v, improved, rec.get("arms"), "original", cfg)
+    ident = validation_identity(rec, cfg)
+    if ok and ident:
+        ok, why = False, "not adopted: %s" % ident
     if ok and "preliminary" in (row.get("verdict") or ""):
         ok, why = False, "not adopted: insufficient evidence: the validation run was preliminary (%s); more rounds or requests are needed" % (
             row["verdict"].split("(", 1)[1].split(")", 1)[0] if "(" in row["verdict"] else "too few prompts or rounds")
@@ -1230,6 +1249,25 @@ def _validate(cfg, original, steps_, records, port, rounds, repetitions, warmup,
     return dict(base, measured_by=name, row=row, why=why, verdict=row["verdict"], measured=_metric_line(row), validated=ok, confirmation=conf,
                 basis="one paired run of your original launch against the launch with %s, on a broader workload (%s)" % (
                     ", ".join(st["finding"] for st in steps_), vbasis))
+
+
+def validation_identity(rec, cfg):
+    """Why a validation record does not bind its result to the configured model and llama-server build, or None. The
+    record's model and binary identity (size and a hash of the first 64 MiB, taken when the run started) must match the
+    configured files now; a configured file that does not exist (a test's stand-in) is not judged."""
+    from hotpath.records import file_identity
+    key = lambda x: ((x or {}).get("size_bytes"), (x or {}).get("sha256_head64m"))
+    for what, rec_key, cfg_key in (("model", "model", "model_path"), ("llama-server build", "binary", "runtime_binary")):
+        path = (cfg or {}).get(cfg_key)
+        if not path or not Path(str(path)).is_file():
+            continue
+        mine = file_identity(str(path))
+        seen = rec.get(rec_key) or {}
+        if not seen.get("size_bytes"):
+            return "the validation record does not state which %s it measured" % what
+        if key(seen) != key(mine):
+            return "the validation measured another %s (%s) than %s in hotpath.local.json (%s) now" % (what, seen.get("basename"), cfg_key, mine.get("basename"))
+    return None
 
 
 def recommended_launch(user_args, cum, observed, validated=True, adopted=False):
@@ -1355,6 +1393,9 @@ def improvement_markdown(rec):
         L += ["## What was tested", ""]
         for st in rec["steps"]:
             L.append("%d. **%s** (%s): %s" % (st["step"], st["finding"], st["experiment_kind"], st.get("title") or ""))
+            if st.get("reused_from_disk"):
+                L.append("   - measured earlier in this session (%s, reused on resume); only a validation run by this process can make it recommended" %
+                         st["reused_from_disk"])
             why = st["why"][len("not adopted: "):] if st["why"].startswith("not adopted: ") else (st["why"][len("adopted: "):] if st["why"].startswith("adopted: ") else st["why"])
             L.append("   - %s: %s" % ("kept" if st["adopted"] else "not kept", why))
             if st.get("fidelity"):

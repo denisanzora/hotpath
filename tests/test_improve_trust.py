@@ -128,7 +128,9 @@ class TrustTests(unittest.TestCase):
         n = len(runner.specs)
         runner2 = GuardedRunner()
         second = self.run_loop(runner2, max_experiments=2, session=first["session"], resume=True)
-        self.assertEqual(runner2.specs, [], "completed experiments must be reused, not re-run")
+        # completed steps are reused; a validation, the only evidence that can recommend, is always run again by this process
+        self.assertTrue(runner2.specs, "the validation runs again")
+        self.assertTrue(all(s["provenance"].get("experiment_kind") == "confirmation" for s in runner2.specs), [s["name"] for s in runner2.specs])
         self.assertEqual([s["adopted"] for s in first["steps"]], [s["adopted"] for s in second["steps"]])
         self.assertGreater(n, 0)
 

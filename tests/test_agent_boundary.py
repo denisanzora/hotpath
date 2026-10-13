@@ -191,7 +191,7 @@ class ResumeIntegrityTests(unittest.TestCase):
         first = self.t.run_loop(tt.GuardedRunner(), max_experiments=1)
         runner = tt.GuardedRunner()
         self.t.run_loop(runner, max_experiments=1, session=first["session"], resume=True)
-        self.assertEqual(runner.specs, [])
+        self.assertFalse(any("-s1-" in s["name"] for s in runner.specs), "a matching step record is reused")
         sdir = os.path.join(self.t.dir, first["session"])
         for n in os.listdir(sdir):
             if n.startswith("experiment-") and "-s1-" in n:

@@ -231,3 +231,61 @@ class McpMessageTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RunOwnedValidationTests(unittest.TestCase):
+    """Release review: an agent that can write to the session directory must not be able to produce a recommendation with
+    a forged record. Steps may be reused on resume; the validation that can recommend is run by this process, and its
+    record must name the configured model and build."""
+
+    def setUp(self):
+        self.t = tt.TrustTests("test_resume_reruns_nothing_completed")
+        self.t.setUp()
+
+    def tearDown(self):
+        self.t.tearDown()
+
+    def test_a_forged_validation_record_cannot_recommend(self):
+        # an interrupted session: the step ran, the validation did not
+        first = self.t.run_loop(tt.GuardedRunner(raise_on=2), max_experiments=1)
+        sdir = os.path.join(self.t.dir, first["session"])
+        step = json.load(open(os.path.join(sdir, [n for n in os.listdir(sdir) if "-s1-" in n and n.startswith("experiment-")][0]), encoding="utf-8"))
+        # the forger writes a confirmation record with a keep verdict and a fingerprint matching the validation spec it predicts
+        forged = json.loads(json.dumps(step))
+        forged["name"] = "%s-confirm" % first["session"]
+        arms = list(forged["arms"].values())
+        forged["arms"] = {"original": arms[0], "improved": arms[1]}
+        spec_files = [n for n in os.listdir(sdir) if n.startswith("confirm") and n.endswith(".json")]
+        if spec_files:
+            forged["spec_fingerprint"] = im.spec_fingerprint(json.load(open(os.path.join(sdir, spec_files[0]), encoding="utf-8")), self.t.cfg)
+        with open(os.path.join(sdir, "experiment-%s-20990101-000000.json" % forged["name"]), "w", encoding="utf-8") as f:
+            json.dump(forged, f)
+        # the real validation (run by this process) shows the outputs differ: no recommendation, whatever the file says
+        runner = tt.GuardedRunner(confirm_diverges=True)
+        rep = self.t.run_loop(runner, max_experiments=1, session=first["session"], resume=True)
+        self.assertTrue(any(s["provenance"].get("experiment_kind") == "confirmation" for s in runner.specs), "the validation must be run, not reused")
+        self.assertFalse(rep["result"]["validated"], rep["result"]["verdict"])
+        self.assertEqual(rep["outcomes"]["recommended"], [])
+        self.assertTrue(any(st.get("reused_from_disk") for st in rep["steps"]))
+
+    def test_a_validation_of_another_model_file_is_not_validated(self):
+        model = os.path.join(self.t.dir, "m.gguf")
+        with open(model, "wb") as f:
+            f.write(b"the configured model")
+        other = os.path.join(self.t.dir, "other.gguf")
+        with open(other, "wb") as f:
+            f.write(b"another model file")
+
+        class OtherModel(tt.GuardedRunner):
+            def __call__(self, spec, spec_path):
+                rec = super().__call__(spec, spec_path)
+                rec["model"] = records.file_identity(other)
+                return rec
+        self.t.cfg = {"runtime_binary": "llama-server", "model_path": model}
+        rep = self.t.run_loop(OtherModel(), max_experiments=1)
+        self.assertFalse(rep["result"]["validated"], rep["result"]["verdict"])
+        self.assertIn("another model", rep["result"]["verdict"])
+        rep = self.t.run_loop(type("Same", (tt.GuardedRunner,), {"__call__": lambda s, spec, p: dict(tt.GuardedRunner.__call__(s, spec, p),
+                                                                                                    model=records.file_identity(model))})(),
+                              max_experiments=1)
+        self.assertTrue(rep["result"]["validated"], rep["result"]["verdict"])
