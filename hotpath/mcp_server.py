@@ -437,7 +437,9 @@ def _child_argv(argv):
     variables on the path) with this hotpath's own location added explicitly."""
     pkg_parent = str(Path(__file__).resolve().parent.parent)
     boot = "import sys; sys.path.insert(0, %r); from hotpath.cli import main; sys.exit(main(sys.argv[1:]))" % pkg_parent
-    return [sys.executable, "-I", "-c", boot] + list(argv)
+    # -I also ignores PYTHONUNBUFFERED and PYTHONIOENCODING: -u keeps job output unbuffered (job status shows progress as
+    # it happens) and -X utf8 keeps it UTF-8
+    return [sys.executable, "-I", "-u", "-X", "utf8", "-c", boot] + list(argv)
 
 
 def _child_env():
