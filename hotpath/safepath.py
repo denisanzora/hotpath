@@ -69,7 +69,7 @@ def os_description():
     if os.name != "nt":
         return platform.platform()
     v = sys.getwindowsversion()
-    major, minor, build = getattr(v, "platform_version", None) or (v.major, v.minor, v.build)
+    major, minor, build = v.major, v.minor, v.build          # the running build, as `ver` reports it (platform_version is a DLL's)
     return "Windows-%s-%d.%d.%d-SP%d" % (major if minor == 0 else "%d.%d" % (major, minor), major, minor, build, v.service_pack_major)
 
 
