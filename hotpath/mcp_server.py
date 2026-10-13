@@ -39,7 +39,16 @@ from hotpath import __version__
 PROTOCOL_VERSION = "2024-11-05"
 MAX_OUTPUT_CHARS = 20000
 DEFAULT_RESULT_WAIT_S = 45
-MAX_RESULT_WAIT_S = 55
+MAX_RESULT_WAIT_S = 55          # default cap per call; an operator whose client allows longer tool calls raises it (HOTPATH_MCP_MAX_WAIT_S)
+
+
+def _max_wait():
+    """Longest a call may wait for a job: 55 s by default (below the ~60 s some clients allow a tool call), or the operator's
+    HOTPATH_MCP_MAX_WAIT_S for clients that allow longer calls, which means fewer status polls."""
+    try:
+        return max(5, min(3600, int(os.environ.get("HOTPATH_MCP_MAX_WAIT_S", MAX_RESULT_WAIT_S))))
+    except ValueError:
+        return MAX_RESULT_WAIT_S
 ENABLE_ACTIVE_HINT = ("To allow them, the user restarts this MCP server with the environment variable HOTPATH_MCP_ALLOW_ACTIVE=1, e.g. "
                       "Claude Code: `claude mcp add hotpath -e HOTPATH_MCP_ALLOW_ACTIVE=1 -- hotpath-mcp` (or \"env\": {\"HOTPATH_MCP_ALLOW_ACTIVE\": \"1\"} "
                       "in the server's entry in .mcp.json); OpenCode: \"environment\": {\"HOTPATH_MCP_ALLOW_ACTIVE\": \"1\"} in the mcp entry of opencode.json; "
@@ -104,7 +113,7 @@ _STR = {"type": "string"}
 _INT = {"type": "integer"}
 _CONFIRM = {"type": "boolean", "description": "Must be true. Also requires the server to run with HOTPATH_MCP_ALLOW_ACTIVE=1."}
 _TIMEOUT = {"type": "integer", "description": "Seconds before the job's process tree is killed (default 7200, capped by HOTPATH_MCP_MAX_TIMEOUT_S)."}
-_RESULT_WAIT = {"type": "integer", "description": "Return the result if the job finishes within this many seconds (default 45, max 55); "
+_RESULT_WAIT = {"type": "integer", "description": "Return the result if the job finishes within this many seconds (default 45, max 55 unless the operator raised it); "
                 "otherwise return a job id to poll with hotpath_job_status."}
 
 # name -> (description, schema, active, argv builder)
@@ -335,15 +344,17 @@ def _improve_argv(a, dry_run):
 
 @tool("hotpath_improve_plan", "Passive dry run of hotpath_improve: diagnoses the starting point (the running server observed passively, or nothing "
       "running) and writes the first experiment spec; reports the finding it would test, the arms, the free VRAM needed and a rough duration. "
-      "Launches nothing. Show this to the user before asking to run hotpath_improve.", _s(dict(_IMPROVE_PROPS)))
+      "Starts no llama-server and no GPU work (discovery may run `llama-server --version` on installed binaries). Show this to the user before "
+      "asking to run hotpath_improve. With `requests` (the user's captured request bodies) the steps and the validation use those real requests.", _s(dict(_IMPROVE_PROPS)))
 def _improve_plan(a):
     return _improve_argv(a, True)
 
 
 @tool("hotpath_improve", "ACTIVE, the whole loop in one job: tests the top finding with a one-variable experiment on hotpath's own llama-server "
       "(never the user's), adopts a change only on a keep verdict (faster, consistent, identical outputs, verified cache state; cache flags "
-      "only with real-traffic evidence), repeats within the budget, confirms several adopted changes in one paired original-vs-improved run, "
-      "and reports the launch line to apply. Starts with a baseline run when no server or log exists. Uses the GPU for tens of minutes; runs as "
+      "only with real-traffic evidence), repeats within the budget, validates the adopted changes against the original launch on a broader "
+      "workload (the user's own requests with `requests`), and reports each option as recommended, needs review, rejected or inconclusive, "
+      "with the launch line to apply only for what was validated. Starts with a baseline run when no server or log exists. Uses the GPU for tens of minutes; runs as "
       "a job (poll hotpath_job_status). Requires confirm=true and HOTPATH_MCP_ALLOW_ACTIVE=1. Changes nothing on the user's server.",
       _s(dict(_IMPROVE_PROPS, wait_s=_INT, confirm=_CONFIRM, timeout_s=_TIMEOUT, wait_for_result_s=_RESULT_WAIT), ["confirm"]), active=True)
 def _improve(a):
@@ -538,11 +549,19 @@ class Job:
             totals = next((re.search(r"running (\d+) launches, (\d+) requests", ln) for ln in lines if ln.startswith("running ")), None)
             launches = [re.search(r"\(launch (\d+)/(\d+)\)", ln) for ln in lines if "launching arm" in ln]
             done_requests = sum(1 for ln in lines if ln.strip().startswith(("warmup rep", "rep rep")))
+            # improve sessions: which part of the loop runs (a step and its estimate, the validation), then the current experiment
+            phase = [ln for ln in lines if ln.startswith(("step ", "validating:", "baseline:", "your requests:", "  adopted", "  not adopted", "resuming "))]
+            if phase:
+                head += "\nphase: %s" % phase[-1].strip()
+                kept = [ln.strip() for ln in phase if ln.startswith(("  adopted", "  not adopted"))]
+                if kept:
+                    head += "\nsteps finished so far: %s" % "; ".join(k.split(":")[0] for k in kept)
             if totals:
-                head += "\nprogress: launch %s of %s, %d of %s requests done" % (
+                head += "\nprogress of the current experiment: launch %s of %s, %d of %s requests done" % (
                     launches[-1].group(1) if launches and launches[-1] else "0", totals.group(1), done_requests, totals.group(2))
             return head + "\nlatest output:\n" + "\n".join(lines[-tail_lines:]) + \
-                "\n\nStill running. Poll with hotpath_job_status(job_id=%r, wait_s=45); stop with hotpath_job_cancel." % self.id, False
+                ("\n\nStill running. Poll with hotpath_job_status(job_id=%r, wait_s=%d): each call waits up to %d s and returns early when the job "
+                 "ends, so there is no need to poll faster; stop with hotpath_job_cancel." % (self.id, _max_wait(), _max_wait())), False
         body = _format(self._read(self.out_path), self._read(self.err_path), self.proc.returncode, elapsed, self.timed_out, self.cancelled)
         return head + "\n" + body, self.state() != "finished"
 
@@ -562,7 +581,7 @@ def start_job(name, argv, timeout_s, wait_s):
         job = Job(name, argv, timeout_s)
         with _JOBS_LOCK:
             JOBS[job.id] = job
-    job.done.wait(max(0, min(int(wait_s), MAX_RESULT_WAIT_S)))
+    job.done.wait(max(0, min(int(wait_s), _max_wait())))
     return job.report()
 
 
@@ -574,8 +593,10 @@ def stop_all_jobs():
         j.stop()
 
 
-@tool("hotpath_job_status", "State and latest output of an active job (experiment, bench, measure, profile, kernels) started by this server; "
-      "waits up to wait_s seconds (max 55) for it to finish and returns its full result when it has. Without job_id: lists jobs. Read-only.",
+@tool("hotpath_job_status", "State and latest output of an active job (improve, experiment, bench, measure, profile, kernels) started by this server: "
+      "the loop's phase and the current experiment's progress; waits up to wait_s seconds (the operator's limit, 55 by default) for it to finish "
+      "and returns its full result when it has, so one call per wait is enough. Without job_id: lists jobs, and names any other hotpath process "
+      "holding the GPU. Read-only.",
       _s({"job_id": _STR, "wait_s": _INT}))
 def _job_status(a):
     return None  # handled in-process
@@ -606,11 +627,11 @@ def _job_call(name, args):
     if name == "hotpath_job_cancel":
         job.stop()
         return job.report()
-    job.done.wait(max(0, min(int(args.get("wait_s") if args.get("wait_s") is not None else DEFAULT_RESULT_WAIT_S), MAX_RESULT_WAIT_S)))
+    job.done.wait(max(0, min(int(args.get("wait_s") if args.get("wait_s") is not None else min(DEFAULT_RESULT_WAIT_S, _max_wait())), _max_wait())))
     return job.report()
 
 
-_LIMITS = {"max_minutes": (1, 24 * 60), "max_experiments": (0, 20), "wait_s": (0, 86400), "timeout_s": (1, 7 * 86400), "wait_for_result_s": (0, 600),
+_LIMITS = {"max_minutes": (1, 24 * 60), "max_experiments": (0, 20), "wait_s": (0, 86400), "timeout_s": (1, 7 * 86400), "wait_for_result_s": (0, 3600),
            "rounds": (1, 20), "repetitions": (1, 50), "n_predict": (1, 32768), "port": (1024, 65535), "sample_seconds": (0, 600),
            "n_prompts": (1, 1000), "limit": (1, 100000), "pp": (0, 1 << 20), "tg": (0, 1 << 20), "ub": (1, 1 << 16), "reps": (1, 1000),
            "warmup": (0, 50), "bandwidth_gbs": (1, 100000)}
