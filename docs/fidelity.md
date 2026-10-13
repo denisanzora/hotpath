@@ -56,6 +56,13 @@ fragile positions of the model on those prompts, so a near-tie divergence might 
 - **Length.** Requests with longer outputs (114-160 tokens) diverged three times as often as those with shorter outputs
   (71-109 tokens): 24 against 8 divergences over 72 arm-request pairs each. Prompt length showed no clear effect (18 against 14).
 
+**Cache state.** Replayed warm (the 24 requests in the application's order, prompt cache on, so consecutive requests reuse
+the shared system prompt: a median 126 cached tokens, 10% of prompt tokens), the production launch gave the same outputs
+as cold on 24/24 requests, and a second warm launch was logprob-identical to the first. At this configuration prefix
+reuse did not change any output. `--cache-ram 0` in the same warm replay: −2.8% wall, logprob-identical, and no reuse lost
+(the reuse comes from the slot itself, not the host cache), which agrees with the cold measurement `improve` validated
+(one launch per arm, so preliminary).
+
 The same pattern appeared in an `improve` run from a partial offload: 8-bit KV + 58 GPU layers diverged on 3 of 6 real
 requests at near-ties (margins 0.005-0.047 nats), and on one critic request two numeric risk scores differed.
 
@@ -63,7 +70,7 @@ requests at near-ties (margins 0.005-0.047 nats), and on one critic request two 
 
 | Question | Established by this evidence? |
 |---|---|
-| Is the baseline reproducible? | yes, at this configuration: bit-identical across launches and execution paths |
+| Is the baseline reproducible? | yes, at this configuration: bit-identical across launches and execution paths, warm or cold |
 | Is a near-tie divergence caused by numerical sensitivity? | yes: equivalent reorderings produce the same kind of divergence at the same positions |
 | Does a near-tie mean the candidate is numerically harmless? | **no**: a lossy change produced indistinguishable near-tie divergences |
 | Does a near-tie mean the outputs are equivalent? | **no**: continuations diverge, and decision-like fields changed |
@@ -79,6 +86,7 @@ application, not a claim of equivalence, and the report names it wherever it is 
 
 ## Limits of the study
 
-One GPU, one runtime build, one model, one application, 24 requests and one launch per arm; greedy decoding only, cold
-cache only for this table, sequential requests (no concurrent batching). Field comparisons cover the top-level schema
+One GPU, one runtime build, one model, one application, 24 requests and one launch per arm; greedy decoding only; the
+warm replay used requests spread across sizes rather than a contiguous slice of the application's sequence; sequential
+requests (no concurrent batching). Field comparisons cover the top-level schema
 properties; "remaining tokens that line up" is a token-sequence measure, not a semantic one.
