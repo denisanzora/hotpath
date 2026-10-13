@@ -245,6 +245,29 @@ def _arm_args(common, arm):
     return args
 
 
+PROPOSE_MAX_REQUESTS = 12
+
+
+def requests_subset_for_spec(workload, spec_out):
+    """A requests workload larger than PROPOSE_MAX_REQUESTS: the experiment runs a spread of it instead (per request class,
+    from the smallest to the largest), written next to the spec as ids only (bodies stay in the workload file). Every
+    request runs rounds x (warmup + repetitions) times per arm, so all of a capture is rarely affordable, and its first N
+    are not representative."""
+    from hotpath import workload as wl
+    if not _is_requests_workload(workload):
+        return None
+    w = wl.load_workload(workload)
+    if len(w["items"]) <= PROPOSE_MAX_REQUESTS:
+        return None
+    picks, per = wl.per_class_spread(w, 4, PROPOSE_MAX_REQUESTS, positions=False)
+    path = Path(spec_out).with_name(Path(spec_out).stem + "-requests.json")
+    basis = "%d of the workload's %d requests: per request class %d from the smallest to the largest (an experiment runs every request rounds x " \
+            "(warmup + repetitions) times per arm)" % (len(picks), len(w["items"]), per)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(wl.subset(workload, [x["id"] for x in picks], "%s-spread" % w["name"], basis), indent=1) + "\n", encoding="utf-8")
+    return {"path": str(path), "basis": basis}
+
+
 def check_output_path(out_path, force=False):
     """A spec is written to a new .json file: never over an existing file unless forced, and never over a local config."""
     out = Path(out_path)
@@ -270,7 +293,12 @@ def propose(diagnosis_path, finding_id, cfg, workload, out_path, common_args=Non
         raise ValueError("no finding %r in the diagnosis; available: %s" % (finding_id, sorted(findings)))
     args, source = baseline_args(d, cfg, common_args)
     args, removed = strip_runner_owned(_strip_launch_prefix(args))
+    sub = requests_subset_for_spec(workload, out)
+    if sub:
+        workload = sub["path"]
     spec = build_spec(findings[finding_id], cfg, args, workload, port=port, rounds=rounds, repetitions=repetitions, warmup=warmup, n_predict=n_predict)
+    if sub:
+        spec["provenance"]["workload_subset"] = sub["basis"]
     spec["provenance"]["common_args_source"] = source
     # the largest arm decides how much free VRAM a launch needs; a generic floor when the model is unknown
     need = [vram_needed_mib(cfg, _arm_args(args, a)) for a in spec["arms"]]

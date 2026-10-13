@@ -115,6 +115,8 @@ def cmd_propose(args):
     except ValueError as e:
         raise SystemExit("error: %s" % e)
     print("wrote %s (baseline arguments from: %s)" % (args.out, source))
+    if spec["provenance"].get("workload_subset"):
+        print("workload: %s, written to %s" % (spec["provenance"]["workload_subset"], spec["workload"]))
     if spec["provenance"].get("removed_server_args"):
         print("left out of the copied server arguments (the runner supplies its own, so the experiment cannot reuse your server's port, log, "
               "slot directory or model flags): %s" % ", ".join(spec["provenance"]["removed_server_args"]))

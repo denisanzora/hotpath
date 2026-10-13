@@ -86,14 +86,17 @@ def arm_launch(spec, arm, out_dir=None):
 def plan(spec):
     rounds = int(spec.get("rounds", 3))
     arms = spec["arms"]
-    n_items, wl_np = None, None
+    n_items, wl_np, warm_items = None, None, None
     try:
         w = load_workload(spec["workload"])
         n_items = len(w.get("items") or w.get("prompts") or [])
         wl_np = w.get("n_predict")
+        # a cold pass of application requests warms up with its first request only (measure.run_requests_workload)
+        cold = w.get("kind") == "requests" and (spec.get("cache_mode") or w.get("cache_mode") or "cold") == "cold"
+        warm_items = 1 if cold else n_items
     except (OSError, ValueError, KeyError, TypeError):
         pass
-    per_launch = (int(spec.get("warmup", 1)) + int(spec.get("repetitions", 2))) * n_items if n_items else None
+    per_launch = (int(spec.get("warmup", 1)) * warm_items + int(spec.get("repetitions", 2)) * n_items) if n_items else None
     lines = ["Experiment: %s" % spec["name"], "Rounds: %d, arms: %d -> server launches: %d%s" % (
                  rounds, len(arms), rounds * len(arms), ", requests: %d (%d per launch, warmups included)" % (per_launch * rounds * len(arms), per_launch) if per_launch else ""),
              "Binary: %s" % redact_path(spec["binary"]), "Model: %s" % redact_path(spec["model"]),

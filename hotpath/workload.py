@@ -124,6 +124,62 @@ def load_workload(path):
     return w
 
 
+STEP_POSITIONS = {1: [0.5], 2: [0.5, 1.0], 3: [0.0, 0.5, 1.0]}
+
+
+def spread(items, n, avoid=(), positions=None):
+    """n items from a size-sorted list at evenly spaced positions (the largest always included), preferring items not in
+    `avoid` near each position."""
+    if n >= len(items):
+        return list(items)
+    positions = positions or ([0.5] if n == 1 else [i / (n - 1) for i in range(n)])
+    picks = []
+    for q in positions:
+        idx = int(round(q * (len(items) - 1)))
+        order = sorted(range(len(items)), key=lambda j: (abs(j - idx), j))
+        if q >= 1.0:
+            pick = items[-1] if items[-1] not in picks else None
+        else:
+            pick = next((items[j] for j in order if items[j]["id"] not in avoid and items[j] not in picks), None) or \
+                next((items[j] for j in order if items[j] not in picks), None)
+        if pick is not None:
+            picks.append(pick)
+    return picks
+
+
+def class_groups(w, max_classes):
+    """Items by request class, each class sorted small to large. Derived classes finer than `max_classes` (a system
+    message that varies per request) are regrouped by endpoint and schema; beyond that the most frequent classes are kept."""
+    order = {it["id"]: i for i, it in enumerate(w["items"])}
+    groups = {}
+    for it in w["items"]:
+        groups.setdefault(request_class(it), []).append(it)
+    if len(groups) > max_classes and any(not it.get("class_labelled") for it in w["items"]):
+        coarse = {}
+        for it in w["items"]:
+            coarse.setdefault("/".join(request_class(it).split("/")[:2]), []).append(it)
+        groups = coarse
+    if len(groups) > max_classes:
+        keep = sorted(groups, key=lambda c: (-len(groups[c]), c))[:max_classes]
+        groups = {c: groups[c] for c in keep}
+    for c in groups:
+        groups[c].sort(key=lambda it: (request_size(it), order[it["id"]]))
+    return groups, order
+
+
+def per_class_spread(w, per_class, max_total, avoid=(), positions=None):
+    """Per request class, `per_class` requests from the smallest to the largest (preferring ones not in `avoid`), at most
+    `max_total` in all, in the application's own order."""
+    groups, order = class_groups(w, max_total)
+    n = max(1, min(int(per_class), max_total // max(1, len(groups)) or 1))
+    picks = []
+    for items in groups.values():
+        # positions=False: evenly spaced from the smallest to the largest; None: the step positions (median, largest, ...)
+        picks += spread(items, n, avoid=avoid, positions=None if positions is False else (positions or STEP_POSITIONS.get(n)))
+    picks.sort(key=lambda it: order[it["id"]])
+    return picks, n
+
+
 def subset(parent_path, item_ids, name, basis):
     """A requests workload made of some items of `parent_path` (by id, in this order), holding no bodies."""
     return {"name": name, "kind": "requests", "subset_of": str(parent_path), "item_ids": list(item_ids), "basis": basis}

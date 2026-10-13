@@ -267,29 +267,6 @@ def _measured_load_s(records):
     return None
 
 
-STEP_POSITIONS = {1: [0.5], 2: [0.5, 1.0], 3: [0.0, 0.5, 1.0]}
-
-
-def _spread(items, n, avoid=(), positions=None):
-    """n items from a size-sorted list at evenly spaced positions (the largest always included), preferring items not in
-    `avoid` near each position, so a validation set is mostly requests the steps did not see."""
-    if n >= len(items):
-        return list(items)
-    positions = positions or ([0.5] if n == 1 else [i / (n - 1) for i in range(n)])
-    picks = []
-    for q in positions:
-        idx = int(round(q * (len(items) - 1)))
-        order = sorted(range(len(items)), key=lambda j: (abs(j - idx), j))
-        if q >= 1.0:
-            pick = items[-1] if items[-1] not in picks else None              # the largest request, seen or not
-        else:
-            pick = next((items[j] for j in order if items[j]["id"] not in avoid and items[j] not in picks), None) or \
-                next((items[j] for j in order if items[j] not in picks), None)
-        if pick is not None:
-            picks.append(pick)
-    return picks
-
-
 def requests_plan(workload, sdir, cfg, cache_mode=None, step_per_class=2, validation_per_class=4, max_steps=8, max_validation=16):
     """For a workload of the user's own requests: the subset the steps run (per request class the median and the largest
     request) and a broader validation subset (per class, from the smallest to the largest, mostly requests the steps did
@@ -300,33 +277,10 @@ def requests_plan(workload, sdir, cfg, cache_mode=None, step_per_class=2, valida
     sp, vp = sdir / "steps-requests.json", sdir / "validation-requests.json"
     w = wl.load_workload(workload)
     if not (sp.is_file() and vp.is_file()):
-        order = {it["id"]: i for i, it in enumerate(w["items"])}
-        groups = {}
-        for it in w["items"]:
-            groups.setdefault(wl.request_class(it), []).append(it)
-        if len(groups) > max_steps and any(not it.get("class_labelled") for it in w["items"]):
-            # derived classes this fine-grained (a system message that varies per request, say) are not request classes:
-            # regroup by endpoint and schema only
-            coarse = {}
-            for it in w["items"]:
-                coarse.setdefault("/".join(wl.request_class(it).split("/")[:2]), []).append(it)
-            groups = coarse
-        if len(groups) > max_steps:
-            # still more classes than the step cap: the most frequent classes, the rest reported as not covered
-            keep = sorted(groups, key=lambda c: (-len(groups[c]), c))[:max_steps]
-            groups = {c: groups[c] for c in keep}
-        for c in groups:
-            groups[c].sort(key=lambda it: (wl.request_size(it), order[it["id"]]))
-        n_cls = len(groups)
-        per_step = max(1, min(int(step_per_class), max_steps // n_cls or 1))
-        per_val = max(1, min(int(validation_per_class), max_validation // n_cls or 1))
-        steps, val = [], []
-        for c, items in groups.items():
-            st = _spread(items, per_step, positions=STEP_POSITIONS.get(per_step))
-            steps += st
-            val += _spread(items, per_val, avoid={x["id"] for x in st})
-        steps.sort(key=lambda it: order[it["id"]])          # the application's own order (it matters for warm caches)
-        val.sort(key=lambda it: order[it["id"]])
+        # per request class the median and the largest for the steps; for the validation a spread from the smallest to the
+        # largest that prefers requests the steps did not run; both in the application's own order (it matters when warm)
+        steps, per_step = wl.per_class_spread(w, step_per_class, max_steps)
+        val, per_val = wl.per_class_spread(w, validation_per_class, max_validation, avoid={x["id"] for x in steps}, positions=False)
         sp.write_text(json.dumps(wl.subset(workload, [x["id"] for x in steps], "%s-steps" % w["name"],
                                            "per request class: the median and the largest request (%d per class)" % per_step), indent=1) + "\n", encoding="utf-8")
         vp.write_text(json.dumps(wl.subset(workload, [x["id"] for x in val], "%s-validation" % w["name"],
@@ -1346,6 +1300,9 @@ def improvement_markdown(rec):
                 L.append("| %s | %s | `%s` | %s%s |" % (OUTCOME_LABEL[k], x["what"], x.get("change") or "-", (x.get("why") or "").replace("not adopted: ", "").replace("|", "/"),
                                                        " (outputs: %s)" % x["fidelity"] if x.get("fidelity") else ""))
         L.append("")
+    if rec.get("next_step") and not rec.get("requests"):
+        L += ["Workload: synthetic prompts shaped like your observed traffic. If you have your application's captured request bodies, plan "
+              "again with them (`--requests FILE`, MCP `requests`): every step and the validation then run your real requests.", ""]
     if rec.get("next_measurement"):
         L += ["Next useful measurement:"] + ["- %s" % x for x in rec["next_measurement"]] + [""]
     L += ["## What was found", "",
