@@ -134,3 +134,17 @@ class CacheSettingWarmTests(unittest.TestCase):
         rec["spec_redacted"]["arms"] = [{"name": "a"}, {"name": "b", "args_override": {"--ubatch-size": 512}}]
         row = dg.experiment_verdict(rec)["arms"][0]
         self.assertEqual(row["cache"]["comparability"]["basis"], "warm reuse differs")
+
+
+class CaptureDiscoveryTests(unittest.TestCase):
+    def test_captured_requests_in_the_working_directory_are_found_and_nothing_else(self):
+        with tempfile.TemporaryDirectory() as td:
+            os.makedirs(os.path.join(td, "captured"))
+            with open(os.path.join(td, "captured", "app.jsonl"), "w", encoding="utf-8") as f:
+                f.write(json.dumps({"messages": [{"role": "user", "content": "x"}]}) + "\n")
+            with open(os.path.join(td, "notes.jsonl"), "w", encoding="utf-8") as f:
+                f.write(json.dumps({"event": "log line"}) + "\n")
+            with open(os.path.join(td, "hotpath.local.json"), "w", encoding="utf-8") as f:
+                f.write("{}")
+            found = wl.find_request_captures(td)
+            self.assertEqual([os.path.basename(p) for p in found], ["app.jsonl"])

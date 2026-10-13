@@ -1765,7 +1765,7 @@ def diagnose(records, bandwidth_gbs=None, cfg=None, focus=None):
             "recommended_next_experiment": {"finding": recommended["id"], **recommended["experiment"]} if recommended else None}
 
 
-def diagnosis_brief(d, path=None, discovery=None, top=5):
+def diagnosis_brief(d, path=None, discovery=None, top=5, captures=None):
     """The short form `inspect` prints: the top problems with what is known and what is not, and the exact next step."""
     L = ["# Diagnosis of %s" % d.get("diagnosed_arm")]
     if d.get("diagnosed_arm_reason"):
@@ -1801,9 +1801,18 @@ def diagnosis_brief(d, path=None, discovery=None, top=5):
     top = shown[0] if shown else None
     if top and isinstance((top.get("experiment") or {}).get("arms"), str) and (not rec or rec["finding"] != top["id"]):
         L.append("- for the top finding (%s): %s" % (top["id"], top["experiment"]["arms"]))
-    if rec:
+    if rec and captures:
+        # the user's own requests are in the working directory: the loop should run on them, and say exactly how
+        cap = captures[0].replace("\\", "/")
+        L.append("- hotpath improve --dry-run --requests %s   (passive: the plan on your application's own requests, %s; MCP: hotpath_improve_plan with "
+                 "requests=%r)" % (cap, "found in this directory" if len(captures) == 1 else "one of %d request files found here: %s" % (
+                     len(captures), ", ".join(c.replace("\\", "/") for c in captures[:3])), cap))
+        L.append("- hotpath improve --requests %s   (ACTIVE: runs that plan on hotpath's own llama-server: steps on a per-class spread of your requests, "
+                 "validation on requests the steps did not run; MCP: hotpath_improve with requests=%r)" % (cap, cap))
+    elif rec:
         L.append("- hotpath improve --dry-run   (passive: the plan for testing this and the findings after it, one experiment at a time; MCP: hotpath_improve_plan)")
         L.append("- hotpath improve   (ACTIVE: runs that plan on hotpath's own llama-server, adopts only keep verdicts, reports the launch line to apply; MCP: hotpath_improve)")
+    if rec:
         L.append("  or one experiment at a time:")
         out = "experiments/%s.json" % rec.get("kind", "next")
         n = 2

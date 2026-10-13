@@ -341,7 +341,7 @@ def cmd_inspect(args):
     d["source_files"] = [Path(str(opath)).name]
     dpath = _write(d, args, "diagnosis", diag_mod.diagnosis_markdown(d))
     print("")
-    print(diag_mod.diagnosis_brief(d, str(dpath), rec))
+    print(diag_mod.diagnosis_brief(d, str(dpath), rec, captures=wl_mod.find_request_captures(".")))
     return 0
 
 

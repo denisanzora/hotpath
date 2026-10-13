@@ -180,6 +180,38 @@ def per_class_spread(w, per_class, max_total, avoid=(), positions=None):
     return picks, n
 
 
+def find_request_captures(root=".", max_files=60):
+    """Files in the working directory (and its captured/, workloads/ subdirectories) that hold application request bodies:
+    JSONL whose first line is a llama-server request (or {"body": ...}), or requests workloads. Bounded and read-only: only
+    the first line (or the `kind` of a workload) of at most `max_files` files is read; nothing is listed but the paths."""
+    found, seen = [], 0
+    for d in (Path(root), Path(root) / "captured", Path(root) / "workloads"):
+        if not d.is_dir():
+            continue
+        for p in sorted(d.iterdir()):
+            if seen >= max_files:
+                return found
+            if not p.is_file() or p.suffix.lower() not in (".jsonl", ".json") or p.name.lower().endswith(".local.json"):
+                continue
+            seen += 1
+            try:
+                with open(p, "r", encoding="utf-8") as f:
+                    head = f.readline(1 << 20) if p.suffix.lower() == ".jsonl" else None
+                if head is not None:
+                    r = json.loads(head)
+                    body = r.get("body") if isinstance(r, dict) and isinstance(r.get("body"), dict) else r
+                    if isinstance(body, dict) and ("messages" in body or "prompt" in body):
+                        found.append(str(p))
+                elif p.stat().st_size < (256 << 20):
+                    with open(p, "r", encoding="utf-8") as f:
+                        w = json.load(f)
+                    if isinstance(w, dict) and w.get("kind") == "requests" and not w.get("subset_of"):
+                        found.append(str(p))
+            except (OSError, ValueError, UnicodeDecodeError):
+                continue
+    return found
+
+
 def subset(parent_path, item_ids, name, basis):
     """A requests workload made of some items of `parent_path` (by id, in this order), holding no bodies."""
     return {"name": name, "kind": "requests", "subset_of": str(parent_path), "item_ids": list(item_ids), "basis": basis}
