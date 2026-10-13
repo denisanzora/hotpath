@@ -289,3 +289,11 @@ class RunOwnedValidationTests(unittest.TestCase):
                                                                                                     model=records.file_identity(model))})(),
                               max_experiments=1)
         self.assertTrue(rep["result"]["validated"], rep["result"]["verdict"])
+
+
+class AgentBenchModelTests(unittest.TestCase):
+    def test_an_agent_cannot_point_the_benchmark_at_another_model(self):
+        self.assertNotIn("model", mcp.TOOLS["hotpath_bench"][1]["properties"])
+        text, err = mcp.call_tool("hotpath_bench", {"model": "evil.gguf", "confirm": True})
+        self.assertTrue(err)
+        self.assertIn("unknown argument", text)

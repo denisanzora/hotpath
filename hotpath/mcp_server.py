@@ -378,12 +378,13 @@ def _measure(a):
     return argv
 
 
-@tool("hotpath_bench", "ACTIVE: llama-bench prefill/decode throughput; refuses under background GPU load. Requires confirm=true and HOTPATH_MCP_ALLOW_ACTIVE=1.",
-      _s({"model": _STR, "pp": _INT, "tg": _INT, "ub": _INT, "reps": _INT, "confirm": _CONFIRM, "timeout_s": _TIMEOUT, "wait_for_result_s": _RESULT_WAIT}, ["confirm"]), active=True)
+@tool("hotpath_bench", "ACTIVE: llama-bench prefill/decode throughput of the configured model (model_path in hotpath.local.json); refuses under "
+      "background GPU load. Requires confirm=true and HOTPATH_MCP_ALLOW_ACTIVE=1.",
+      _s({"pp": _INT, "tg": _INT, "ub": _INT, "reps": _INT, "confirm": _CONFIRM, "timeout_s": _TIMEOUT, "wait_for_result_s": _RESULT_WAIT}, ["confirm"]), active=True)
 def _bench(a):
+    # no model argument: an agent-run benchmark loads the operator's configured model only, like an agent-run experiment
+    # (a GGUF an agent chose would be parsed by the runtime's native loader)
     argv = ["bench"]
-    if a.get("model"):
-        argv += ["--model", _no_unc(a["model"], "model")]
     for k in ("pp", "tg", "ub", "reps"):
         if a.get(k) is not None:
             argv += ["--" + k, str(a[k])]

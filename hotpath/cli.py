@@ -609,6 +609,8 @@ def cmd_bench(args):
         print("refusing: background GPU utilization max %.0f%% > %s" % (bg["util_pct_max"], args.max_background_util))
         return 3
     _require(args.model or cfg.get("model_path"), "model file", "--model", "model_path")
+    if agentgate.active() and args.model and Path(args.model).resolve() != Path(str(cfg.get("model_path") or "")).resolve():
+        raise SystemExit("refused: an agent-run benchmark uses the configured model_path only")
     cmd = ad.recipe(args.model or cfg.get("model_path"), ngl=args.ngl, ub=args.ub, pp=args.pp, tg=args.tg, reps=args.reps)
     print(" ".join(cmd))
     res = adapters.run_recipe(cmd, path_prepend=cfg.get("path_prepend"))
