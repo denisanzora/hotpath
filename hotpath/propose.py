@@ -183,30 +183,48 @@ def build_spec(finding, cfg, common_args, workload, port=8099, rounds=3, repetit
 LAUNCH_S_ASSUMED = 30
 
 
-def estimate_minutes(spec, rates, load_s=None):
+def estimate_minutes(spec, rates, load_s=None, measured=None, gen_hint=None):
     """Rough duration of a run from the diagnosed configuration's own prefill/decode rates and the workload's size, for
     planning (and for an agent's polling); every arm is assumed to run at the baseline's rates, so a faster candidate
-    finishes sooner. Model load time is an assumption. None when rates or the workload are unknown."""
-    from hotpath.workload import load_workload
+    finishes sooner. Application requests: a request measured earlier in the session costs its measured time; otherwise
+    its generation is the class's measured median, else the observed traffic's (`gen_hint`), capped by its own limit,
+    since requests usually stop long before max_tokens. Model load time is an assumption unless measured. Includes the
+    untimed probe pass of the first round. None when rates or the workload are unknown."""
+    from hotpath.workload import load_workload, request_class
     if not rates or not rates.get("prefill_tps") or not rates.get("decode_tps"):
         return None
     try:
         w = load_workload(spec["workload"])
     except (OSError, ValueError, KeyError, TypeError):
         return None
+    measured = measured or {}
+    seconds, basis_items = [], "prompt tokens estimated from the workload"
     if w.get("kind") == "requests":
-        sizes = [(len(json.dumps(it["body"].get("messages") or it["body"].get("prompt") or "")) / 4.0,
-                  it["body"].get("max_tokens") or it["body"].get("n_predict") or 256) for it in w["items"]]
+        hits = 0
+        for it in w["items"]:
+            if it["id"] in (measured.get("wall_s") or {}):
+                seconds.append(measured["wall_s"][it["id"]])
+                hits += 1
+                continue
+            limit = it["body"].get("max_tokens") or it["body"].get("n_predict") or 256
+            gen = (measured.get("class_generated") or {}).get(request_class(it)) or gen_hint or limit
+            t = len(json.dumps(it["body"].get("messages") or it["body"].get("prompt") or "")) / 4.0
+            seconds.append(t / rates["prefill_tps"] + min(limit, gen) / rates["decode_tps"] + 0.2)
+        basis_items = "%d of %d requests at their time measured earlier in this session, the rest estimated (generation: measured per class, else the " \
+                      "observed traffic's, capped by each request's limit)" % (hits, len(w["items"]))
     else:
         n_predict = spec.get("n_predict") or w.get("n_predict") or 64
-        sizes = [(1.2 * (p.get("words") or len(p["text"].split())) + 15, n_predict) for p in w["prompts"]]
-    per_pass = sum(t / rates["prefill_tps"] + n / rates["decode_tps"] + 0.2 for t, n in sizes)
+        seconds = [(1.2 * (p.get("words") or len(p["text"].split())) + 15) / rates["prefill_tps"] + n_predict / rates["decode_tps"] + 0.2 for p in w["prompts"]]
+    per_pass = sum(seconds)
     load = float(load_s) if load_s else LAUNCH_S_ASSUMED
-    per_launch = (int(spec.get("warmup", 1)) + int(spec.get("repetitions", 2))) * per_pass + load + float(spec.get("cooldown_s", 5))
+    cold_requests = w.get("kind") == "requests" and (spec.get("cache_mode") or w.get("cache_mode") or "cold") == "cold"
+    warmup = (seconds[0] if seconds else 0.0) * int(spec.get("warmup", 1)) if cold_requests else int(spec.get("warmup", 1)) * per_pass
+    per_launch = warmup + int(spec.get("repetitions", 2)) * per_pass + load + float(spec.get("cooldown_s", 5))
     launches = int(spec.get("rounds", 3)) * len(spec["arms"])
-    return {"minutes": round(launches * per_launch / 60.0, 1),
-            "basis": "baseline rates %.0f/%.1f t/s prefill/decode (%s) for every arm, prompt tokens estimated from the workload, %s" % (
-                rates["prefill_tps"], rates["decode_tps"], rates.get("basis"),
+    probes = len(spec["arms"]) * per_pass * 1.1 if int(spec.get("probe_top_k", 10)) > 0 else 0.0
+    return {"minutes": round((launches * per_launch + probes) / 60.0, 1),
+            "basis": "baseline rates %.0f/%.1f t/s prefill/decode (%s) for every arm, %s, %s, one untimed probe pass per arm" % (
+                rates["prefill_tps"], rates["decode_tps"], rates.get("basis"), basis_items,
                 "%.0f s per model load (measured)" % load if load_s else "%d s per model load assumed" % LAUNCH_S_ASSUMED)}
 
 

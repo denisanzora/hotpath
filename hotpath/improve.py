@@ -324,6 +324,31 @@ def _apply_rq(spec, rq):
     return spec
 
 
+def _measured_requests(records):
+    """From the newest experiment of the session: each application request's measured wall time (first arm) and the median
+    generated length per request class, so later estimates use what the requests really cost."""
+    for rec in reversed(records):
+        if rec.get("kind") != "experiment" or not rec.get("arms"):
+            continue
+        first = next(iter(rec["arms"].values()))
+        reqs = [r for r in first.get("requests") or [] if r.get("wall_ms") and not r.get("error")]
+        if not reqs:
+            continue
+        wall, gen = {}, {}
+        for r in reqs:
+            wall.setdefault(r.get("prompt_id"), []).append(r["wall_ms"] / 1000.0)
+            if r.get("class") and r.get("predicted_n"):
+                gen.setdefault(r["class"], []).append(r["predicted_n"])
+        med = lambda v: sorted(v)[len(v) // 2]
+        return {"wall_s": {k: med(v) for k, v in wall.items()}, "class_generated": {k: med(v) for k, v in gen.items()}}
+    return {}
+
+
+def _gen_hint(diag):
+    shape = (diag or {}).get("traffic_shape") or {}
+    return shape.get("generated_tokens_p90") or shape.get("generated_tokens_median")
+
+
 def _is_requests_workload(path):
     try:
         with open(path, "r", encoding="utf-8") as f:
@@ -643,7 +668,7 @@ def _improve(cfg, start_records, workload, out_dir, runner, max_experiments, max
             report["skipped_findings"].append({"finding": f["id"], "title": f.get("title"), "why_not_run": str(e)})
             continue
         spec["provenance"].update({"improve_session": session, "step": n})
-        est = prop.estimate_minutes(spec, diag.get("rates"), load_s=_measured_load_s(records))
+        est = prop.estimate_minutes(spec, diag.get("rates"), load_s=_measured_load_s(records), measured=_measured_requests(records), gen_hint=_gen_hint(diag))
         if est:
             spec["provenance"]["estimated_duration"] = est
         need = est["minutes"] if est else None
@@ -657,8 +682,9 @@ def _improve(cfg, start_records, workload, out_dir, runner, max_experiments, max
                                    "arms": [a["name"] for a in spec["arms"]], "variable": f["experiment"].get("variable"), "port": port,
                                    "min_free_vram_mib": spec["preconditions"].get("min_free_vram_mib")}
             vw = rq["validation"] if rq else validation_workload(_spec_dir(sdir, True), shape, _ctx_tokens(best["args"]), n_predict)[0]
-            vest = prop.estimate_minutes({"workload": vw, "arms": [{}, {}], "rounds": rounds, "repetitions": repetitions, "warmup": warmup, "cooldown_s": 5},
-                                         diag.get("rates"), load_s=_measured_load_s(records))
+            vest = prop.estimate_minutes({"workload": vw, "arms": [{}, {}], "rounds": rounds, "repetitions": repetitions, "warmup": warmup, "cooldown_s": 5,
+                                          "cache_mode": rq["cache_mode"] if rq else None},
+                                         diag.get("rates"), load_s=_measured_load_s(records), measured=_measured_requests(records), gen_hint=_gen_hint(diag))
             report["validation_estimate_minutes"] = vest["minutes"] if vest else None
             report["plan_queue"] = [{"finding": x["id"], "title": x.get("title")} for x in diag.get("findings") or []
                                     if x["id"] != f["id"] and executable(x, requests_wl) is None]
@@ -776,6 +802,8 @@ def _improve(cfg, start_records, workload, out_dir, runner, max_experiments, max
         validate_decisions(cfg, original, report, records, port, rounds, repetitions, warmup, n_predict, budget, sdir, session, runner, log, shape, rq)
     report["remaining"] = [{"id": f["id"], "title": f.get("title"), "confidence": f.get("confidence"), "next": (f.get("measured") or {}).get("how")}
                            for f in diag.get("findings") or [] if f.get("severity") in ("high", "medium") and f["id"] not in attempted][:5]
+    report["outcomes"] = outcomes(report)
+    report["next_measurement"] = next_measurement(report)
     rec = new_record("improvement", "controlled" if budget.experiments else "hypothesis", **report)
     path = write_record(rec, out_dir, "improvement")
     Path(str(path)[:-5] + ".md").write_text(improvement_markdown(rec), encoding="utf-8")
@@ -783,6 +811,79 @@ def _improve(cfg, start_records, workload, out_dir, runner, max_experiments, max
     if not dry_run:
         (sdir / "finished").write_text(Path(path).name + "\n", encoding="utf-8")
     return rec
+
+
+OUTCOME_ORDER = ("recommended", "needs_review", "rejected", "inconclusive")
+OUTCOME_LABEL = {"recommended": "Recommended", "needs_review": "Needs review", "rejected": "Rejected", "inconclusive": "Inconclusive"}
+
+
+def outcomes(report):
+    """Every candidate the run measured, in exactly one of four outcomes:
+    recommended  - faster, and the required correctness criteria held in a validation run of exactly this set;
+    needs_review - faster, but with output differences, a capacity limit, a change to what the application sends, too little
+                   VRAM headroom, or launch flags the measurement could not include: only the user can accept it;
+    rejected     - slower, a regression on some prompt or request class, failed launches or rejected requests, a validity drop,
+                   memory spill, or a production gate that rules it out;
+    inconclusive - no difference beyond the noise, or not enough trustworthy evidence (including not validated for lack of budget)."""
+    res = report.get("result") or {}
+    out = {k: [] for k in OUTCOME_ORDER}
+    validated_steps = set(report.get("validated_steps") or [])
+    decided = set()
+    for d in report.get("decisions") or []:
+        key = (d.get("step"), d.get("arm"))
+        if key in decided:
+            continue
+        decided.add(key)
+        out["needs_review"].append({"what": "%s%s" % ("step %s " % d["step"] if isinstance(d.get("step"), int) else "", d.get("arm")), "change": d.get("change"),
+                                    "why": d.get("needs"), "fidelity": d.get("fidelity"), "wall": ((d.get("measured") or {}).get("wall_ms") or {}).get("ratio"),
+                                    "validated_on_broad_workload": bool(d.get("validation"))})
+    for st in report.get("steps") or []:
+        what = "step %d %s" % (st["step"], st.get("candidate") or st["finding"])
+        item = {"what": what, "change": _change_text(st["change"]) if st.get("change") else None, "why": st.get("why"), "fidelity": st.get("fidelity"),
+                "wall": (((st.get("measured") or {}).get("wall_ms") or {}).get("ratio"))}
+        if st.get("adopted"):
+            if res.get("validated") and (not validated_steps or st["experiment"] in validated_steps):
+                out["recommended"].append(dict(item, why="validated: %s" % (res.get("verdict") or "").split(" [")[0]))
+            elif (st.get("step"), st.get("candidate")) in decided:
+                continue
+            elif "budget" in (res.get("verdict") or "") or res.get("not_validated"):
+                out["inconclusive"].append(dict(item, why="kept by its step, not validated: %s" % (res.get("verdict") or "")))
+            else:
+                v = (res.get("verdict") or "").lower()
+                bucket = "rejected" if any(w in v for w in ("regress", "reject", "slower")) else "needs_review" if "outputs differ" in v or "near-tie" in v or "differ" in v                     else "inconclusive"
+                out[bucket].append(dict(item, why="kept by its step, but the validation did not pass: %s" % (res.get("verdict") or "")))
+            continue
+        if (st.get("step"), st.get("candidate")) in decided:
+            continue
+        verdict = (st.get("verdict") or "").lower()
+        why = (st.get("why") or "").lower()
+        if verdict.startswith("reject") or "regress" in why or "spills" in why or "would cost more" in why:
+            out["rejected"].append(item)
+        else:
+            out["inconclusive"].append(item)
+    return out
+
+
+def next_measurement(report):
+    """What to measure next when the evidence did not decide, instead of a conclusion it cannot support."""
+    out = []
+    res = report.get("result") or {}
+    oc = report.get("outcomes") or {}
+    if res.get("not_validated") or "budget" in (res.get("verdict") or ""):
+        out.append("validate what the steps kept: `hotpath improve --resume %s --max-minutes N` (completed steps are reused)" % report.get("session"))
+    if any("within the within-prompt noise" in (x.get("why") or "") or "more rounds" in (x.get("why") or "") for x in oc.get("inconclusive") or []) or \
+            any("within noise" in (st.get("verdict") or "") or "more rounds" in (st.get("verdict") or "") for st in report.get("steps") or []):
+        out.append("a small effect within the noise: repeat with more rounds (`--rounds 5`) before deciding")
+    if not report.get("requests"):
+        out.append("the steps used synthetic prompts: run again with your application's own requests (`--requests captured.jsonl`) so the decision rests on "
+                   "your request shapes, schemas and output lengths")
+    if any((x.get("fidelity") or "").startswith(("numerically close", "unverified")) for x in oc.get("needs_review") or []):
+        out.append("faster options change outputs: review the differing requests with your application's own check, or state what it decides on "
+                   "(`decision_fields` in hotpath.local.json) so hotpath can compare exactly those fields")
+    rq = report.get("requests") or {}
+    if rq and rq.get("cache_mode") == "cold" and any(st.get("experiment_kind") == "server_overhead_flags" for st in report.get("steps") or []):
+        out.append("prompt-cache flags were measured without reuse (cache mode cold); `--cache-mode warm` replays your requests in order with reuse")
+    return out
 
 
 def unfinished_sessions(out_dir):
@@ -1057,7 +1158,7 @@ def _validate(cfg, original, steps_, records, port, rounds, repetitions, warmup,
     if need and all(x is not None for x in need):
         spec["preconditions"]["min_free_vram_mib"] = max(need)
     rates = original.get("rates")
-    est = prop.estimate_minutes(spec, rates, load_s=_measured_load_s(records))
+    est = prop.estimate_minutes(spec, rates, load_s=_measured_load_s(records), measured=_measured_requests(records))
     base = {"steps": steps_, "measured_by": None, "validated": False}
     if est:
         spec["provenance"]["estimated_duration"] = est
@@ -1082,8 +1183,12 @@ def _validate(cfg, original, steps_, records, port, rounds, repetitions, warmup,
     if not row:
         return dict(base, measured_by=name, verdict="not validated: the validation run produced no comparison", why="not adopted: no comparison")
     ok, why, _ = adoptable(row, v, improved, rec.get("arms"), "original", cfg)
+    if ok and "preliminary" in (row.get("verdict") or ""):
+        ok, why = False, "not adopted: insufficient evidence: the validation run was preliminary (%s); more rounds or requests are needed" % (
+            row["verdict"].split("(", 1)[1].split(")", 1)[0] if "(" in row["verdict"] else "too few prompts or rounds")
     conf = {"experiment": name, "record": rpath.name, "verdict": row["verdict"], "workload_basis": vbasis, "measured": _metric_line(row),
-            "fidelity": row.get("fidelity"), "passed": ok, "why": why}
+            "fidelity": row.get("fidelity"), "passed": ok, "why": why, "classes": row.get("classes"), "fields": row.get("fields"),
+            "request_errors": row.get("request_errors")}
     return dict(base, measured_by=name, row=row, why=why, verdict=row["verdict"], measured=_metric_line(row), validated=ok, confirmation=conf,
                 basis="one paired run of your original launch against the launch with %s, on a broader workload (%s)" % (
                     ", ".join(st["finding"] for st in steps_), vbasis))
@@ -1150,8 +1255,15 @@ def improvement_markdown(rec):
     else:
         head = res.get("verdict") or ""
     L += ["**%s**" % head, ""]
-    if rec.get("decisions"):
-        L += ["%d faster option(s) need your decision (below)." % len(rec["decisions"]), ""]
+    if rec.get("outcomes") and any(rec["outcomes"].values()):
+        L += ["## Outcome", "", "| | What | Change | Why |", "|---|---|---|---|"]
+        for k in OUTCOME_ORDER:
+            for x in rec["outcomes"].get(k) or []:
+                L.append("| %s | %s | `%s` | %s%s |" % (OUTCOME_LABEL[k], x["what"], x.get("change") or "-", (x.get("why") or "").replace("not adopted: ", "").replace("|", "/"),
+                                                       " (outputs: %s)" % x["fidelity"] if x.get("fidelity") else ""))
+        L.append("")
+    if rec.get("next_measurement"):
+        L += ["Next useful measurement:"] + ["- %s" % x for x in rec["next_measurement"]] + [""]
     L += ["## What was found", "",
           "- Starting configuration: `%s` (%s)" % (" ".join(sp["args"]) or "(no arguments)", sp["source"])]
     lo = sp.get("left_out") or {}
@@ -1159,6 +1271,13 @@ def improvement_markdown(rec):
         L.append("  - not in the measured launch (hotpath cannot run them; results do not cover them): %s" % ", ".join(lo["not_measured"]))
     if lo.get("plumbing"):
         L.append("  - left out as plumbing (hotpath's server sets its own binding, model file and logging): %s" % ", ".join(lo["plumbing"]))
+    rqs = rec.get("requests")
+    if rqs:
+        L.append("- Your requests: %d from %s in %d class(es) (%s); steps ran %d, the validation %d (%d not seen by the steps); cache mode %s" % (
+            rqs["requests"], rqs["source"], len(rqs["classes"]), ", ".join("%s x%d" % kv for kv in sorted(rqs["classes"].items())), rqs["steps"]["requests"],
+            rqs["validation"]["requests"], rqs["validation"]["held_out"], rqs["cache_mode"]))
+        if rqs.get("sampled_requests"):
+            L.append("  - %d of them sample (temperature above 0): their outputs are not compared token by token" % rqs["sampled_requests"])
     b = rec.get("bottleneck")
     if b:
         L.append("- Biggest bottleneck: %s [%s, %s%s]" % (b["title"], b.get("severity"), b.get("confidence"),
@@ -1215,7 +1334,7 @@ def improvement_markdown(rec):
                 L.append("  - %s%s%s" % (v.get("summary") or "", "; wall %s -> %s" % (_fmt(vw.get("baseline"), "wall_ms"), _fmt(vw.get("candidate"), "wall_ms")) if vw else "",
                                            "; outputs: %s" % v["fidelity"] if v.get("fidelity") else ""))
             elif isinstance(d.get("step"), int):
-                L.append("  - measured on the step workload only (3 prompts); not validated on the broad workload (budget)")
+                L.append("  - measured on the step workload only; not validated on the broad workload (budget)")
         L += ["", "To accept one, add its change to your launch yourself; `hotpath improve` will then start from it.", ""]
     L += ["## Measured result", ""]
     if res.get("basis"):
@@ -1225,6 +1344,14 @@ def improvement_markdown(rec):
     if conf.get("fidelity"):
         f = conf["fidelity"]
         L.append("- output fidelity in the validation run: %s (%s; %s)" % (f.get("class"), f.get("why"), f.get("basis")))
+    for c, m in sorted((conf.get("classes") or {}).items()):
+        w, p_, d_ = m.get("wall_ms") or {}, m.get("prefill_tps") or {}, m.get("decode_tps") or {}
+        L.append("  - %s (%d requests): wall ratio %s (worst request %s), prefill %s, decode %s" % (
+            c, m.get("requests") or 0, w.get("ratio"), w.get("worst_request_ratio"), p_.get("ratio"), d_.get("ratio")))
+    fa = conf.get("fields") or {}
+    if fa.get("decisions_judged"):
+        L.append("- decision fields (%s): equal on %d of %d requests (%s)" % (", ".join(fa.get("decision_fields") or []), fa["decisions_equal"], fa["decisions_judged"],
+                                                                          fa.get("decision_basis")))
     L += ["", "## Apply or revert", ""]
     if r["changes"] or r["env"]:
         for c in r["changes"]:
