@@ -27,7 +27,7 @@ def binary_identity(path, path_prepend=None):
     ident = file_identity(path)
     try:
         from hotpath import safepath
-        p = subprocess.run(safepath.resolve([path, "--version"]), capture_output=True, text=True, timeout=30, env=env_with_path(path_prepend), stdin=subprocess.DEVNULL)
+        p = safepath.run([path, "--version"], capture_output=True, text=True, timeout=30, env=env_with_path(path_prepend), stdin=subprocess.DEVNULL)
         ver = (p.stdout + p.stderr).strip().splitlines()
         if p.returncode == 0:
             ident["version_lines"] = ver[:3]

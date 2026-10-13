@@ -12,6 +12,7 @@ scenario the reviewer reproduced (or traced) against the code before the fixes:
      client without a reply; network (UNC) paths made Windows contact another host;
  10. a dry run of a running session rewrote spec files the running process reads; a killed write left half a record."""
 import json
+import sys
 import os
 import tempfile
 import threading
@@ -63,7 +64,7 @@ class PortTests(unittest.TestCase):
             ex._launch = lambda *a, **k: launched.append(a)
             try:
                 with self.assertRaises(SystemExit) as cm:
-                    ex.run({"name": "s", "binary": "b", "model": "m", "port": 8080, "arms": [{"name": "a"}], "workload": "w.json", "preconditions": {}}, td)
+                    ex.run({"name": "s", "binary": sys.executable, "model": "m", "port": 8080, "arms": [{"name": "a"}], "workload": "w.json", "preconditions": {}}, td)
             finally:
                 gpu_mod.pid_listening_on, ex._launch = saved
                 os.environ.pop("HOTPATH_GPU_LOCK_DIR", None)

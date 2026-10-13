@@ -169,6 +169,15 @@ def build_spec(finding, cfg, common_args, workload, port=8099, rounds=3, repetit
     kind = exp.get("kind")
     args = list(common_args)
     arms = []
+    # a finding may come from a diagnosis file, which anyone able to write the working directory can edit: its arms are
+    # evidence of what to try, and only tuning settings are taken from them, in the CLI too
+    from hotpath import agentgate
+    refused = []
+    for a in exp["arms"]:
+        refused += agentgate.arg_problems([t for k, v in (a.get("args_override") or {}).items() for t in (str(k), str(v))], "arm %s" % a.get("name"))
+        refused += agentgate.env_problems(a.get("env_override"), "arm %s" % a.get("name"))
+    if refused:
+        raise ValueError("finding %s proposes settings hotpath does not carry from a diagnosis: %s" % (finding.get("id"), "; ".join(refused)))
     for a in exp["arms"]:
         arm = {"name": a["name"]}
         if a.get("args_override"):

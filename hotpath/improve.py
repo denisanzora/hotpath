@@ -640,6 +640,12 @@ def _improve(cfg, start_records, workload, out_dir, runner, max_experiments, max
             rq["summary"]["requests"], len(rq["summary"]["classes"]), rq["summary"]["source"], rq["summary"]["steps"]["requests"],
             rq["summary"]["validation"]["requests"], rq["summary"]["validation"]["held_out"], rq["cache_mode"]))
     step_wl = rq["steps"] if rq else workload
+    # the environment the user's server is declared to run with (launcher_env in hotpath.local.json): another process's
+    # environment cannot be read, so this is the operator's statement; the baseline, the experiments and the validation start from it
+    env0 = {str(k): str(v) for k, v in (cfg.get("launcher_env") or {}).items() if str(k).startswith(("GGML_", "LLAMA_", "CUDA_"))}
+    env_ignored = sorted(str(k) for k in (cfg.get("launcher_env") or {}) if str(k) not in env0)
+    if env_ignored:
+        log("note: launcher_env sets %s, which are not runtime variables (GGML_*, LLAMA_*, CUDA_*); the experiments run without them" % ", ".join(env_ignored))
     baseline = None
     if not records:
         # nothing running and no log: measure the starting configuration on hotpath's own server first
@@ -647,7 +653,7 @@ def _improve(cfg, start_records, workload, out_dir, runner, max_experiments, max
         args, removed_b = prop.strip_runner_owned(args)
         if removed_b:
             source += "; left out (the runner sets its own binding, model and files): %s" % ", ".join(sorted(set(removed_b)))
-        bspec = _apply_rq(baseline_spec(cfg, args, step_wl, port, repetitions, warmup, n_predict, "%s-baseline" % session), rq)
+        bspec = _apply_rq(baseline_spec(cfg, args, step_wl, port, repetitions, warmup, n_predict, "%s-baseline" % session, env=env0), rq)
         bpath = _spec_dir(sdir, dry_run) / "baseline.json"
         bpath.write_text(json.dumps(bspec, indent=2) + "\n", encoding="utf-8")
         baseline = {"spec": str(bpath), "args": args, "source": source}
@@ -676,9 +682,10 @@ def _improve(cfg, start_records, workload, out_dir, runner, max_experiments, max
         source = "%s, measured as the baseline on hotpath's own server" % baseline["source"]
     args0, removed = prop.strip_runner_owned(prop._strip_launch_prefix(args0))
     observed = (diag.get("observed_launch") or {}).get("args_redacted")
-    # the environment the user's server is declared to run with (launcher_env in hotpath.local.json): another process's
-    # environment cannot be read, so this is the operator's statement; experiments and the validation start from it
-    env0 = {str(k): str(v) for k, v in (cfg.get("launcher_env") or {}).items() if str(k).startswith(("GGML_", "LLAMA_", "CUDA_"))}
+    early_left_out = left_out_of_measurement(observed, args0)[1]
+    if early_left_out:
+        log("note: your launch has %s, which hotpath does not run in its experiments (they name files or change what the server computes); "
+            "a result measured without them is reported, not recommended automatically" % ", ".join(early_left_out))
     original = {"args": list(args0), "env": dict(env0)}
     shape = diag.get("traffic_shape")
     best = {"args": list(args0), "env": dict(env0), "label": None}
@@ -816,23 +823,10 @@ def _improve(cfg, start_records, workload, out_dir, runner, max_experiments, max
                 arm = arm_of[row["arm"]]
                 best["args"], best["env"] = materialize(spec["common_args"], spec.get("env"), arm)
                 best["label"] = "%s/%s" % (rec["name"], row["arm"])
-                for k, v in (arm.get("args_override") or {}).items():
-                    k = _canon(k, cum["args"], cum["args_remove"])
-                    cum["args"][k] = v
-                    cum["args_remove"].discard(k)
-                for k in arm.get("args_remove") or []:
-                    k = _canon(k, cum["args"], cum["args_remove"])
-                    cum["args"].pop(k, None)
-                    cum["args_remove"].add(k)
-                for k, v in (arm.get("env_override") or {}).items():
-                    cum["env"][k] = str(v)
-                    cum["env_remove"].discard(k)
-                for k in arm.get("env_remove") or []:
-                    cum["env"].pop(k, None)
-                    cum["env_remove"].add(k)
                 step["change"] = {"args_override": arm.get("args_override") or {}, "args_remove": arm.get("args_remove") or [],
                                   "env_override": arm.get("env_override") or {}, "env_remove": arm.get("env_remove") or []}
                 adopted_steps.append(step)
+                cum = _as_cum(_cum_change(adopted_steps))
         steps.append(step)
         log("  %s: %s" % ("adopted" if step["adopted"] else "not adopted", step["verdict"]))
         if best["label"] is None or not step["adopted"]:
@@ -846,9 +840,9 @@ def _improve(cfg, start_records, workload, out_dir, runner, max_experiments, max
                                runner, dry_run, bandwidth_gbs, log, report, shape, rq)
     report["minutes_used"] = round(budget.minutes, 1)
     validated = report["result"].get("validated")
-    if validated and report.get("validated_steps") and len(report["validated_steps"]) < len(adopted_steps):
-        ch = _cum_change([st for st in adopted_steps if st["experiment"] in report["validated_steps"]])
-        cum = {"args": dict(ch["args_override"]), "args_remove": set(ch["args_remove"]), "env": dict(ch["env_override"]), "env_remove": set(ch["env_remove"])}
+    if validated:
+        # the line to apply is built from the change the passing validation's improved arm ran with, nothing else
+        cum = _as_cum(report["result"].pop("validated_change"))
     plumbing, not_measured = left_out_of_measurement(observed, args0)
     _ = plumbing
     report["starting_point"]["left_out"] = {"plumbing": plumbing, "not_measured": not_measured}
@@ -1038,10 +1032,10 @@ def layers_that_fit(cfg, ctx=4096):
     return min(n, total_layers), total_layers, "estimate: %.0f MiB weights + %.0f MiB KV cache at -c %d + 512 MiB compute against %.0f MiB free" % (w, kv, ctx, free)
 
 
-def baseline_spec(cfg, args, workload, port, repetitions, warmup, n_predict, name):
+def baseline_spec(cfg, args, workload, port, repetitions, warmup, n_predict, name, env=None):
     spec = {"name": name, "description": "Baseline by hotpath improve: your starting configuration on hotpath's own server, measured once so the loop "
                                          "has evidence to diagnose. Not a comparison.",
-            "binary": "${runtime_binary}", "model": "${model_path}", "port": int(port), "common_args": list(args), "env": {},
+            "binary": "${runtime_binary}", "model": "${model_path}", "port": int(port), "common_args": list(args), "env": dict(env or {}),
             "arms": [{"name": "baseline"}], "workload": workload, "rounds": 1, "repetitions": int(repetitions), "warmup": int(warmup),
             "cooldown_s": 5, "health_timeout_s": 600,
             "preconditions": {"sample_seconds": 5, "max_gpu_util_pct": 10, "min_free_vram_mib": 2000, "ports_must_be_free": [int(port)]},
@@ -1167,7 +1161,7 @@ def _result(cfg, original, cum, adopted_steps, records, workload, port, rounds, 
             report["decisions"].append({"step": "validation", "arm": label, "change": _change_text(_cum_change(steps_)), "verdict": out["row"]["verdict"],
                                         "needs": out["why"].replace("not adopted: ", ""), "fidelity": (out["row"].get("fidelity") or {}).get("class"),
                                         "measured": _metric_line(out["row"]), "decomposition": None})
-    report["validations"] = [{k: v for k, v in t.items() if k not in ("row", "steps")} for t in tried]
+    report["validations"] = [{k: v for k, v in t.items() if k not in ("row", "steps", "change")} for t in tried]
     last = tried[-1]
     report["confirmation"] = (last if last.get("validated") else tried[0]).get("confirmation")
     if last.get("validated"):
@@ -1176,6 +1170,7 @@ def _result(cfg, original, cum, adopted_steps, records, workload, port, rounds, 
         if len(kept) < len(adopted_steps):
             last["verdict"] += " (validated without %s, which did not pass alone or together)" % ", ".join(st["finding"] for st in adopted_steps if st not in kept)
         return {"verdict": last["verdict"], "measured_by": last["measured_by"], "measured": last.get("measured"), "validated": True,
+                "validated_change": last["change"],
                 "validated_changes": [st["finding"] for st in kept], "basis": last["basis"] + "; run by this process against the configured model and build"}
     first = tried[0]
     untried = [label for label, _ in candidates[len(tried):]]
@@ -1211,14 +1206,36 @@ def validate_decisions(cfg, original, report, records, port, rounds, repetitions
 
 
 def _cum_change(steps_):
-    c = {"args_override": {}, "args_remove": [], "env_override": {}, "env_remove": []}
+    """The combined change of `steps_` applied one after another: a later step's value replaces an earlier one under any
+    spelling of the argument, and setting an argument undoes an earlier removal (and the reverse). The one accumulation
+    the loop, the validation and the recommended launch line all use."""
+    args, removed, env, env_removed = {}, [], {}, []
     for st in steps_:
         ch = st.get("change") or {}
-        c["args_override"].update(ch.get("args_override") or {})
-        c["args_remove"] += [x for x in ch.get("args_remove") or [] if x not in c["args_remove"]]
-        c["env_override"].update(ch.get("env_override") or {})
-        c["env_remove"] += [x for x in ch.get("env_remove") or [] if x not in c["env_remove"]]
-    return c
+        for k, v in (ch.get("args_override") or {}).items():
+            k = _canon(k, args, removed)
+            args.pop(k, None)
+            args[k] = v
+            if k in removed:
+                removed.remove(k)
+        for k in ch.get("args_remove") or []:
+            k = _canon(k, args, removed)
+            args.pop(k, None)
+            if k not in removed:
+                removed.append(k)
+        for k, v in (ch.get("env_override") or {}).items():
+            env[k] = str(v)
+            if k in env_removed:
+                env_removed.remove(k)
+        for k in ch.get("env_remove") or []:
+            env.pop(k, None)
+            if k not in env_removed:
+                env_removed.append(k)
+    return {"args_override": args, "args_remove": removed, "env_override": env, "env_remove": env_removed}
+
+
+def _as_cum(ch):
+    return {"args": dict(ch["args_override"]), "args_remove": set(ch["args_remove"]), "env": dict(ch["env_override"]), "env_remove": set(ch["env_remove"])}
 
 
 def _validate(cfg, original, steps_, records, port, rounds, repetitions, warmup, n_predict, budget, sdir, session, runner, log, shape, name, rq=None):
@@ -1254,7 +1271,7 @@ def _validate(cfg, original, steps_, records, port, rounds, repetitions, warmup,
     cand = {"prefill_tps": (last.get("prefill_tps") or {}).get("candidate"), "decode_tps": (last.get("decode_tps") or {}).get("candidate")}
     est = prop.estimate_minutes(spec, rates, load_s=_measured_load_s(records), measured=_first_arm_requests(records, original),
                                 arm_rates=[rates, cand if cand["prefill_tps"] and cand["decode_tps"] else None])
-    base = {"steps": steps_, "measured_by": None, "validated": False}
+    base = {"steps": steps_, "change": ch, "measured_by": None, "validated": False}
     if est:
         spec["provenance"]["estimated_duration"] = est
         if est["minutes"] > budget.time_left():

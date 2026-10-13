@@ -141,7 +141,9 @@ def env_with_path(path_prepend=None):
 
 
 def run_recipe(cmd, timeout=3600, path_prepend=None):
-    p = subprocess.run(safepath.resolve(cmd), capture_output=True, text=True, timeout=timeout, env=env_with_path(path_prepend), stdin=subprocess.DEVNULL)
+    from hotpath import launch
+    p = safepath.run([cmd[0]] + launch.absolute_paths(cmd[1:]), capture_output=True, text=True, timeout=timeout, env=env_with_path(path_prepend),
+                     stdin=subprocess.DEVNULL)
     return {"cmd": [str(c) for c in cmd], "returncode": p.returncode, "stdout": p.stdout[-20000:], "stderr": p.stderr[-5000:]}
 
 

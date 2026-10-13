@@ -34,7 +34,7 @@ def _run(cmd, timeout=20):
     try:
         # stdin is never inherited: under the MCP server it is the JSON-RPC pipe, and PowerShell waits for it to close;
         # the program is resolved outside the working directory (safepath)
-        p = subprocess.run(safepath.resolve(cmd), capture_output=True, text=True, timeout=timeout, stdin=subprocess.DEVNULL)
+        p = safepath.run(cmd, capture_output=True, text=True, timeout=timeout, stdin=subprocess.DEVNULL)
         return p.returncode, p.stdout, p.stderr
     except (OSError, subprocess.TimeoutExpired) as e:
         return -1, "", str(e)

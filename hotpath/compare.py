@@ -10,16 +10,16 @@ def _arm_sets(records):
     """Flatten inputs into {label: {requests, meta}}."""
     sets = {}
     classes = set()
-    for rec in records:
+    for run, rec in enumerate(records):
         if rec["kind"] == "experiment":
             for name, arm in rec["arms"].items():
-                sets["%s/%s" % (rec["name"], name)] = {"requests": arm["requests"], "meta": {
+                sets["%s/%s" % (rec["name"], name)] = {"requests": arm["requests"], "run": run, "meta": {
                     "binary": arm.get("binary") or rec.get("binary"), "ggml_cuda_dll": arm.get("ggml_cuda_dll"),
                     "model": arm.get("model") or rec.get("model"), "workload": rec.get("workload"),
                     "launch_facts": arm.get("launch_facts"), "failures": arm.get("failures"), "launches": arm.get("launches")}}
             classes.add("controlled")
         elif rec["kind"] == "measurement":
-            sets[rec.get("label") or rec["created"]] = {"requests": rec["requests"], "meta": {
+            sets[rec.get("label") or rec["created"]] = {"requests": rec["requests"], "run": run, "meta": {
                 "binary": None, "model": None, "workload": rec.get("workload"), "target": rec.get("target")}}
             classes.add("historical")
     return sets, classes
@@ -47,11 +47,13 @@ def output_equivalence(sets):
     if len(labels) < 2:
         return {}
     ref = labels[0]
-    by_prompt = {}
+    by_prompt, keyed = {}, {}
     for lab in labels:
         for r in sets[lab]["requests"]:
             if r.get("error"):
                 continue            # rejected by the server: no output (counted in the verdict)
+            if r.get("output_hash") == "keyed per run":
+                keyed[r["prompt_id"]] = True
             key = r.get("tokens") if r.get("tokens") else ("sha256:" + str(r.get("output_sha256")))
             by_prompt.setdefault(r["prompt_id"], {}).setdefault(lab, []).append(key)
     result = {}
@@ -63,6 +65,11 @@ def output_equivalence(sets):
                  "basis": "token ids" if isinstance(ref_tok, list) else "output content hash"}
         for lab in labels[1:]:
             if lab not in arms:
+                continue
+            if keyed.get(pid) and sets[lab].get("run") != sets[ref].get("run"):
+                # application outputs are hashed with a key that exists only while one run lasts: equal outputs of two runs
+                # have different hashes, so only arms of one run compare
+                entry[lab] = {"identical": None, "comparable": False, "note": "outputs of different runs are hashed with different keys"}
                 continue
             other = arms[lab][0]
             if isinstance(ref_tok, list) and isinstance(other, list):

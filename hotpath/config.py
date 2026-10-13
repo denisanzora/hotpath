@@ -25,14 +25,16 @@ def load_local(path=None):
     p = Path(path or os.environ.get("HOTPATH_LOCAL") or DEFAULT_NAME)
     # in a process the MCP server started, the configuration is the one the operator started that server with: the file
     # names the programs and models hotpath launches, and it sits in a working directory an agent may write to
+    import hashlib
     expected = os.environ.get(SNAPSHOT_ENV)
-    if expected and config_digest(p) != expected:
+    data = p.read_bytes() if p.is_file() else None
+    # the bytes that were checked are the bytes that are parsed (no second read the file could change in between)
+    if expected and (hashlib.sha256(data).hexdigest() if data is not None else "missing") != expected:
         raise SystemExit("refused: %s changed after the MCP server started; it decides which programs and models hotpath launches, so a "
                          "change takes effect only when the operator restarts the MCP server" % p.name)
-    if not p.is_file():
+    if data is None:
         return {"_path": str(p), "_missing": True}
-    with open(p, "r", encoding="utf-8") as f:
-        d = json.load(f)
+    d = json.loads(data.decode("utf-8-sig"))
     d["_path"] = str(p)
     return d
 

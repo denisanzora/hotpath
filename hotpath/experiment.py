@@ -176,15 +176,24 @@ def _port_free(port):
         s.close()
 
 
+def launch_command(cmd):
+    """The command exactly as it is launched: the program as an absolute path (a bare runtime_binary name from PATH, never
+    the working directory) and every path-valued argument absolute, since the server runs in its own directory."""
+    from hotpath import safepath
+    cmd = safepath.resolve(cmd)
+    return [cmd[0]] + launch.absolute_paths(cmd[1:])
+
+
 def _launch(cmd, env, log_path):
     from hotpath import safepath
-    if not Path(cmd[0]).is_absolute() and not Path(cmd[0]).parent.parts:
-        cmd = safepath.resolve(cmd)            # a bare runtime_binary name: from PATH, never the working directory
+    cmd = launch_command(cmd)
     log = open(log_path, "ab")
     kw = {}
     if os.name == "nt":
         kw["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-    proc = subprocess.Popen(cmd, env=env, stdout=log, stderr=log, stdin=subprocess.DEVNULL, **kw)
+    # the server's own directory, not the working directory: Windows loads the server's libraries (cudart, ggml backends)
+    # from the current directory before PATH
+    proc = subprocess.Popen(cmd, env=env, stdout=log, stderr=log, stdin=subprocess.DEVNULL, cwd=safepath.program_dir(cmd[0]), **kw)
     locks.track(proc)
     return proc, log
 
@@ -213,7 +222,10 @@ def run(spec, out_dir, dry_run=False, wait_for_preconditions_s=0):
         check_name(spec.get("name"), "spec name")
         for a in spec["arms"]:
             check_name(a.get("name"), "arm name")
+            launch_command(arm_launch(spec, a, out_dir)[0])
     except ValueError as e:
+        raise SystemExit("error: %s" % e)
+    except FileNotFoundError as e:
         raise SystemExit("error: %s" % e)
     workload = load_workload(spec["workload"])
     if workload.get("kind") != "requests":
@@ -283,6 +295,10 @@ def _run_locked(spec, out_dir, workload, wait_for_preconditions_s):
     for rnd in range(rounds):
         for a in spec["arms"]:
             cmd, env, port = arm_launch(spec, a, out_dir)
+            try:
+                cmd = launch_command(cmd)        # recorded identities name the program and model that actually run
+            except FileNotFoundError as e:
+                raise SystemExit("cannot launch arm %s: %s" % (a["name"], e))
             base = "http://127.0.0.1:%d" % port
             log_path = out / ("server-%s-%s-r%d.log" % (spec["name"], a["name"], rnd))
             print("[round %d] launching arm %s (launch %d/%d)" % (rnd, a["name"], len(rec["launches"]) + 1, total), flush=True)

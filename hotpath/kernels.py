@@ -24,7 +24,7 @@ def run_tbo(build_dir, mode, op_filter, params_regex=None, backend="CUDA0", time
         raise SystemExit("test-backend-ops not found under %s" % build_dir)
     cmd = ad.recipe(mode, op_filter, backend=backend, params_regex=params_regex)
     from hotpath import safepath
-    p = subprocess.run(safepath.resolve(cmd), capture_output=True, text=True, timeout=timeout, env=env_with_path(path_prepend), stdin=subprocess.DEVNULL)
+    p = safepath.run(cmd, capture_output=True, text=True, timeout=timeout, env=env_with_path(path_prepend), stdin=subprocess.DEVNULL)
     text = re.sub(r"\x1b\[[0-9;]*m", "", p.stdout + "\n" + p.stderr)  # strip ANSI color codes
     cases = []
     for line in text.splitlines():

@@ -11,7 +11,13 @@
   S1 outcomes misfiled class regressions and preliminary validations and left measured arms out;
   S2 a faster-but-different option skipped the regression and spill checks;
   S3 rejected requests were compared by count, not by request;
-  S4 output hashes of application requests were unkeyed."""
+  S4 output hashes of application requests were unkeyed;
+  A  programs ran in the working directory, where Windows looks for the libraries they load (a planted cudart DLL);
+  B  the config's digest was checked on one read and the config parsed from another;
+  C  a configured relative program path with a directory part could not be run;
+  D  arms of a finding read from a diagnosis file reached a launch with any argument;
+  E  outputs of two runs compared as different because their hashes are keyed per run;
+  F  the loop, the validation and the recommended line each accumulated the adopted changes their own way."""
 import json
 import os
 import subprocess
@@ -244,6 +250,146 @@ class OutputHashTests(unittest.TestCase):
         self.assertEqual(ms.output_digest('{"ok": true}', w1), ms.output_digest('{"ok": true}', w1))
         self.assertNotEqual(ms.output_digest('{"ok": true}', w1), ms.output_digest('{"ok": true}', w2))
         self.assertNotEqual(ms.output_digest('{"ok": true}', w1), hashlib.sha256(b'{"ok": true}').hexdigest()[:16])
+
+
+
+class ProgramDirectoryTests(unittest.TestCase):
+    """A"""
+
+    def test_a_program_runs_in_its_own_directory(self):
+        with tempfile.TemporaryDirectory() as td, _InDir(td):
+            p = safepath.run([sys.executable, "-I", "-c", "import os; print(os.getcwd())"], capture_output=True, text=True)
+            self.assertEqual(os.path.normcase(p.stdout.strip()), os.path.normcase(os.path.dirname(os.path.abspath(sys.executable))))
+
+    def test_the_server_runs_in_its_own_directory_with_absolute_paths(self):
+        from hotpath import experiment as ex
+        seen = {}
+
+        class P:
+            pid = 1
+
+        saved = (ex.subprocess.Popen, ex.locks.track)
+        ex.subprocess.Popen = lambda cmd, **kw: seen.update(cmd=cmd, cwd=kw.get("cwd")) or P()
+        ex.locks.track = lambda proc: None
+        try:
+            with tempfile.TemporaryDirectory() as td, _InDir(td):
+                _proc, log = ex._launch(["bin/llama-server", "--model", "models/m.gguf", "--slot-save-path=cache", "--ctx-size", "4096"], {}, "s.log")
+                log.close()
+                here = os.getcwd()
+        finally:
+            ex.subprocess.Popen, ex.locks.track = saved
+        self.assertEqual(seen["cwd"], os.path.join(here, "bin"))
+        self.assertEqual(seen["cmd"], [os.path.join(here, "bin", "llama-server"), "--model", os.path.join(here, "models", "m.gguf"),
+                                       "--slot-save-path=" + os.path.join(here, "cache"), "--ctx-size", "4096"])
+
+    def test_every_program_launch_names_its_directory(self):
+        # the package's process launches: through safepath.run, the server launch with its own cwd, or the MCP server's own
+        # isolated Python children (python -I does not import from the working directory)
+        import re
+        root = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "hotpath")
+        for name in os.listdir(root):
+            if not name.endswith(".py") or name == "safepath.py":
+                continue
+            with open(os.path.join(root, name), encoding="utf-8") as f:
+                src = f.read()
+            for m in re.finditer(r"subprocess\.(run|Popen|call|check_output|check_call)\(", src):
+                line = src[src.rfind("\n", 0, m.start()) + 1:src.find("\n", m.end())]
+                ok = (name == "experiment.py" and "cwd=safepath.program_dir" in line) or (name == "mcp_server.py" and "_child_argv(" in line)
+                self.assertTrue(ok, "%s launches a program outside safepath: %s" % (name, line.strip()))
+
+
+class ConfigReadOnceTests(unittest.TestCase):
+    """B"""
+
+    def test_the_checked_bytes_are_the_parsed_bytes(self):
+        import builtins
+        with tempfile.TemporaryDirectory() as td:
+            p = os.path.join(td, "hotpath.local.json")
+            with open(p, "w", encoding="utf-8") as f:
+                json.dump({"runtime_binary": "llama-server.exe"}, f)
+            os.environ[config.SNAPSHOT_ENV] = config.config_digest(p)
+            real_open = builtins.open
+
+            def no_second_read(*a, **k):
+                raise AssertionError("the config was read a second time")
+            builtins.open = no_second_read
+            try:
+                self.assertEqual(config.load_local(p)["runtime_binary"], "llama-server.exe")
+            finally:
+                builtins.open = real_open
+                os.environ.pop(config.SNAPSHOT_ENV, None)
+
+
+class RelativeProgramPathTests(unittest.TestCase):
+    """C"""
+
+    def test_a_configured_relative_path_is_made_absolute(self):
+        with tempfile.TemporaryDirectory() as td, _InDir(td):
+            os.mkdir("bin")
+            exe = os.path.join("bin", "tool.exe")
+            open(exe, "w").close()
+            self.assertEqual(safepath.which(exe), os.path.join(os.getcwd(), exe))
+            self.assertEqual(safepath.resolve([exe, "-x"]), [os.path.join(os.getcwd(), exe), "-x"])
+            self.assertIsNone(safepath.which(os.path.join("bin", "missing.exe")))
+
+
+class DiagnosisArmTests(unittest.TestCase):
+    """D"""
+
+    def _finding(self, arm):
+        return {"id": "f", "experiment": {"kind": "x", "variable": "v", "arms": [{"name": "a"}, dict(arm, name="b")]}}
+
+    def test_a_forged_finding_cannot_add_a_launch_argument(self):
+        for arm in ({"args_override": {"--rpc": "10.0.0.1:50052"}}, {"args_override": {"--mcp-servers-config": "x.json"}},
+                    {"env_override": {"GGML_BACKEND_PATH": "x.dll"}}):
+            with self.assertRaises(ValueError):
+                prop.build_spec(self._finding(arm), {}, ["--ctx-size", "4096"], "w.json")
+
+    def test_tuning_arms_are_proposed(self):
+        spec = prop.build_spec(self._finding({"args_override": {"--ubatch-size": 256}, "env_override": {"GGML_CUDA_DISABLE_GRAPHS": "1"}}), {},
+                               ["--ctx-size", "4096"], "w.json")
+        self.assertEqual(spec["arms"][1]["args_override"], {"--ubatch-size": 256})
+
+
+class CrossRunOutputTests(unittest.TestCase):
+    """E"""
+
+    def test_keyed_outputs_of_two_runs_are_not_compared(self):
+        from hotpath import compare as cmp_mod
+
+        def rec(name, h1, h2):
+            req = lambda h: {"prompt_id": "r1", "output_sha256": h, "output_hash": "keyed per run"}
+            return {"kind": "experiment", "name": name, "arms": {"a": {"requests": [req(h1)]}, "b": {"requests": [req(h2)]}}}
+        oe = cmp_mod.output_equivalence(cmp_mod._arm_sets([rec("one", "k1", "k1"), rec("two", "k2", "k2")])[0])["r1"]
+        self.assertTrue(oe["one/b"]["identical"])
+        self.assertIsNone(oe["two/a"]["identical"])
+        self.assertFalse(oe["two/a"]["comparable"])
+
+
+class OneAccumulationTests(unittest.TestCase):
+    """F"""
+
+    def test_later_steps_replace_earlier_ones_under_any_spelling(self):
+        steps = [{"change": {"args_remove": ["--cache-ram"], "args_override": {"-ngl": 40}}},
+                 {"change": {"args_override": {"--cache-ram": 0, "--gpu-layers": 65}, "env_remove": ["GGML_CUDA_DISABLE_GRAPHS"]}},
+                 {"change": {"env_override": {"GGML_CUDA_DISABLE_GRAPHS": 1}}}]
+        ch = im._cum_change(steps)
+        self.assertEqual(ch["args_override"], {"--cache-ram": 0, "-ngl": 65})
+        self.assertEqual(ch["args_remove"], [])
+        self.assertEqual((ch["env_override"], ch["env_remove"]), ({"GGML_CUDA_DISABLE_GRAPHS": "1"}, []))
+
+    def test_the_apply_line_is_what_the_validated_arm_launched(self):
+        original = {"args": ["--ctx-size", "8192", "--cache-ram", "4096", "-ngl", "30"], "env": {}}
+        steps = [{"change": {"args_remove": ["--cache-ram"]}}, {"change": {"args_override": {"--cache-ram": 0, "--gpu-layers": 65}}}]
+        ch = im._cum_change(steps)
+        arm = {"name": "improved", "args_override": ch["args_override"], "args_remove": ch["args_remove"]}
+        measured = im.materialize(original["args"], original["env"], arm)[0]
+        self.assertEqual(im.recommended_launch(None, original, im._as_cum(ch))["args"], measured)
+        self.assertIn("--cache-ram", measured)
+
+    def test_the_no_server_baseline_runs_with_the_declared_environment(self):
+        spec = im.baseline_spec({}, ["--ctx-size", "4096"], "w.json", 8099, 2, 1, None, "b", env={"GGML_CUDA_DISABLE_GRAPHS": "1"})
+        self.assertEqual(spec["env"], {"GGML_CUDA_DISABLE_GRAPHS": "1"})
 
 
 if __name__ == "__main__":

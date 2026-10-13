@@ -8,6 +8,7 @@ drop them and an experiment never inherits a path it cannot resolve.
 Only the command line is read. Settings given through LLAMA_ARG_* environment variables or defaults compiled into
 the build are not visible here; `unset` in the result means "not on the command line", never "off".
 """
+from pathlib import Path
 
 # canonical name -> spellings (llama.cpp common/arg.cpp; older and newer spellings both accepted)
 FLAGS = {
@@ -141,6 +142,27 @@ def parse(argv):
         else:
             other.append(flag)
     return {"settings": settings, "path_flags": sorted(set(path_flags)), "other_flags": sorted(set(other))}
+
+
+def absolute_paths(argv, base=None):
+    """`argv` with the values of path-valued arguments (PATH_FLAGS) made absolute against `base` (default: the working
+    directory): hotpath runs programs in their own directory, where a relative path would point somewhere else."""
+    base = Path(base) if base else Path.cwd()
+    fix = lambda v: v if (not v or Path(v).is_absolute()) else str(base / v)
+    out, toks, i = [], [str(a) for a in argv], 0
+    while i < len(toks):
+        t = toks[i]
+        head = canonical(t).split("=", 1)[0] if t.startswith("--") else t
+        if head in PATH_FLAGS and t.startswith("--") and "=" in t:
+            out.append(t.split("=", 1)[0] + "=" + fix(t.split("=", 1)[1]))
+            i += 1
+        elif head in PATH_FLAGS and i + 1 < len(toks) and _is_value(toks[i + 1]):
+            out += [t, fix(toks[i + 1])]
+            i += 2
+        else:
+            out.append(t)
+            i += 1
+    return out
 
 
 def spellings(flag):

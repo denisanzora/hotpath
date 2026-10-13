@@ -425,7 +425,7 @@ def _kill_tree(proc):
     if os.name == "nt":
         from hotpath import safepath
         try:
-            subprocess.run(safepath.resolve(["taskkill", "/F", "/T", "/PID", str(proc.pid)]), capture_output=True, stdin=subprocess.DEVNULL)
+            safepath.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)], capture_output=True, stdin=subprocess.DEVNULL)
         except OSError:
             proc.kill()
     else:
