@@ -115,3 +115,22 @@ class PreliminaryValidationTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CacheSettingWarmTests(unittest.TestCase):
+    """In warm mode a different reuse is not comparable, except when the change under test is a prompt-cache setting:
+    then the reuse it loses or gains is its effect, and wall time in the application's order is the comparison."""
+
+    def test_reuse_difference_is_the_effect_of_a_cache_setting(self):
+        import test_release_review as rr
+        from hotpath import diagnose as dg
+        base = [rr._req("p%d" % (i % 3), 900, wall=1500, pms=200) for i in range(9)]
+        cand = [rr._req("p%d" % (i % 3), 300, wall=1700, pms=400) for i in range(9)]      # loses reuse, gets slower
+        rec = rr._exp(base, cand, rr.WARM, rr.WARM)
+        rec["spec_redacted"]["arms"] = [{"name": "a"}, {"name": "b", "args_override": {"--cache-ram": 0}}]
+        row = dg.experiment_verdict(rec)["arms"][0]
+        self.assertTrue(row["cache"]["comparability"].get("reuse_is_the_effect"), row["cache"]["comparability"])
+        self.assertTrue(row["verdict"].startswith("reject"), row["verdict"])
+        rec["spec_redacted"]["arms"] = [{"name": "a"}, {"name": "b", "args_override": {"--ubatch-size": 512}}]
+        row = dg.experiment_verdict(rec)["arms"][0]
+        self.assertEqual(row["cache"]["comparability"]["basis"], "warm reuse differs")

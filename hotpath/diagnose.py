@@ -1107,7 +1107,10 @@ def paired_metric(base_reqs, cand_reqs, metric, better):
     med_ratio = percentiles(ratios)["median"]
     change = med_ratio - 1.0
     improved_dir = (1 if better == "higher" else -1)
-    consistent = sum(1 for r in ratios if (r - 1.0) * improved_dir > 0)
+    # prompts that moved the same way as the median: for an improvement the improved ones, for a regression the regressed ones
+    # (counting only improvements made a consistent regression look like noise)
+    moved = 1 if change > 0 else -1
+    consistent = sum(1 for r in ratios if (r - 1.0) * moved > 0)
     noise = percentiles([r["baseline_relative_spread"] for r in rows if r["baseline_relative_spread"] is not None])
     noise_med = noise["median"] if noise else 0.0
     if abs(change) < 0.02:
@@ -1230,7 +1233,14 @@ def experiment_verdict(rec):
             excl["dropped_prompts"] = sorted(str(p) for p in before - after)
             if comp["basis"] == "warm":
                 differs = prompt_reuse_differs(vb, vc)
-                if differs:
+                if differs and _cache_setting_arm(rec, lab):
+                    # the change under test is a prompt-cache setting: the reuse it loses or gains is its effect, so wall time in the
+                    # application's own request order is the comparison that matters (prefill rates then reflect reuse, not compute)
+                    comp = dict(comp, basis="warm", reuse_is_the_effect=True,
+                                detail="both arms warm in the application's request order; they reused different numbers of cached tokens on prompt(s) %s, "
+                                       "which is the effect of the prompt-cache setting under test: wall time includes the reuse it loses or gains" % differs[:5])
+                    row["cache"]["comparability"] = comp
+                elif differs:
                     comp = {"comparable": False, "basis": "warm reuse differs",
                             "detail": "both arms warm, but they reused a different number of cached tokens on prompt(s) %s (> 10%% apart): the change in reuse, not the change under test, drives prefill and wall time" % differs[:5]}
                     row["cache"]["comparability"] = comp
@@ -1349,6 +1359,18 @@ def experiment_verdict(rec):
         rows.append(row)
     return {"experiment": rec.get("name"), "evidence_class": rep.get("evidence_class"), "comparability_issues": rep.get("comparability_issues"), "arms": rows,
             "scope_note": "A verdict describes this workload on this machine; it is not a property of the runtime in general."}
+
+
+CACHE_SETTING_FLAGS = ("--cache-ram", "-cram", "--ctx-checkpoints", "-ctxcp", "--cache-reuse", "--no-cache-prompt", "--cache-prompt",
+                       "--cache-idle-slots", "--no-cache-idle-slots", "--swa-full")
+
+
+def _cache_setting_arm(rec, arm_name):
+    """Whether an arm of a recorded experiment changes only prompt-cache settings (relative to the spec's common arguments)."""
+    spec = rec.get("spec_redacted") or {}
+    arm = next((a for a in spec.get("arms") or [] if a.get("name") == arm_name), None) or {}
+    changed = list((arm.get("args_override") or {}).keys()) + list(arm.get("args_remove") or [])
+    return bool(changed) and not arm.get("env_override") and not arm.get("env_remove") and all(str(f).split("=")[0] in CACHE_SETTING_FLAGS for f in changed)
 
 
 def rejected_requests(reqs):
