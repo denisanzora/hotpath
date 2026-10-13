@@ -183,7 +183,7 @@ def build_spec(finding, cfg, common_args, workload, port=8099, rounds=3, repetit
 LAUNCH_S_ASSUMED = 30
 
 
-def estimate_minutes(spec, rates, load_s=None, measured=None, gen_hint=None):
+def estimate_minutes(spec, rates, load_s=None, measured=None, gen_hint=None, arm_rates=None):
     """Rough duration of a run from the diagnosed configuration's own prefill/decode rates and the workload's size, for
     planning (and for an agent's polling); every arm is assumed to run at the baseline's rates, so a faster candidate
     finishes sooner. Application requests: a request measured earlier in the session costs its measured time; otherwise
@@ -198,34 +198,44 @@ def estimate_minutes(spec, rates, load_s=None, measured=None, gen_hint=None):
     except (OSError, ValueError, KeyError, TypeError):
         return None
     measured = measured or {}
-    seconds, basis_items = [], "prompt tokens estimated from the workload"
-    if w.get("kind") == "requests":
-        hits = 0
-        for it in w["items"]:
-            if it["id"] in (measured.get("wall_s") or {}):
-                seconds.append(measured["wall_s"][it["id"]])
-                hits += 1
-                continue
-            limit = it["body"].get("max_tokens") or it["body"].get("n_predict") or 256
-            gen = (measured.get("class_generated") or {}).get(request_class(it)) or gen_hint or limit
-            t = len(json.dumps(it["body"].get("messages") or it["body"].get("prompt") or "")) / 4.0
-            seconds.append(t / rates["prefill_tps"] + min(limit, gen) / rates["decode_tps"] + 0.2)
-        basis_items = "%d of %d requests at their time measured earlier in this session, the rest estimated (generation: measured per class, else the " \
-                      "observed traffic's, capped by each request's limit)" % (hits, len(w["items"]))
-    else:
-        n_predict = spec.get("n_predict") or w.get("n_predict") or 64
-        seconds = [(1.2 * (p.get("words") or len(p["text"].split())) + 15) / rates["prefill_tps"] + n_predict / rates["decode_tps"] + 0.2 for p in w["prompts"]]
-    per_pass = sum(seconds)
+    per_arm_rates = [r if (r and r.get("prefill_tps") and r.get("decode_tps")) else rates for r in (arm_rates or [])] or [rates] * len(spec["arms"])
+    per_arm_rates += [rates] * (len(spec["arms"]) - len(per_arm_rates))
+
+    def pass_seconds(rt, use_measured):
+        seconds, hits = [], 0
+        if w.get("kind") == "requests":
+            for it in w["items"]:
+                if use_measured and it["id"] in (measured.get("wall_s") or {}):
+                    seconds.append(measured["wall_s"][it["id"]])
+                    hits += 1
+                    continue
+                limit = it["body"].get("max_tokens") or it["body"].get("n_predict") or 256
+                gen = (measured.get("class_generated") or {}).get(request_class(it)) or gen_hint or limit
+                t = len(json.dumps(it["body"].get("messages") or it["body"].get("prompt") or "")) / 4.0
+                seconds.append(t / rt["prefill_tps"] + min(limit, gen) / rt["decode_tps"] + 0.2)
+        else:
+            n_predict = spec.get("n_predict") or w.get("n_predict") or 64
+            seconds = [(1.2 * (p.get("words") or len(p["text"].split())) + 15) / rt["prefill_tps"] + n_predict / rt["decode_tps"] + 0.2 for p in w["prompts"]]
+        return seconds, hits
     load = float(load_s) if load_s else LAUNCH_S_ASSUMED
     cold_requests = w.get("kind") == "requests" and (spec.get("cache_mode") or w.get("cache_mode") or "cold") == "cold"
-    warmup = (seconds[0] if seconds else 0.0) * int(spec.get("warmup", 1)) if cold_requests else int(spec.get("warmup", 1)) * per_pass
-    per_launch = warmup + int(spec.get("repetitions", 2)) * per_pass + load + float(spec.get("cooldown_s", 5))
-    launches = int(spec.get("rounds", 3)) * len(spec["arms"])
-    probes = len(spec["arms"]) * per_pass * 1.1 if int(spec.get("probe_top_k", 10)) > 0 else 0.0
-    return {"minutes": round((launches * per_launch + probes) / 60.0, 1),
-            "basis": "baseline rates %.0f/%.1f t/s prefill/decode (%s) for every arm, %s, %s, one untimed probe pass per arm" % (
-                rates["prefill_tps"], rates["decode_tps"], rates.get("basis"), basis_items,
-                "%.0f s per model load (measured)" % load if load_s else "%d s per model load assumed" % LAUNCH_S_ASSUMED)}
+    total, hits = 0.0, 0
+    for i, rt in enumerate(per_arm_rates):
+        # measured request times describe the configuration they were measured on: the first arm's
+        seconds, h = pass_seconds(rt, use_measured=(i == 0))
+        hits = max(hits, h)
+        per_pass = sum(seconds)
+        warmup = (seconds[0] if seconds else 0.0) * int(spec.get("warmup", 1)) if cold_requests else int(spec.get("warmup", 1)) * per_pass
+        per_launch = warmup + int(spec.get("repetitions", 2)) * per_pass + load + float(spec.get("cooldown_s", 5))
+        total += int(spec.get("rounds", 3)) * per_launch + (per_pass * 1.1 if int(spec.get("probe_top_k", 10)) > 0 else 0.0)
+    own = arm_rates and any(r is not rates and r for r in arm_rates[1:])
+    basis_items = ("%d requests at their time measured earlier in this session, the rest estimated (generation: measured per class, else the "
+                   "observed traffic's, capped by each request's limit)" % hits) if w.get("kind") == "requests" else "prompt tokens estimated from the workload"
+    return {"minutes": round(total / 60.0, 1),
+            "basis": "%s, %s, %s, one untimed probe pass per arm" % (
+                ("each arm at its own measured rates (first arm %.0f/%.1f t/s prefill/decode)" % (rates["prefill_tps"], rates["decode_tps"])) if own else
+                "baseline rates %.0f/%.1f t/s prefill/decode (%s) for every arm" % (rates["prefill_tps"], rates["decode_tps"], rates.get("basis")),
+                basis_items, "%.0f s per model load (measured)" % load if load_s else "%d s per model load assumed" % LAUNCH_S_ASSUMED)}
 
 
 def _arm_args(common, arm):

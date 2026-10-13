@@ -442,6 +442,38 @@ def requests_workload(captured):
     return str(out)
 
 
+EVIDENCE_KINDS = ("observation", "measurement", "experiment", "bench", "profile")
+
+
+def evidence_records(paths):
+    """Records to start from. A diagnosis is a conclusion, not evidence: it stands for the records it was made from (its
+    source_files, next to it). Anything else is refused with what to pass instead."""
+    out = []
+    for p in paths:
+        rec = load_record(p)
+        kind = rec.get("kind")
+        if kind in EVIDENCE_KINDS:
+            out.append(rec)
+            continue
+        if kind == "diagnosis":
+            srcs = [Path(p).parent / n for n in rec.get("source_files") or []]
+            missing = [s.name for s in srcs if not s.is_file()]
+            if not srcs or missing:
+                raise SystemExit("error: %s is a diagnosis, not evidence, and the records it was made from are not next to it (%s); pass an observation, "
+                                 "measurement or experiment record" % (Path(p).name, ", ".join(missing) or "none listed"))
+            if agentgate.active():
+                for s in srcs:
+                    try:
+                        agentgate.inside_roots(str(s), "record")
+                    except ValueError as e:
+                        raise SystemExit("refused: %s" % e)
+            print("note: %s is a diagnosis; starting from the records it was made from: %s" % (Path(p).name, ", ".join(s.name for s in srcs)))
+            out += [load_record(str(s)) for s in srcs]
+            continue
+        raise SystemExit("error: %s is a %s record; improve starts from observation, measurement or experiment records" % (Path(p).name, kind))
+    return out
+
+
 def cmd_improve(args):
     """ACTIVE (unless --dry-run): diagnose, test the top finding with an experiment, adopt it only on a keep verdict, repeat
     within the budget, confirm the cumulative change, and print the launch line to apply."""
@@ -469,20 +501,29 @@ def cmd_improve(args):
         print("wrote %s" % rep["path"])
         return 0
     if args.from_records:
-        records = [load_record(p) for p in args.from_records]
+        records = evidence_records(args.from_records)
         start = "the records you named: %s" % ", ".join(Path(p).name for p in args.from_records)
     else:
         rec, full = _discover(args, cfg)
         _write(full, args, "discovery", disc.discovery_markdown(rec))
         live = disc.healthy_user_servers(rec)
         base = args.server or cfg.get("server_url") if (args.server or cfg.get("server_url")) else (live[0]["base_url"] if len(live) == 1 else None)
-        if base and not args.server:
+        saved = None
+        if base:
             from hotpath import server as srv_mod
             if srv_mod.health(base.rstrip("/")).get("status") == "unreachable":
-                base = live[0]["base_url"] if len(live) == 1 else None
+                # the usual sequence on one GPU: the user stopped their server so the experiments get its memory. Its last
+                # observation (with its command line) is the evidence, also when the server was named explicitly
+                saved = _last_observation(out, base)
+                if saved:
+                    print("note: %s is not running; starting from its last observation (%s)" % (base, saved[0].name))
+                    base = None
+                elif not args.server:
+                    base = live[0]["base_url"] if len(live) == 1 else None
         if not base and len(live) > 1:
             raise SystemExit("several llama-servers are running (%s); choose one with --server" % ", ".join(s["base_url"] for s in live))
-        saved = None if (base or args.log) else _last_observation(out, cfg.get("server_url"))
+        if saved is None and not (base or args.log):
+            saved = _last_observation(out, cfg.get("server_url"))
         if saved:
             # the usual sequence on one GPU: improve refused while the user's server held the VRAM, the user stopped it, and
             # runs improve again; the last observation still has that server's launch command line, which a log alone lacks

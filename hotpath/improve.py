@@ -355,6 +355,13 @@ def _measured_requests(records):
     return {}
 
 
+def _first_arm_requests(records, original):
+    """Measured request times of the original launch (the first arm of the session's first experiment), for estimating
+    the validation's original arm."""
+    exps = [r for r in records if r.get("kind") == "experiment"]
+    return _measured_requests(exps[:1]) if exps else {}
+
+
 def _gen_hint(diag):
     shape = (diag or {}).get("traffic_shape") or {}
     return shape.get("generated_tokens_p90") or shape.get("generated_tokens_median")
@@ -1194,7 +1201,11 @@ def _validate(cfg, original, steps_, records, port, rounds, repetitions, warmup,
     if need and all(x is not None for x in need):
         spec["preconditions"]["min_free_vram_mib"] = max(need)
     rates = original.get("rates")
-    est = prop.estimate_minutes(spec, rates, load_s=_measured_load_s(records), measured=_measured_requests(records))
+    # the improved arm runs at the speed its steps measured for it (the last change's candidate), not the original's
+    last = (steps_[-1].get("measured") or {}) if steps_ else {}
+    cand = {"prefill_tps": (last.get("prefill_tps") or {}).get("candidate"), "decode_tps": (last.get("decode_tps") or {}).get("candidate")}
+    est = prop.estimate_minutes(spec, rates, load_s=_measured_load_s(records), measured=_first_arm_requests(records, original),
+                                arm_rates=[rates, cand if cand["prefill_tps"] and cand["decode_tps"] else None])
     base = {"steps": steps_, "measured_by": None, "validated": False}
     if est:
         spec["provenance"]["estimated_duration"] = est
