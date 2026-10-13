@@ -713,8 +713,9 @@ def build_parser():
     s.add_argument("--requests", metavar="CAPTURED", help="your application's own request bodies (JSON array or JSONL of llama-server request bodies, "
                    "optionally {\"class\": ..., \"body\": ...}): every step and the final validation run these real requests instead of synthetic prompts; "
                    "the workload is written to workloads/ (keep it local: it holds your prompts)")
-    s.add_argument("--cache-mode", choices=("cold", "warm", "as-is"), help="prompt-cache handling for request workloads (default cold: no reuse, "
-                   "every request fully processed; warm: your requests in order with reuse, as your application sends them)")
+    s.add_argument("--cache-mode", choices=("cold", "warm", "as-is"), help="prompt-cache handling for request workloads: %s" % (
+        "cold (default): every request fully processed, prompt cache off; warm: your requests in your application's order with the prompt cache as "
+        "it sends them; as-is: no intervention, for diagnostics only"))
     s.add_argument("--step-requests", type=int, default=2, help="requests per request class in each step (default 2: the median and the largest)")
     s.add_argument("--validation-requests", type=int, default=4, help="requests per request class in the final validation (default 4, smallest to "
                    "largest, preferring ones the steps did not run)")

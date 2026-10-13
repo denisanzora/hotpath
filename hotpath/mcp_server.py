@@ -302,7 +302,7 @@ _IMPROVE_PROPS = {
     "workload": {"type": "string", "description": "Workload file inside the working directory (default: synthetic prompts shaped like the observed traffic)."},
     "requests": {"type": "string", "description": "The user's captured application request bodies (JSONL or JSON array, inside the working directory): steps and the "
                  "final validation run these real requests. Prefer this whenever the user has them."},
-    "cache_mode": {"type": "string", "enum": ["cold", "warm", "as-is"], "description": "Prompt-cache handling for request workloads (default cold)."},
+    "cache_mode": {"type": "string", "enum": ["cold", "warm", "as-is"], "description": "Prompt-cache handling for request workloads: cold (default): every request fully processed with the prompt cache off, so each change is measured on full prompt processing; warm: your requests in your application's order with the prompt cache as your application sends them (prefix reuse included); as-is: no intervention, for diagnostics (comparisons are usually not comparable)."},
     "from_records": {"type": "array", "items": _STR, "description": "Start from these records (inside the working directory) instead of observing the running server."},
     "server": {"type": "string", "description": "The user's running server to start from (loopback URL); it is observed, never restarted or loaded."},
     "args": {"type": "string", "description": "Starting llama-server arguments as one string, only when no server runs (default: server_args in the config, else defaults fitted to the GPU)."},
