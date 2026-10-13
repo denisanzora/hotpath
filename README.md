@@ -321,7 +321,7 @@ hotpath keeps four questions apart and never answers one with another:
 | Output equivalence | identical token ids or content on every compared request, reproducible within each arm | that other prompts behave the same |
 | Application-level correctness | JSON validity against the request's schema; the output's schema fields and the operator's `decision_fields` compared one by one | anything your application checks beyond those fields |
 
-A near-tie at the first divergence shows the change moved a numerically close decision. It does not show the resulting output is equivalent: the continuation from that token on is generated from a different prefix, and on structured outputs it can change fields the application reads. hotpath's default therefore accepts identical outputs only; anything else is "Needs review" unless the operator configured, and hotpath checked, a policy.
+A study on 24 real requests (docs/fidelity.md) found the baseline bit-reproducible across launches, mathematically equivalent changes (another microbatch, flash attention off) flipping 25-38% of greedy outputs at near-ties, and a lossy 8-bit KV cache producing near-tie divergences indistinguishable from those, at the same fragile positions. A near-tie at the first divergence shows the change moved a numerically close decision. It does not show the resulting output is equivalent: the continuation from that token on is generated from a different prefix, and on structured outputs it can change fields the application reads. hotpath's default therefore accepts identical outputs only; anything else is "Needs review" unless the operator configured, and hotpath checked, a policy.
 
 ## Reading the results
 
