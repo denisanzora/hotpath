@@ -18,6 +18,8 @@
 - A machine-wide GPU lock: one hotpath process does GPU work at a time, whichever client or working directory started it; `hotpath_job_status` names another holder. MCP job children stop their `llama-server` and exit when the MCP server is killed outright.
 - `HOTPATH_MCP_MAX_WAIT_S`: an operator can raise the per-call job wait for clients that allow longer tool calls; improve job status names the loop's phase.
 
+- On resume a planted validation record with a matching fingerprint could produce a "Recommended" result that hotpath never validated. Validations are now always run by the current process, and their record must name the configured model and build; reused steps only choose what is validated.
+
 ### Fixed
 - Resume reused any record whose file name matched the step, also one written for another spec; it now needs the spec's fingerprint.
 - The session lock was check-then-write and trusted a bare pid; locks are exclusive files naming pid and process start time. Two active MCP calls arriving together could both start a job.
