@@ -47,21 +47,204 @@ def _body_hash(body):
     return hashlib.sha256(json.dumps(body, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()[:16]
 
 
+REQUEST_ENDPOINTS = ("/v1/chat/completions", "/chat/completions", "/completion", "/completions", "/v1/completions")
+
+
+def request_class(item):
+    """The request class of an application request: the label the capture gave it (`class` or `stage`), else one derived
+    from its shape: endpoint, the JSON schema's name (or grammar / free text) and a short hash of the system message, so
+    requests the application builds the same way fall into one class without storing any of their text."""
+    if item.get("class"):
+        return str(item["class"])
+    body = item.get("body") or {}
+    ep = "chat" if "messages" in body else "completion"
+    rf = body.get("response_format") if isinstance(body.get("response_format"), dict) else {}
+    js = rf.get("json_schema") if isinstance(rf.get("json_schema"), dict) else {}
+    shape = js.get("name") or ("schema" if (rf.get("type") in ("json_schema", "json_object") or body.get("json_schema")) else
+                               ("grammar" if body.get("grammar") else "text"))
+    sysmsg = next((m.get("content") for m in body.get("messages") or [] if isinstance(m, dict) and m.get("role") == "system"), None)
+    tag = hashlib.sha256(json.dumps(sysmsg, ensure_ascii=False).encode("utf-8")).hexdigest()[:6] if sysmsg else "nosys"
+    return "%s/%s/%s" % (ep, str(shape)[:40], tag)
+
+
+def request_size(item):
+    """Characters of prompt content plus the requested generation limit: an ordering key for picking small to large
+    requests before any of them was measured."""
+    body = item.get("body") or {}
+    if "messages" in body:
+        chars = sum(len(m.get("content") if isinstance(m.get("content"), str) else json.dumps(m.get("content")))
+                    for m in body["messages"] if isinstance(m, dict))
+    else:
+        chars = len(str(body.get("prompt") or ""))
+    return chars + 4 * int(body.get("max_tokens") or body.get("n_predict") or 0)
+
+
+def is_sampled(body):
+    """Whether a request samples (temperature above 0 without top_k 1): its output is not expected to repeat across
+    configurations, so token identity is not a meaningful check for it. llama-server's default temperature is 0.8."""
+    try:
+        t = float(body.get("temperature", 0.8))
+    except (TypeError, ValueError):
+        return True
+    return t > 0 and body.get("top_k") != 1
+
+
 def load_workload(path):
     with open(path, "r", encoding="utf-8") as f:
         w = json.load(f)
+    if w.get("subset_of"):
+        # a subset names items of another requests workload by id and holds no request bodies itself, so the user's prompts
+        # stay in the one file they keep in workloads/ (never in a results or session directory)
+        with open(w["subset_of"], "r", encoding="utf-8") as f:
+            if json.load(f).get("subset_of"):
+                raise ValueError("subset_of must name a workload of requests, not another subset (%s)" % w["subset_of"])
+        parent = load_workload(w["subset_of"])
+        if parent.get("kind") != "requests":
+            raise ValueError("subset_of must name a requests workload, %s is not one" % w["subset_of"])
+        by_id = {it["id"]: it for it in parent["items"]}
+        missing = [i for i in w.get("item_ids") or [] if i not in by_id]
+        if missing:
+            raise ValueError("subset names items %s that %s does not have" % (missing[:5], w["subset_of"]))
+        out = {k: v for k, v in parent.items() if k != "items"}
+        out.update({k: v for k, v in w.items() if k != "item_ids"})
+        out["kind"] = "requests"
+        out["items"] = [by_id[i] for i in w["item_ids"]]
+        return out
     if w.get("kind") == "requests":
         for it in w["items"]:
             it.setdefault("sha256", _body_hash(it["body"]))
             it.setdefault("endpoint", "/v1/chat/completions" if "messages" in it["body"] else "/completion")
+            if it["endpoint"] not in REQUEST_ENDPOINTS:
+                # a workload sends inference requests, nothing else (a slot save or a props change is not a request to measure)
+                raise ValueError("item %s: endpoint %r is not one of %s" % (it.get("id"), it["endpoint"], ", ".join(REQUEST_ENDPOINTS)))
+            it["class"] = request_class(it)
         return w
     for p in w["prompts"]:
         p.setdefault("sha256", hashlib.sha256(p["text"].encode()).hexdigest()[:16])
     return w
 
 
+STEP_POSITIONS = {1: [0.5], 2: [0.5, 1.0], 3: [0.0, 0.5, 1.0]}
+
+
+def spread(items, n, avoid=(), positions=None):
+    """n items from a size-sorted list at evenly spaced positions (the largest always included), preferring items not in
+    `avoid` near each position."""
+    if n >= len(items):
+        return list(items)
+    positions = positions or ([0.5] if n == 1 else [i / (n - 1) for i in range(n)])
+    picks = []
+    for q in positions:
+        idx = int(round(q * (len(items) - 1)))
+        order = sorted(range(len(items)), key=lambda j: (abs(j - idx), j))
+        if q >= 1.0:
+            pick = items[-1] if items[-1] not in picks else None
+        else:
+            pick = next((items[j] for j in order if items[j]["id"] not in avoid and items[j] not in picks), None) or \
+                next((items[j] for j in order if items[j] not in picks), None)
+        if pick is not None:
+            picks.append(pick)
+    return picks
+
+
+def class_groups(w, max_classes):
+    """Items by request class, each class sorted small to large. Derived classes finer than `max_classes` (a system
+    message that varies per request) are regrouped by endpoint and schema; beyond that the most frequent classes are kept."""
+    order = {it["id"]: i for i, it in enumerate(w["items"])}
+    groups = {}
+    for it in w["items"]:
+        groups.setdefault(request_class(it), []).append(it)
+    if len(groups) > max_classes and any(not it.get("class_labelled") for it in w["items"]):
+        coarse = {}
+        for it in w["items"]:
+            coarse.setdefault("/".join(request_class(it).split("/")[:2]), []).append(it)
+        groups = coarse
+    if len(groups) > max_classes:
+        keep = sorted(groups, key=lambda c: (-len(groups[c]), c))[:max_classes]
+        groups = {c: groups[c] for c in keep}
+    for c in groups:
+        groups[c].sort(key=lambda it: (request_size(it), order[it["id"]]))
+    return groups, order
+
+
+def per_class_spread(w, per_class, max_total, avoid=(), positions=None):
+    """Per request class, `per_class` requests from the smallest to the largest (preferring ones not in `avoid`), at most
+    `max_total` in all, in the application's own order."""
+    groups, order = class_groups(w, max_total)
+    n = max(1, min(int(per_class), max_total // max(1, len(groups)) or 1))
+    picks = []
+    for items in groups.values():
+        # positions=False: evenly spaced from the smallest to the largest; None: the step positions (median, largest, ...)
+        picks += spread(items, n, avoid=avoid, positions=None if positions is False else (positions or STEP_POSITIONS.get(n)))
+    picks.sort(key=lambda it: order[it["id"]])
+    return picks, n
+
+
+def find_request_captures(root=".", max_files=60):
+    """Files in the working directory (and its captured/, workloads/ subdirectories) that hold application request bodies:
+    JSONL whose first line is a llama-server request (or {"body": ...}), or requests workloads. Bounded and read-only: only
+    the first line (or the `kind` of a workload) of at most `max_files` files is read; nothing is listed but the paths."""
+    found, seen = [], 0
+    for d in (Path(root), Path(root) / "captured", Path(root) / "workloads"):
+        if not d.is_dir():
+            continue
+        for p in sorted(d.iterdir()):
+            if seen >= max_files:
+                return found
+            if not p.is_file() or p.suffix.lower() not in (".jsonl", ".json") or p.name.lower().endswith(".local.json"):
+                continue
+            seen += 1
+            try:
+                with open(p, "r", encoding="utf-8") as f:
+                    head = f.readline(1 << 20) if p.suffix.lower() == ".jsonl" else None
+                if head is not None:
+                    r = json.loads(head)
+                    body = r.get("body") if isinstance(r, dict) and isinstance(r.get("body"), dict) else r
+                    if isinstance(body, dict) and ("messages" in body or "prompt" in body):
+                        found.append(str(p))
+                elif p.stat().st_size < (256 << 20):
+                    with open(p, "r", encoding="utf-8") as f:
+                        w = json.load(f)
+                    if isinstance(w, dict) and w.get("kind") == "requests" and not w.get("subset_of"):
+                        found.append(str(p))
+            except (OSError, ValueError, UnicodeDecodeError):
+                continue
+    return found
+
+
+def subset(parent_path, item_ids, name, basis):
+    """A requests workload made of some items of `parent_path` (by id, in this order), holding no bodies."""
+    return {"name": name, "kind": "requests", "subset_of": str(parent_path), "item_ids": list(item_ids), "basis": basis}
+
+
+def requests_workload_path(path):
+    """Where a workload of request bodies is written: a file named without a directory (or directly in the working
+    directory) goes to workloads/, which hotpath excludes from version control; an explicit directory is kept."""
+    p = Path(path)
+    if p.parent == Path(".") or p.absolute().parent == Path.cwd().absolute():
+        return Path("workloads") / p.name
+    return p
+
+
+def in_private_dir(path):
+    """Whether `path` is below a directory hotpath excluded from version control (one holding its .gitignore)."""
+    from hotpath.records import PRIVATE_GITIGNORE
+    for d in Path(path).absolute().parents:
+        g = d / ".gitignore"
+        try:
+            if g.is_file() and g.read_text(encoding="utf-8") == PRIVATE_GITIGNORE:
+                return True
+        except OSError:
+            pass
+    return False
+
+
 def save_workload(w, path):
-    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    from hotpath.records import private_dir
+    if w.get("kind") == "requests" or Path(path).parent.name == "workloads":
+        private_dir(Path(path).parent)
+    else:
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
         json.dump(w, f, indent=1)
 
@@ -84,15 +267,23 @@ def workload_from_requests(path, name="requests", limit=None):
         raw = [json.loads(ln) for ln in text.splitlines() if ln.strip()]
     items = []
     for i, r in enumerate(raw):
+        label = None
         if isinstance(r, dict) and "body" in r and isinstance(r["body"], dict):
             endpoint, body = r.get("endpoint"), r["body"]
+            label = r.get("class") or r.get("stage")          # a capture may label each request with the application step it serves
         else:
             endpoint, body = None, r
         if not isinstance(body, dict) or not ("messages" in body or "prompt" in body):
             raise ValueError("item %d is not a llama-server request body (needs 'messages' or 'prompt')" % i)
         body = dict(body)
         body["stream"] = False
-        items.append({"id": "r%02d" % i, "endpoint": endpoint or ("/v1/chat/completions" if "messages" in body else "/completion"), "body": body, "sha256": _body_hash(body)})
+        it = {"id": ("r%02d" if len(raw) <= 100 else "r%04d") % i, "endpoint": endpoint or ("/v1/chat/completions" if "messages" in body else "/completion"),
+              "body": body, "sha256": _body_hash(body)}
+        if label:
+            it["class"] = str(label)[:60]
+            it["class_labelled"] = True
+        it["class"] = request_class(it)
+        items.append(it)
         if limit and len(items) >= limit:
             break
     if not items:
@@ -108,9 +299,15 @@ def workload_from_requests(path, name="requests", limit=None):
 def workload_identity(w):
     if w.get("kind") == "requests":
         hashes = [it["sha256"] for it in w["items"]]
+        classes = {}
+        for it in w["items"]:
+            c = request_class(it)
+            classes[c] = classes.get(c, 0) + 1
         return {"name": w["name"], "kind": "requests", "n_prompts": len(hashes), "n_predict": None, "temperature": None, "ignore_eos": False,
                 "prompt_hashes": hashes, "set_hash": hashlib.sha256("".join(hashes).encode()).hexdigest()[:16],
-                "endpoints": sorted({it["endpoint"] for it in w["items"]}),
+                "endpoints": sorted({it["endpoint"] for it in w["items"]}), "classes": classes,
+                "sampled_requests": sum(1 for it in w["items"] if is_sampled(it["body"])),
+                "subset_of": Path(w["subset_of"]).name if w.get("subset_of") else None,
                 "fields_present": sorted({k for it in w["items"] for k in it["body"] if k not in ("messages", "prompt")})}
     return {"name": w["name"], "n_prompts": len(w["prompts"]), "n_predict": w["n_predict"], "temperature": w.get("temperature", 0.0),
             "ignore_eos": bool(w.get("ignore_eos", True)),

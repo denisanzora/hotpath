@@ -5,10 +5,11 @@ tooling reports them; hotpath does not sum per-process counters into a paging ve
 because shared allocations (notably those attributed to dwm.exe) can be counted more than once.
 """
 import json
-import platform
-import shutil
+import os
 import subprocess
 import time
+
+from hotpath import safepath
 
 # Peak theoretical memory bandwidth (GB/s), used only for roofline estimates. Keyed by the
 # nvidia-smi product name. Add entries or pass --bandwidth-gbs to override.
@@ -31,14 +32,16 @@ KNOWN_BANDWIDTH_GBS = {
 
 def _run(cmd, timeout=20):
     try:
-        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        # stdin is never inherited: under the MCP server it is the JSON-RPC pipe, and PowerShell waits for it to close;
+        # the program is resolved outside the working directory (safepath)
+        p = safepath.run(cmd, capture_output=True, text=True, timeout=timeout, stdin=subprocess.DEVNULL)
         return p.returncode, p.stdout, p.stderr
     except (OSError, subprocess.TimeoutExpired) as e:
         return -1, "", str(e)
 
 
 def nvidia_smi_available():
-    return shutil.which("nvidia-smi") is not None
+    return safepath.which("nvidia-smi") is not None
 
 
 def gpu_static():
@@ -58,6 +61,49 @@ def gpu_static():
     if rc == 0:
         info["driver_model"] = out.strip()
     return info
+
+
+def gpus_all():
+    """Every NVIDIA GPU nvidia-smi reports (gpu_static describes only the first). Empty list without nvidia-smi."""
+    if not nvidia_smi_available():
+        return []
+    fields = "index,name,driver_version,memory.total,memory.used,compute_cap,utilization.gpu,pcie.link.gen.current,pcie.link.width.current"
+    rc, out, _ = _run(["nvidia-smi", "--query-gpu=" + fields, "--format=csv,noheader,nounits"])
+    if rc != 0:
+        return []
+    rows = []
+    for line in out.strip().splitlines():
+        d = dict(zip(fields.split(","), [v.strip() for v in line.split(",")]))
+        d["bandwidth_gbs_known"] = KNOWN_BANDWIDTH_GBS.get(d.get("name"))
+        rows.append(d)
+    return rows
+
+
+def driver_cuda_version():
+    """Highest CUDA version the installed driver supports, from nvidia-smi's banner ("CUDA Version: 12.8", or
+    "CUDA UMD Version" on newer drivers). None when it cannot be read."""
+    if not nvidia_smi_available():
+        return None
+    import re
+    rc, out, _ = _run(["nvidia-smi"])
+    m = re.search(r"CUDA (?:UMD )?Version:\s*([\d.]+)", out or "")
+    return m.group(1) if m else None
+
+
+def compute_apps():
+    """Processes nvidia-smi lists as using the GPU for compute: pid, name, used MiB (often N/A under Windows WDDM)."""
+    if not nvidia_smi_available():
+        return []
+    rc, out, _ = _run(["nvidia-smi", "--query-compute-apps=pid,process_name,used_memory", "--format=csv,noheader,nounits"])
+    if rc != 0:
+        return []
+    apps = []
+    for line in out.strip().splitlines():
+        parts = [p.strip() for p in line.split(",")]
+        if len(parts) >= 3 and parts[0].isdigit():
+            apps.append({"pid": int(parts[0]), "name": parts[1].replace("\\", "/").rsplit("/", 1)[-1],
+                         "used_mib": float(parts[2]) if parts[2].replace(".", "", 1).isdigit() else None})
+    return apps
 
 
 def gpu_dynamic():
@@ -108,7 +154,7 @@ def windows_process_gpu_counters(pid):
     These are the WDDM counters Task Manager shows. 'shared usage' for a process is the
     best available indicator that *that process* has allocations living in system memory.
     """
-    if platform.system() != "Windows" or not pid:
+    if os.name != "nt" or not pid:
         return {}
     ps = (
         "$p='pid_%d_*';" % int(pid) +
@@ -138,7 +184,7 @@ def windows_process_gpu_counters(pid):
 
 def windows_adapter_memory():
     """Adapter-wide dedicated/shared usage. Reported as-is; not a paging verdict."""
-    if platform.system() != "Windows":
+    if os.name != "nt":
         return {}
     ps = (
         "$r=@{};"
@@ -160,7 +206,7 @@ def windows_adapter_memory():
 
 def pid_listening_on(port):
     """PID of the process listening on a local TCP port, or None."""
-    if platform.system() == "Windows":
+    if os.name == "nt":
         rc, out, _ = _run(["netstat", "-ano", "-p", "tcp"])
         if rc != 0:
             return None

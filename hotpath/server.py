@@ -10,20 +10,39 @@ import urllib.error
 import urllib.request
 
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """hotpath talks to one local server; a redirect elsewhere is refused, not followed."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise urllib.error.HTTPError(req.full_url, code, "redirect refused (hotpath does not follow redirects): %s" % msg, headers, fp)
+
+
+# loopback only: no redirects and no proxy (an HTTP_PROXY or a system proxy would otherwise receive the request bodies)
+_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect)
+
+
 class ServerError(RuntimeError):
     pass
 
 
+class RequestRejected(ServerError):
+    """The server answered a request with an HTTP error status: it is up, and refused this request."""
+
+    def __init__(self, code, error_type):
+        super().__init__("HTTP %s (%s)" % (code, error_type))
+        self.code, self.error_type = code, error_type
+
+
 def _get(url, timeout=10):
     req = urllib.request.Request(url, headers={"Accept": "application/json"})
-    with urllib.request.urlopen(req, timeout=timeout) as r:
+    with _OPENER.open(req, timeout=timeout) as r:
         return json.loads(r.read().decode("utf-8"))
 
 
 def _post(url, body, timeout=600):
     data = json.dumps(body).encode("utf-8")
     req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"}, method="POST")
-    with urllib.request.urlopen(req, timeout=timeout) as r:
+    with _OPENER.open(req, timeout=timeout) as r:
         raw = r.read().decode("utf-8")
         return json.loads(raw) if raw else {}
 
@@ -127,7 +146,16 @@ def request(base, endpoint, body, timeout=900):
     body = dict(body)
     body["stream"] = False
     t0 = time.perf_counter()
-    r = _post(base + endpoint, body, timeout=timeout)
+    try:
+        r = _post(base + endpoint, body, timeout=timeout)
+    except urllib.error.HTTPError as e:
+        etype = None
+        try:
+            err = json.loads(e.read().decode("utf-8", "replace")).get("error")
+            etype = err.get("type") if isinstance(err, dict) else None
+        except (ValueError, AttributeError, OSError):
+            pass
+        raise RequestRejected(e.code, str(etype or "unknown")[:60])
     r["_wall_ms"] = round((time.perf_counter() - t0) * 1000.0, 1)
     return r
 

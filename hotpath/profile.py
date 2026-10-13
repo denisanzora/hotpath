@@ -16,7 +16,8 @@ from hotpath.records import redact_args, file_identity, new_record
 
 
 def _run(cmd, env=None, timeout=3600):
-    p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, env=env)
+    from hotpath import launch, safepath
+    p = safepath.run([cmd[0]] + launch.absolute_paths(cmd[1:]), capture_output=True, text=True, timeout=timeout, env=env, stdin=subprocess.DEVNULL)
     return p.returncode, p.stdout, p.stderr
 
 
@@ -75,8 +76,8 @@ def profile(bin_dir, model, label, out_dir, pp, tg, ngl=99, ub=512, extra_args=N
         raise SystemExit("nsys not found: " + ns.install_hint)
     if not lb.locate():
         raise SystemExit("llama-bench not found in %s" % bin_dir)
-    out = Path(out_dir)
-    out.mkdir(parents=True, exist_ok=True)
+    from hotpath.records import private_dir
+    out = private_dir(Path(out_dir).absolute())   # nsys runs in its own directory, not this one
     stem = str(out / ("nsys-%s" % label))
     bench_args = ["-ngl", str(ngl), "-ub", str(ub), "-p", str(pp), "-n", str(tg), "-r", "1"] + list(extra_args or [])
     cmd = ns.recipe(str(lb.locate()), model, bench_args, stem)
@@ -84,7 +85,8 @@ def profile(bin_dir, model, label, out_dir, pp, tg, ngl=99, ub=512, extra_args=N
     if path_prepend:
         import os
         env = dict(os.environ)
-        env["PATH"] = os.pathsep.join(path_prepend) + os.pathsep + env.get("PATH", "")
+        from hotpath import safepath
+        env["PATH"] = os.pathsep.join(safepath.absolute_entries(path_prepend)) + os.pathsep + env.get("PATH", "")
     bg = gpu_mod.sample_background(seconds=5.0, interval=1.0)
     rc, so, se = _run(cmd, env=env)
     rec = new_record("profile", "active", label=label, mode={"pp": pp, "tg": tg, "ub": ub, "ngl": ngl},

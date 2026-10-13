@@ -9,13 +9,15 @@ cache_n), the wall time, and the generated token ids, so prefill, generation, an
 latency are kept apart and outputs can be compared across arms.
 """
 import hashlib
+import hmac
 import json
+import os
 import time
 
 from hotpath import gpu as gpu_mod
 from hotpath import server as srv
 from hotpath.records import new_record, percentiles
-from hotpath.workload import workload_identity
+from hotpath.workload import is_sampled, request_class, workload_identity
 
 
 def apply_request_override(body, override):
@@ -161,6 +163,58 @@ def _validity(content, schema, mode="auto"):
         return {"valid_json": True, "schema_required_present": present, "schema_valid": None, "validation_level": "validator could not run: %s" % type(e).__name__}
 
 
+def field_kind(prop):
+    """What kind of value a schema property holds, for comparing outputs field by field: `categorical` (enum, const,
+    boolean: the kind of field an application branches on), `number`, `text` (free strings), `structure` (objects,
+    arrays) or `other`."""
+    if not isinstance(prop, dict):
+        return "other"
+    if "enum" in prop or "const" in prop:
+        return "categorical"
+    t = prop.get("type")
+    t = [x for x in t if x != "null"][0] if isinstance(t, list) and [x for x in t if x != "null"] else t
+    return {"boolean": "categorical", "integer": "number", "number": "number", "string": "text", "object": "structure",
+            "array": "structure"}.get(t, "other")
+
+
+def output_fields(content, schema, key=None):
+    """Per property the schema declares at the top level: a short keyed hash of the output's value (or "missing"), and the
+    property's kind. Lets two arms' outputs be compared field by field (did the same decision come out?) without storing
+    output text; keys the schema does not declare are output content and are not recorded. The key is a per-run secret
+    kept in memory only, so a short value (an enum, a boolean, a score) cannot be recovered by hashing candidates."""
+    if not isinstance(schema, dict) or not isinstance(schema.get("properties"), dict) or not schema["properties"]:
+        return None, None
+    try:
+        obj = json.loads(content)
+    except (ValueError, TypeError):
+        return None, None
+    if not isinstance(obj, dict):
+        return None, None
+    fields, kinds = {}, {}
+    for k, prop in schema["properties"].items():
+        k = str(k)
+        kinds[k] = field_kind(prop)
+        if k not in obj:
+            fields[k] = "missing"
+            continue
+        raw = json.dumps(obj[k], sort_keys=True, ensure_ascii=False).encode("utf-8")
+        fields[k] = hmac.new(key, raw, hashlib.sha256).hexdigest()[:12] if key else hashlib.sha256(raw).hexdigest()[:12]
+    return fields, kinds
+
+
+def output_digest(content, workload):
+    """The identity hash of an application output: keyed with the run's secret (see _field_key), so outputs compare between
+    the arms of one run while a short output (an enum, a score) cannot be recovered by hashing likely candidates."""
+    return hmac.new(_field_key(workload), content.encode("utf-8"), hashlib.sha256).hexdigest()[:16]
+
+
+def _field_key(workload):
+    """The per-run key of output field hashes: set by the experiment runner for all arms of one run (in memory only)."""
+    if not workload.get("_field_key"):
+        workload["_field_key"] = os.urandom(16)
+    return workload["_field_key"]
+
+
 def cache_state(timings):
     """What the server itself says about this request's prompt cache: cold when it reused no tokens, warm when it
     reused some. Anything else (field missing, null, non-numeric, negative, NaN) is "unknown": missing or malformed
@@ -227,26 +281,42 @@ def run_requests_workload(base, workload, repetitions=3, warmup=1, request_overr
     for phase, rep in seq:
         if mode == "cold" and out["cache"]["slot_erase_supported"]:
             srv.erase_slot(base, slot_id)
-        for it in workload["items"]:
+        # in cold mode a warmup pass only has to warm the runtime (kernels, graphs, allocations): the first item does that, and
+        # nothing it leaves behind is reused; in warm and as-is mode a warmup pass establishes the cache state, so it is whole
+        items = workload["items"][:1] if (phase == "warmup" and mode == "cold") else workload["items"]
+        for it in items:
             body = apply_request_override(it["body"], request_override)
             if force_cold_requests:
                 body["cache_prompt"] = False
             before = gpu_mod.gpu_dynamic()
-            resp = srv.request(base, it["endpoint"], body)
+            try:
+                resp = srv.request(base, it["endpoint"], body)
+            except srv.RequestRejected as e:
+                # the server answered with an error (a request larger than the context, a schema it cannot compile): this
+                # configuration cannot serve this request. Recorded as a failed request of the arm; the error's type and code
+                # are kept, its message is not (it can quote the request)
+                rec = {"phase": phase, "rep": rep, "prompt_id": it["id"], "prompt_sha256": it["sha256"], "endpoint": it["endpoint"],
+                       "class": request_class(it), "sampled": is_sampled(body), "error": {"http": e.code, "type": e.error_type}}
+                (out["warmup_requests"] if phase == "warmup" else out["requests"]).append(rec)
+                if progress:
+                    progress("%s rep %d %s: REJECTED by the server (HTTP %s, %s)" % (phase, rep, it["id"], e.code, e.error_type))
+                continue
             after = gpu_mod.gpu_dynamic()
             t = resp.get("timings", {})
             content, stop = _content(resp)
             rec = {"phase": phase, "rep": rep, "prompt_id": it["id"], "prompt_sha256": it["sha256"], "endpoint": it["endpoint"],
+                   "class": request_class(it), "sampled": is_sampled(body), "output_hash": "keyed per run",
                    "prompt_n": t.get("prompt_n"), "cache_n": t.get("cache_n"), "cache_state": cache_state(t),
                    "prompt_ms": t.get("prompt_ms"), "prompt_tps": t.get("prompt_per_second"),
                    "predicted_n": t.get("predicted_n"), "predicted_ms": t.get("predicted_ms"), "predicted_tps": t.get("predicted_per_second"),
                    "wall_ms": resp.get("_wall_ms"), "stop_type": stop, "tokens": None,
-                   "output_sha256": hashlib.sha256(content.encode("utf-8")).hexdigest()[:16], "output_chars": len(content),
+                   "output_sha256": output_digest(content, workload), "output_chars": len(content),
                    "output_text": content if store_outputs else None, "gpu_before": before, "gpu_after": after}
             # validity is judged against the application's own request (the workload item), not the arm's edited body:
             # an arm that drops the schema is still measured on whether its output satisfies what the application requires
             rec.update(_validity(content, _schema_of(it["body"]), schema_mode))
             rec["validity_schema_from"] = "workload item" if _schema_of(it["body"]) is not None else None
+            rec["fields"], rec["field_kinds"] = output_fields(content, _schema_of(it["body"]), _field_key(workload))
             (out["warmup_requests"] if phase == "warmup" else out["requests"]).append(rec)
             if progress:
                 progress("%s rep %d %s: prompt_n=%s cache_n=%s (%s) pp=%s t/s tg=%s t/s (%s tok) wall=%s ms valid_json=%s schema_valid=%s" % (
@@ -368,7 +438,9 @@ def measure(cfg, base, workload, repetitions, warmup, owned, background_seconds=
         raise SystemExit("server not healthy: %s" % snap.get("health"))
     port = int(base.rsplit(":", 1)[1].split("/")[0])
     pid = gpu_mod.pid_listening_on(port)
+    from hotpath import discover as disc
     rec = new_record("measurement", "active", label=label, target=snap,
+                     server_launch=disc.launch_for_record(disc.server_launch(pid)) if pid else {"available": False, "note": "no process found on port %d" % port},
                      workload=workload_identity(workload),
                      gpu=gpu_mod.gpu_static(),
                      background_before=gpu_mod.sample_background(seconds=background_seconds, interval=1.0),

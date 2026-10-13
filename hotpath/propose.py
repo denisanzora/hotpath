@@ -16,24 +16,103 @@ DEFAULT_COMMON_ARGS = ["--ctx-size", "4096", "--gpu-layers", "99", "--batch-size
 
 
 def _set_arg(args, flag, value):
-    args = list(args)
-    if flag in args:
-        args[args.index(flag) + 1] = str(value)
-    else:
-        args += [flag, str(value)]
-    return args
+    from hotpath import launch
+    return launch.set_arg(args, flag, value)
 
 
-def baseline_args(diagnosis_record, cfg, override=None):
-    """Common arguments for the spec: explicit override > cfg['server_args'] > the diagnosed experiment's arm args > defaults."""
+_PATH_SETTINGS = ("model", "log_file", "model_draft", "host", "port")
+
+
+def _speed_settings(args):
+    """The settings of an argv that matter for a comparison (paths, host and port excluded)."""
+    from hotpath import launch
+    s = launch.parse(args)["settings"]
+    return {k: str(v) for k, v in s.items() if k not in _PATH_SETTINGS}
+
+
+def tuning_only(args):
+    """The allowlisted tuning arguments of an argument list read from a record (an observed command line, an experiment's
+    arm), and the names of the others. A record is evidence, not an instruction: a flag that starts programs, reaches other
+    hosts or writes files is never carried from a file into a launch, whoever wrote the file."""
+    from hotpath import agentgate
+    from hotpath import launch
+    kept, dropped = [], []
+    for flag, value in launch.split_args(args):
+        if flag is None:
+            continue
+        if flag.split("=", 1)[0] in agentgate.ALLOWED_FLAGS:
+            kept.append(flag)
+            if value is not None:
+                kept.append(value)
+        else:
+            dropped.append(flag.split("=", 1)[0])
+    return kept, dropped
+
+
+def baseline_args(diagnosis_record, cfg, override=None, from_verdict=True):
+    """Common arguments for the spec, so the baseline arm is the configuration that was diagnosed:
+    explicit override > the arm the last verdict found faster > the diagnosed server's observed command line (or server_args in the config when it matches it, since
+    the config keeps full paths) > server_args > the diagnosed experiment's arm args > defaults."""
     if override:
         return list(override), "command line"
+    d = diagnosis_record or {}
+    if from_verdict and d.get("baseline_from_verdict") and d.get("baseline_args"):
+        # the manual improve step (propose after an experiment): the next experiment starts from the configuration the last
+        # verdict found faster. `hotpath improve` passes from_verdict=False: it always starts from the user's own launch
+        kept, dropped = tuning_only(d["baseline_args"])
+        return kept, d["baseline_from_verdict"] + (" (not carried from the record: %s)" % ", ".join(sorted(set(dropped))) if dropped else "")
+    obs = d.get("observed_launch") or {}
+    if obs.get("args_redacted"):
+        from hotpath import launch
+        if cfg.get("server_args") and _speed_settings(cfg["server_args"]) == _speed_settings(obs["args_redacted"]):
+            return list(cfg["server_args"]), "hotpath.local.json server_args (same settings as the observed command line, %s)" % obs.get("source")
+        kept, dropped = launch.drop_path_args(obs["args_redacted"])
+        kept, untrusted = tuning_only(kept)
+        src = "the diagnosed server's observed command line (%s)" % obs.get("source")
+        if [f for f in untrusted if f not in RUNNER_OWNED_FLAGS]:
+            src += "; not carried from the record into a launch (only tuning settings are): %s" % ", ".join(sorted(set(f for f in untrusted if f not in RUNNER_OWNED_FLAGS)))
+        if cfg.get("server_args"):
+            src += "; server_args in hotpath.local.json differ from it and were not used"
+        if [d for d in dropped if d not in RUNNER_OWNED_FLAGS]:
+            src += "; arguments with file paths left out (records keep only basenames): %s; put the full arguments in server_args to keep them" % ", ".join(
+                d for d in dropped if d not in RUNNER_OWNED_FLAGS)
+        return kept, src
     if cfg.get("server_args"):
         return list(cfg["server_args"]), "hotpath.local.json server_args"
     arm = (diagnosis_record or {}).get("baseline_args")
     if arm:
-        return list(arm), "diagnosed experiment arm"
+        return tuning_only(arm)[0], "diagnosed experiment arm"
     return list(DEFAULT_COMMON_ARGS), "hotpath defaults (adapt --ctx-size and --gpu-layers to your model)"
+
+
+COMPUTE_ALLOWANCE_MIB = 512
+
+
+def vram_needed_mib(cfg, args):
+    """Free VRAM an experiment arm needs before launch, from the GGUF header: the weights on the GPU (+10%), the KV cache at
+    the arm's context size and KV types, and a compute-buffer allowance; None when the model file is unknown (then the
+    spec keeps a generic floor). An estimate for the precondition only; the arm's real footprint is measured per arm."""
+    from hotpath import gguf
+    mp = cfg.get("model_path")
+    if not mp or not Path(mp).is_file():
+        return None
+    try:
+        s = gguf.summarize(gguf.read_header(mp))
+    except (OSError, ValueError, KeyError):
+        return None
+    from hotpath.launch import int_or_none, get
+    from hotpath.diagnose import KV_TYPE_FACTOR
+    ngl = int_or_none(get(args, "n_gpu_layers"))
+    frac = 1.0 if ngl is None or not s.get("n_layer") else min(1.0, max(0, ngl) / (s["n_layer"] + 1))
+    need = s["total_bytes"] / (1 << 20) * frac * 1.1
+    ctx = int_or_none(get(args, "ctx_size")) or 4096
+    if s.get("kv_bytes_per_token_f16") and ctx > 0:
+        fk = KV_TYPE_FACTOR.get(str(get(args, "cache_type_k") or "f16").lower(), 1.0)
+        fv = KV_TYPE_FACTOR.get(str(get(args, "cache_type_v") or "f16").lower(), 1.0)
+        need += s["kv_bytes_per_token_f16"] * ctx * (fk + fv) / 2 / (1 << 20) * frac
+    if frac > 0:
+        need += COMPUTE_ALLOWANCE_MIB
+    return int(need)
 
 
 # llama-server arguments the experiment runner owns or that must never be shared with the user's own server: it adds
@@ -52,7 +131,8 @@ RUNNER_OWNED_FLAGS = frozenset({
 def strip_runner_owned(args):
     """Drop runner-owned flags (and their values) from copied server arguments. Returns (kept_args, removed_flag_names);
     only flag names are reported, since their values are often private paths."""
-    args = [str(a) for a in args]
+    from hotpath import launch
+    args = [launch.canonical(a) for a in args]
     kept, removed, i = [], [], 0
     while i < len(args):
         flag = args[i].split("=", 1)[0]
@@ -89,17 +169,28 @@ def build_spec(finding, cfg, common_args, workload, port=8099, rounds=3, repetit
     kind = exp.get("kind")
     args = list(common_args)
     arms = []
+    # a finding may come from a diagnosis file, which anyone able to write the working directory can edit: its arms are
+    # evidence of what to try, and only tuning settings are taken from them, in the CLI too
+    from hotpath import agentgate
+    refused = []
+    for a in exp["arms"]:
+        refused += agentgate.arg_problems([t for k, v in (a.get("args_override") or {}).items() for t in (str(k), str(v))], "arm %s" % a.get("name"))
+        refused += agentgate.env_problems(a.get("env_override"), "arm %s" % a.get("name"))
+        refused += agentgate.env_problems(dict.fromkeys(a.get("env_remove") or []), "arm %s" % a.get("name"))
+    if refused:
+        raise ValueError("finding %s proposes settings hotpath does not carry from a diagnosis: %s" % (finding.get("id"), "; ".join(refused)))
     for a in exp["arms"]:
         arm = {"name": a["name"]}
         if a.get("args_override"):
             arm["args_override"] = a["args_override"]
             # a larger microbatch needs --batch-size at least as large; keep every other argument identical
             if kind == "ubatch_sweep":
+                from hotpath import launch
                 ub = int(a["args_override"].get("--ubatch-size", 0))
-                nb = int(dict(zip(args[::2], args[1::2])).get("--batch-size", 0) or 0)
+                nb = launch.int_or_none(launch.get(args, "batch_size")) or 0
                 if ub and nb and nb < ub:
                     arm["args_override"] = dict(arm["args_override"], **{"--batch-size": ub})
-        for k in ("env_override", "env_remove", "args_remove", "request_override"):
+        for k in ("env_override", "env_remove", "args_remove", "request_override", "capacity_change", "context_policy", "control"):
             if a.get(k):
                 arm[k] = a[k]
         arms.append(arm)
@@ -121,6 +212,94 @@ def build_spec(finding, cfg, common_args, workload, port=8099, rounds=3, repetit
     if n_predict:
         spec["n_predict"] = int(n_predict)
     return spec
+
+
+LAUNCH_S_ASSUMED = 30
+
+
+def estimate_minutes(spec, rates, load_s=None, measured=None, gen_hint=None, arm_rates=None):
+    """Rough duration of a run from the diagnosed configuration's own prefill/decode rates and the workload's size, for
+    planning (and for an agent's polling); every arm is assumed to run at the baseline's rates, so a faster candidate
+    finishes sooner. Application requests: a request measured earlier in the session costs its measured time; otherwise
+    its generation is the class's measured median, else the observed traffic's (`gen_hint`), capped by its own limit,
+    since requests usually stop long before max_tokens. Model load time is an assumption unless measured. Includes the
+    untimed probe pass of the first round. None when rates or the workload are unknown."""
+    from hotpath.workload import load_workload, request_class
+    if not rates or not rates.get("prefill_tps") or not rates.get("decode_tps"):
+        return None
+    try:
+        w = load_workload(spec["workload"])
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+    measured = measured or {}
+    per_arm_rates = [r if (r and r.get("prefill_tps") and r.get("decode_tps")) else rates for r in (arm_rates or [])] or [rates] * len(spec["arms"])
+    per_arm_rates += [rates] * (len(spec["arms"]) - len(per_arm_rates))
+
+    def pass_seconds(rt, use_measured):
+        seconds, hits = [], 0
+        if w.get("kind") == "requests":
+            for it in w["items"]:
+                if use_measured and it["id"] in (measured.get("wall_s") or {}):
+                    seconds.append(measured["wall_s"][it["id"]])
+                    hits += 1
+                    continue
+                limit = it["body"].get("max_tokens") or it["body"].get("n_predict") or 256
+                gen = (measured.get("class_generated") or {}).get(request_class(it)) or gen_hint or limit
+                t = len(json.dumps(it["body"].get("messages") or it["body"].get("prompt") or "")) / 4.0
+                seconds.append(t / rt["prefill_tps"] + min(limit, gen) / rt["decode_tps"] + 0.2)
+        else:
+            n_predict = spec.get("n_predict") or w.get("n_predict") or 64
+            seconds = [(1.2 * (p.get("words") or len(p["text"].split())) + 15) / rt["prefill_tps"] + n_predict / rt["decode_tps"] + 0.2 for p in w["prompts"]]
+        return seconds, hits
+    load = float(load_s) if load_s else LAUNCH_S_ASSUMED
+    cold_requests = w.get("kind") == "requests" and (spec.get("cache_mode") or w.get("cache_mode") or "cold") == "cold"
+    total, hits = 0.0, 0
+    for i, rt in enumerate(per_arm_rates):
+        # measured request times describe the configuration they were measured on: the first arm's
+        seconds, h = pass_seconds(rt, use_measured=(i == 0))
+        hits = max(hits, h)
+        per_pass = sum(seconds)
+        warmup = (seconds[0] if seconds else 0.0) * int(spec.get("warmup", 1)) if cold_requests else int(spec.get("warmup", 1)) * per_pass
+        per_launch = warmup + int(spec.get("repetitions", 2)) * per_pass + load + float(spec.get("cooldown_s", 5))
+        total += int(spec.get("rounds", 3)) * per_launch + (per_pass * 1.1 if int(spec.get("probe_top_k", 10)) > 0 else 0.0)
+    own = arm_rates and any(r is not rates and r for r in arm_rates[1:])
+    basis_items = ("%d requests at their time measured earlier in this session, the rest estimated (generation: measured per class, else the "
+                   "observed traffic's, capped by each request's limit)" % hits) if w.get("kind") == "requests" else "prompt tokens estimated from the workload"
+    return {"minutes": round(total / 60.0, 1),
+            "basis": "%s, %s, %s, one untimed probe pass per arm" % (
+                ("each arm at its own measured rates (first arm %.0f/%.1f t/s prefill/decode)" % (rates["prefill_tps"], rates["decode_tps"])) if own else
+                "baseline rates %.0f/%.1f t/s prefill/decode (%s) for every arm" % (rates["prefill_tps"], rates["decode_tps"], rates.get("basis")),
+                basis_items, "%.0f s per model load (measured)" % load if load_s else "%d s per model load assumed" % LAUNCH_S_ASSUMED)}
+
+
+def _arm_args(common, arm):
+    args = list(common)
+    for k, v in (arm.get("args_override") or {}).items():
+        args = _set_arg(args, k, v)
+    return args
+
+
+PROPOSE_MAX_REQUESTS = 12
+
+
+def requests_subset_for_spec(workload, spec_out):
+    """A requests workload larger than PROPOSE_MAX_REQUESTS: the experiment runs a spread of it instead (per request class,
+    from the smallest to the largest), written next to the spec as ids only (bodies stay in the workload file). Every
+    request runs rounds x (warmup + repetitions) times per arm, so all of a capture is rarely affordable, and its first N
+    are not representative."""
+    from hotpath import workload as wl
+    if not _is_requests_workload(workload):
+        return None
+    w = wl.load_workload(workload)
+    if len(w["items"]) <= PROPOSE_MAX_REQUESTS:
+        return None
+    picks, per = wl.per_class_spread(w, 4, PROPOSE_MAX_REQUESTS, positions=False)
+    path = Path(spec_out).with_name(Path(spec_out).stem + "-requests.json")
+    basis = "%d of the workload's %d requests: per request class %d from the smallest to the largest (an experiment runs every request rounds x " \
+            "(warmup + repetitions) times per arm)" % (len(picks), len(w["items"]), per)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(wl.subset(workload, [x["id"] for x in picks], "%s-spread" % w["name"], basis), indent=1) + "\n", encoding="utf-8")
+    return {"path": str(path), "basis": basis}
 
 
 def check_output_path(out_path, force=False):
@@ -148,11 +327,24 @@ def propose(diagnosis_path, finding_id, cfg, workload, out_path, common_args=Non
         raise ValueError("no finding %r in the diagnosis; available: %s" % (finding_id, sorted(findings)))
     args, source = baseline_args(d, cfg, common_args)
     args, removed = strip_runner_owned(_strip_launch_prefix(args))
+    sub = requests_subset_for_spec(workload, out)
+    if sub:
+        workload = sub["path"]
     spec = build_spec(findings[finding_id], cfg, args, workload, port=port, rounds=rounds, repetitions=repetitions, warmup=warmup, n_predict=n_predict)
+    if sub:
+        spec["provenance"]["workload_subset"] = sub["basis"]
     spec["provenance"]["common_args_source"] = source
+    # the largest arm decides how much free VRAM a launch needs; a generic floor when the model is unknown
+    need = [vram_needed_mib(cfg, _arm_args(args, a)) for a in spec["arms"]]
+    if all(n is not None for n in need) and need:
+        spec["preconditions"]["min_free_vram_mib"] = max(need)
+        spec["provenance"]["min_free_vram_basis"] = "weights on the GPU + 10%, KV cache at the arm's context and KV types, 512 MiB compute, for the largest arm (estimate from the GGUF header)"
     if removed:
         spec["provenance"]["removed_server_args"] = sorted(set(removed))
     spec["provenance"]["diagnosis"] = Path(diagnosis_path).name
+    est = estimate_minutes(spec, d.get("rates"))
+    if est:
+        spec["provenance"]["estimated_duration"] = est
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(spec, indent=2) + "\n", encoding="utf-8")
     return spec, source

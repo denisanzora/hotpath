@@ -28,6 +28,10 @@ Rules in `hotpath/diagnose.py` must be relative (shares of a request, ratios bet
 
 External tools live in `hotpath/adapters.py` as one class each (locate, install hint, fixed recipe). Add a class and register it in `all_status`.
 
+## Discovery and launch settings
+
+`hotpath/launch.py` is the one place that knows llama-server's argument spellings (`FLAGS`, `BOOLEAN_FLAGS`, `PATH_FLAGS`); add a setting there and every consumer (discovery, observe, diagnose, propose, the runner's alias-safe overrides) sees it. Path-valued flags must be listed in `PATH_FLAGS` so records keep only basenames and specs never inherit a path. `hotpath/discover.py` must stay read-only and bounded: new search locations are explicit lists or user-named roots walked by `walk()` (depth and entry caps, no links); the only program it may run is a found `llama-server --version`, recorded in `executed`, and never for binaries under agent-supplied roots. Every subprocess gets `stdin=subprocess.DEVNULL`. Support for another runtime's process names belongs in `discovery_process_names` and a parser of its own; do not report it as supported until it has been run.
+
 ## Reporting bugs
 
 Include `hotpath tools` output, your OS, GPU, runtime build, and the exact command. Do not attach model files or unredacted logs.

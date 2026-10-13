@@ -1,12 +1,15 @@
 """Command line: init, tools, observe, triage, diagnose, propose, gguf, workload, measure, experiment, compare, bench, profile, kernels."""
 import argparse
 import json
+import shlex
 import os
 import sys
 from pathlib import Path
 
 from hotpath import __version__
 from hotpath import adapters
+from hotpath import agentgate
+from hotpath import locks
 from hotpath import gguf as gguf_mod
 from hotpath import compare as compare_mod
 from hotpath import experiment as exp_mod
@@ -76,23 +79,44 @@ def cmd_diagnose(args):
     return 0
 
 
-def cmd_propose(args):
-    """Write an experiment spec for a diagnosis finding (one variable between arms), then show its dry-run plan."""
-    from hotpath import propose as prop_mod
-    cfg = load_local(args.local)
-    workload = args.workload or cfg.get("workload")
+def choose_workload(workload, cfg, shape):
+    """The workload for an experiment: the one given, else `workload` in the config, else synthetic prompts sized like
+    the real traffic a diagnosis saw, else three default synthetic prompts. Generated files go to workloads/."""
+    workload = workload or cfg.get("workload")
+    if not workload and shape:
+        # synthetic prompts sized like the real traffic the diagnosis saw (p10 / median / p90 prompt tokens, median output),
+        # so the experiment measures the request shape the user actually serves
+        sizes = [shape["prompt_tokens_p10"], shape["prompt_tokens_median"], shape["prompt_tokens_p90"]]
+        words = [max(20, int(round((t - 20) / 1.15))) for t in sizes]          # ~1.15 tokens per word of the synthetic vocabulary
+        n_predict = max(16, min(512, shape["generated_tokens_median"]))
+        workload = str(Path("workloads") / ("hotpath-shaped-%s-n%d.json" % ("-".join(str(w) for w in words), n_predict)))
+        if not Path(workload).exists():
+            wl_mod.save_workload(wl_mod.build_workload("hotpath-shaped", 3, words, seed=1, n_predict=n_predict, fmt="chatml"), workload)
+        print("no workload given; using synthetic prompts shaped like the observed traffic: %s (prompts of about %s tokens, %d generated; from %s)" % (
+            workload, "/".join(str(t) for t in sizes), n_predict, shape["basis"]))
     if not workload:
         workload = str(Path("workloads") / "hotpath-default.json")
         if not Path(workload).exists():
             w = wl_mod.build_workload("hotpath-default", 3, [450, 900, 1300], seed=1, n_predict=64, fmt="chatml")
             wl_mod.save_workload(w, workload)
             print("no workload given; wrote a default synthetic one: %s (3 ChatML prompts of 450/900/1300 words, n_predict 64)" % workload)
+    return workload
+
+
+def cmd_propose(args):
+    """Write an experiment spec for a diagnosis finding (one variable between arms), then show its dry-run plan."""
+    from hotpath import propose as prop_mod
+    cfg = load_local(args.local)
+    shape = (load_record(args.diagnosis).get("traffic_shape") or None) if not (args.workload or cfg.get("workload")) else None
+    workload = choose_workload(args.workload, cfg, shape)
     try:
         spec, source = prop_mod.propose(args.diagnosis, args.finding, cfg, workload, args.out, common_args=args.common_args, port=args.port,
                                         rounds=args.rounds, repetitions=args.repetitions, warmup=args.warmup, n_predict=args.n_predict, force=args.force)
     except ValueError as e:
         raise SystemExit("error: %s" % e)
     print("wrote %s (baseline arguments from: %s)" % (args.out, source))
+    if spec["provenance"].get("workload_subset"):
+        print("workload: %s, written to %s" % (spec["provenance"]["workload_subset"], spec["workload"]))
     if spec["provenance"].get("removed_server_args"):
         print("left out of the copied server arguments (the runner supplies its own, so the experiment cannot reuse your server's port, log, "
               "slot directory or model flags): %s" % ", ".join(spec["provenance"]["removed_server_args"]))
@@ -129,11 +153,15 @@ def cmd_workload(args):
             w = wl_mod.workload_from_requests(args.from_requests, name=args.name if args.name != "synthetic" else "requests", limit=args.limit)
         except ValueError as e:
             raise SystemExit("error: %s" % e)
-        wl_mod.save_workload(w, args.out_file)
+        out = wl_mod.requests_workload_path(args.out_file)
+        wl_mod.save_workload(w, str(out))
         ident = wl_mod.workload_identity(w)
-        print("wrote %s: %d application request bodies (%s), fields %s" % (args.out_file, ident["n_prompts"], ", ".join(ident["endpoints"]), ident["fields_present"]))
-        print("The workload file holds your request bodies; keep it local (workloads/ is gitignored here). Records store hashes, counts and timings only, "
-              "unless the spec sets store_outputs.")
+        print("wrote %s: %d application request bodies (%s), fields %s" % (out, ident["n_prompts"], ", ".join(ident["endpoints"]), ident["fields_present"]))
+        print(("The workload file holds your request bodies. Its directory is excluded from version control (hotpath wrote a .gitignore there)."
+               if wl_mod.in_private_dir(out) else
+               "The workload file holds your request bodies and is outside a directory hotpath excludes from version control: keep it out of any "
+               "repository yourself (a file name without a directory goes to workloads/, which is excluded).") +
+              " Records store hashes, counts and timings only, unless the spec sets store_outputs.")
         return 0
     w = wl_mod.build_workload(args.name, args.n_prompts, args.words, seed=args.seed, n_predict=args.n_predict, fmt=args.format)
     wl_mod.save_workload(w, args.out_file)
@@ -155,7 +183,17 @@ def cmd_measure(args):
 
 def cmd_experiment(args):
     cfg = load_local(args.local)
-    spec = exp_mod.load_spec(args.spec, cfg)
+    raw = None
+    if agentgate.active():
+        # the MCP server checked the file; check what this process reads, too. Dry runs as well: a plan resolves ${key}
+        # references and prints them, so a spec that may not run may not be planned either
+        try:
+            raw = agentgate.check_spec_file(args.spec)
+            if not args.dry_run:
+                agentgate.harden(raw)
+        except ValueError as e:
+            raise SystemExit("refused: %s" % e)
+    spec = exp_mod.load_spec(args.spec, cfg, raw=raw)
     if not args.dry_run:
         _require(spec.get("binary"), "runtime binary", "'binary' in the spec", "runtime_binary")
         _require(spec.get("model"), "model file", "'model' in the spec", "model_path")
@@ -188,22 +226,347 @@ def cmd_compare(args):
     return 0
 
 
+def _roots(args, cfg):
+    from hotpath import discover as disc
+    roots = []
+    for r in list(getattr(args, "root", None) or []) + list(cfg.get("discovery_roots") or []):
+        try:
+            roots.append(disc.check_root(r))
+        except ValueError as e:
+            raise SystemExit("error: %s" % e)
+    return roots
+
+
+def _discover(args, cfg, prefer=None):
+    from hotpath import discover as disc
+    from hotpath.records import new_record
+    rec = disc.discover(None if cfg.get("_missing") else cfg, roots=_roots(args, cfg), run_found=not getattr(args, "no_exec", False),
+                        run_in_roots=not getattr(args, "no_exec_roots", False), max_depth=getattr(args, "max_depth", None) or disc.MAX_DEPTH, prefer=prefer)
+    return rec, new_record("discovery", "passive", **rec)
+
+
+def cmd_discover(args):
+    """Find the local inference setup (running servers, installs, models, GPU, tools, logs) without changing anything."""
+    from hotpath import discover as disc
+    cfg = load_local(args.local)
+    rec, full = _discover(args, cfg)
+    md = disc.discovery_markdown(rec)
+    print(md)
+    _write(full, args, "discovery", md)
+    print("")
+    if cfg.get("_missing"):
+        print("Next: `hotpath init` writes the suggested values to hotpath.local.json%s." % (
+            " (choose among several candidates with --binary/--model/--server)" if rec["ambiguous"] else ""))
+    if disc.healthy_user_servers(rec) or cfg.get("server_url"):
+        print("Next: `hotpath inspect` diagnoses the running server from its command line, log and /metrics (passive).")
+    return 0
+
+
 def cmd_init(args):
-    """Write a starter hotpath.local.json (refuses to overwrite)."""
+    """Write hotpath.local.json from discovery (refuses to overwrite; --update adds only missing keys; --template writes placeholders)."""
     target = Path(args.path or DEFAULT_NAME)
-    if target.exists():
-        print("%s already exists; not overwriting" % target)
+    if args.template:
+        if target.exists():
+            print("%s already exists; not overwriting" % target)
+            return 1
+        template = {"server_url": "http://127.0.0.1:8080", "model_path": "/path/to/model.gguf", "runtime_binary": "/path/to/llama-server",
+                    "runtime_bin_dir": "/path/to/llama.cpp/build/bin", "build_dir": "/path/to/llama.cpp/build", "owned_servers": ["http://127.0.0.1:8099"]}
+        target.write_text(json.dumps(template, indent=2) + "\n", encoding="utf-8")
+        print("wrote %s; edit the paths, then run: hotpath tools" % target)
+        return 0
+    if target.exists() and not args.update:
+        print("%s already exists; not overwriting. `hotpath init --update` adds discovered keys it does not have yet (existing values are kept)." % target)
         return 1
-    template = {
-        "server_url": "http://127.0.0.1:8080",
-        "model_path": "/path/to/model.gguf",
-        "runtime_binary": "/path/to/llama-server",
-        "runtime_bin_dir": "/path/to/llama.cpp/build/bin",
-        "build_dir": "/path/to/llama.cpp/build",
-        "owned_servers": ["http://127.0.0.1:8099"],
-    }
-    target.write_text(json.dumps(template, indent=2) + "\n", encoding="utf-8")
-    print("wrote %s; edit the paths, then run: hotpath tools" % target)
+    if target.name.lower() != DEFAULT_NAME and not target.name.lower().endswith(".local.json"):
+        raise SystemExit("error: the config file name must end in .local.json (it holds local paths and is gitignored by that pattern)")
+    existing = json.loads(target.read_text(encoding="utf-8")) if target.exists() else {}
+    cfg = dict(existing, _path=str(target)) if existing else {"_missing": True}
+    prefer = {k: v for k, v in (("runtime_binary", args.binary), ("model_path", args.model), ("server_url", args.server)) if v}
+    try:
+        rec, full = _discover(args, cfg, prefer)
+    except ValueError as e:
+        raise SystemExit("error: %s" % e)
+    from hotpath import discover as disc
+    _write(full, args, "discovery", disc.discovery_markdown(rec))
+    sug, src = rec["suggested_config"], rec["suggested_config_sources"]
+    if args.root:
+        sug["discovery_roots"] = [str(r) for r in _roots(args, {})]
+        src["discovery_roots"] = "--root (searched again by later discover/inspect runs)"
+    added = {k: v for k, v in sug.items() if k not in existing}
+    data = dict(existing) if existing else {"_comment": "Written by `hotpath init` from discovery; every value says where it came from in the init output. "
+                                                         "Keep this file out of version control: it holds local paths."}
+    data.update(added)
+    target.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+    print("%s %s" % ("updated" if existing else "wrote", target))
+    for k, v in added.items():
+        print("  %-16s %s\n  %-16s   (%s)" % (k, " ".join(v) if k == "server_args" else v, "", src.get(k)))
+    if existing and not added:
+        print("  nothing to add: every discovered key is already set (existing values are never changed)")
+    for k, v in rec["ambiguous"].items():
+        if k not in existing:
+            flag = {"runtime_binary": "--binary", "model_path": "--model", "server_url": "--server"}[k]
+            print("  %-16s not set: several candidates; choose with `hotpath init %s%s PATH`:\n%s" % (
+                k, "--update " if existing else "", flag, "\n".join("    - %s" % c for c in v)))
+    for x in rec["issues"]:
+        if x["severity"] == "high":
+            print("  problem: %s: %s. Fix: %s" % (x["where"], x["what"], x["fix"]))
+    missing = [k for k in ("runtime_binary", "model_path") if k not in data]
+    if missing:
+        print("  still missing: %s. Pass --binary/--model, or --root DIR to search where they live." % ", ".join(missing))
+    print("Next: `hotpath inspect` (passive) diagnoses the running server; `hotpath tools` checks the external tools.")
+    return 0
+
+
+def cmd_inspect(args):
+    """Passive, one step: discover the setup, observe the running (or configured) server with its log and /metrics, diagnose."""
+    from hotpath import discover as disc
+    from hotpath import diagnose as diag_mod
+    cfg = load_local(args.local)
+    rec, full = _discover(args, cfg)
+    _write(full, args, "discovery", disc.discovery_markdown(rec))
+    print(disc.discovery_brief(rec))
+    live = disc.healthy_user_servers(rec)
+    base = args.server or cfg.get("server_url") or (live[0]["base_url"] if len(live) == 1 else None)
+    if not args.server and cfg.get("server_url") and len(live) == 1 and cfg["server_url"].rstrip("/") != live[0]["base_url"]:
+        from hotpath import server as srv_mod
+        if srv_mod.health(cfg["server_url"].rstrip("/")).get("status") == "unreachable":
+            print("\nserver_url in the config (%s) does not answer; inspecting the running server %s instead (`hotpath init --update` does not change "
+                  "existing values: edit server_url, or pass --server)." % (cfg["server_url"], live[0]["base_url"]))
+            base = live[0]["base_url"]
+    if not base and len(live) > 1:
+        raise SystemExit("several llama-servers are running (%s); choose one with --server" % ", ".join(s["base_url"] for s in live))
+    if not (base or args.log or cfg.get("server_log")):
+        print("\nNo running llama-server and no log to read: start your server (with --log-file and --metrics for the most evidence) "
+              "or pass --log LOG, then run `hotpath inspect` again.")
+        return 0
+    obs = observe_mod.observe(cfg, log_path=args.log, base_url=base, sample_seconds=args.sample_seconds)
+    opath = _write(obs, args, "observation", observe_mod.observation_markdown(obs))
+    d = diag_mod.diagnose([obs], bandwidth_gbs=args.bandwidth_gbs, cfg=None if cfg.get("_missing") else cfg)
+    d["source_files"] = [Path(str(opath)).name]
+    dpath = _write(d, args, "diagnosis", diag_mod.diagnosis_markdown(d))
+    print("")
+    print(diag_mod.diagnosis_brief(d, str(dpath), rec, captures=wl_mod.find_request_captures(".")))
+    return 0
+
+
+def _experiment_runner(cfg, wait_s):
+    """Runs one spec file through the normal experiment runner (preconditions, own port, interleaving) and returns its
+    record with the comparison attached; server logs go next to the spec."""
+    def run(spec, spec_path):
+        # the spec the loop built is the one launched (the file next to it is a copy for the user): nothing re-read from disk
+        raw = json.loads(json.dumps(spec))
+        if agentgate.active():
+            # started by the MCP server: whatever produced this spec (an agent, a saved session, the loop from an observed command
+            # line), it launches only what an agent-authored spec may carry, with the idle-GPU and free-port preconditions kept
+            try:
+                agentgate.check_spec(raw)
+            except ValueError as e:
+                raise SystemExit("refused: %s" % e)
+            agentgate.harden(raw)
+        resolved = exp_mod.load_spec(spec_path, cfg, raw=raw)
+        for k in ("binary", "model"):
+            if not resolved.get(k) or not Path(resolved[k]).exists():
+                raise SystemExit("error: %s %s does not exist; set %s in hotpath.local.json (`hotpath init --binary/--model`)" % (
+                    k, resolved.get(k), "runtime_binary" if k == "binary" else "model_path"))
+        rec = exp_mod.run(resolved, str(Path(spec_path).parent), wait_for_preconditions_s=wait_s)
+        rec["comparison"] = compare_mod.compare([rec])
+        return rec
+    return run
+
+
+def _last_observation(out, server_url, max_age_h=24):
+    """The newest observation in the results directory of the configured server that recorded its launch command line,
+    if it is less than a day old; None otherwise."""
+    import datetime as _dt
+    if not server_url:
+        return None
+    for p in sorted(Path(out).glob("observation-*.json"), reverse=True):
+        try:
+            rec = load_record(p)
+        except (OSError, ValueError):
+            continue
+        if ((rec.get("server") or {}).get("base_url") or "").rstrip("/") != server_url.rstrip("/"):
+            continue
+        if not ((rec.get("server_process") or {}).get("launch") or {}).get("available"):
+            continue
+        try:
+            age = _dt.datetime.now(_dt.timezone.utc) - _dt.datetime.fromisoformat(rec["created"])
+        except (KeyError, ValueError, TypeError):
+            continue
+        if age.total_seconds() < -300:
+            continue                       # dated in the future: not an observation hotpath made
+        return (p, rec) if age.total_seconds() < max_age_h * 3600 else None
+    return None
+
+
+class _NoLock:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+def _session_gpu(args):
+    """An active improve run holds the machine-wide GPU lock from its first launch to its report (a dry run takes nothing)."""
+    if args.dry_run:
+        return _NoLock()
+    return locks.gpu_work("improve", args.resume or "new session", wait_s=args.wait_s, log=lambda m: print(m, flush=True))
+
+
+def split_args_string(text):
+    """A launch line given as one string. On Windows, backslashes in paths are kept (POSIX shell rules would drop them)
+    and surrounding quotes are removed."""
+    if os.name != "nt":
+        return shlex.split(text)
+    return [t[1:-1] if len(t) >= 2 and t[0] == t[-1] and t[0] in "\"'" else t for t in shlex.split(text, posix=False)]
+
+
+def requests_workload(captured):
+    """The requests workload for a capture file: workloads/<name>.requests.json, built once from the capture (an existing
+    one is reused when it was built from the same file contents, so a session keeps measuring the same requests)."""
+    import hashlib
+    src = Path(captured)
+    digest = hashlib.sha256(src.read_bytes()).hexdigest()[:16]
+    out = Path("workloads") / ("%s.requests.json" % src.stem)
+    if out.is_file():
+        try:
+            if json.loads(out.read_text(encoding="utf-8")).get("source_sha256") == digest:
+                return str(out)
+        except ValueError:
+            pass
+        out = Path("workloads") / ("%s-%s.requests.json" % (src.stem, digest[:6]))
+        if out.is_file():
+            return str(out)
+    try:
+        w = wl_mod.workload_from_requests(str(src), name=src.stem)
+    except ValueError as e:
+        raise SystemExit("error: %s" % e)
+    w["source_sha256"] = digest
+    wl_mod.save_workload(w, str(out))
+    ident = wl_mod.workload_identity(w)
+    print("wrote %s: %d of your requests in %d class(es) (%s); it holds your prompts, keep it local" % (
+        out, ident["n_prompts"], len(ident["classes"]), ", ".join("%s x%d" % kv for kv in sorted(ident["classes"].items()))))
+    return str(out)
+
+
+EVIDENCE_KINDS = ("observation", "measurement", "experiment", "bench", "profile")
+
+
+def evidence_records(paths):
+    """Records to start from. A diagnosis is a conclusion, not evidence: it stands for the records it was made from (its
+    source_files, next to it). Anything else is refused with what to pass instead."""
+    out = []
+    for p in paths:
+        rec = load_record(p)
+        kind = rec.get("kind")
+        if kind in EVIDENCE_KINDS:
+            out.append(rec)
+            continue
+        if kind == "diagnosis":
+            srcs = [Path(p).parent / n for n in rec.get("source_files") or []]
+            missing = [s.name for s in srcs if not s.is_file()]
+            if not srcs or missing:
+                raise SystemExit("error: %s is a diagnosis, not evidence, and the records it was made from are not next to it (%s); pass an observation, "
+                                 "measurement or experiment record" % (Path(p).name, ", ".join(missing) or "none listed"))
+            if agentgate.active():
+                for s in srcs:
+                    try:
+                        agentgate.inside_roots(str(s), "record")
+                    except ValueError as e:
+                        raise SystemExit("refused: %s" % e)
+            print("note: %s is a diagnosis; starting from the records it was made from: %s" % (Path(p).name, ", ".join(s.name for s in srcs)))
+            out += [load_record(str(s)) for s in srcs]
+            continue
+        raise SystemExit("error: %s is a %s record; improve starts from observation, measurement or experiment records" % (Path(p).name, kind))
+    return out
+
+
+def cmd_improve(args):
+    """ACTIVE (unless --dry-run): diagnose, test the top finding with an experiment, adopt it only on a keep verdict, repeat
+    within the budget, confirm the cumulative change, and print the launch line to apply."""
+    from hotpath import diagnose as diag_mod
+    from hotpath import discover as disc
+    from hotpath import improve as imp
+    cfg = load_local(args.local)
+    if cfg.get("_missing"):
+        raise SystemExit("error: hotpath.local.json not found. Run `hotpath init` first: it finds your llama-server and model "
+                         "(`hotpath init --root DIR` when they live outside the standard locations).")
+    out = _out(args)
+    records, start = [], None
+    pending = [x for x in imp.unfinished_sessions(out) if x[0] != args.resume]
+    if pending:
+        print("note: interrupted improve session(s) can be continued instead of starting over: %s (`hotpath improve --resume NAME`; "
+              "MCP: hotpath_improve with resume=NAME)" % ", ".join("%s (%d experiment(s) recorded)" % x for x in pending[-3:]))
+    if args.resume:
+        with _session_gpu(args):
+            rep = imp.improve(cfg, [], args.workload or "", out, None if args.dry_run else _experiment_runner(cfg, args.wait_s), max_experiments=args.max_experiments,
+                              max_minutes=args.max_minutes, rounds=args.rounds, repetitions=args.repetitions, warmup=args.warmup, port=args.port,
+                              n_predict=args.n_predict, bandwidth_gbs=args.bandwidth_gbs, session=args.resume, resume=True, dry_run=args.dry_run,
+                              log=lambda m: print(m, flush=True))
+        print("")
+        print(imp.improvement_markdown(rep))
+        print("wrote %s" % rep["path"])
+        return 0
+    if args.from_records:
+        records = evidence_records(args.from_records)
+        start = "the records you named: %s" % ", ".join(Path(p).name for p in args.from_records)
+    else:
+        rec, full = _discover(args, cfg)
+        _write(full, args, "discovery", disc.discovery_markdown(rec))
+        live = disc.healthy_user_servers(rec)
+        base = args.server or cfg.get("server_url") if (args.server or cfg.get("server_url")) else (live[0]["base_url"] if len(live) == 1 else None)
+        saved = None
+        if base:
+            from hotpath import server as srv_mod
+            if srv_mod.health(base.rstrip("/")).get("status") == "unreachable":
+                # the usual sequence on one GPU: the user stopped their server so the experiments get its memory. Its last
+                # observation (with its command line) is the evidence, also when the server was named explicitly
+                saved = _last_observation(out, base)
+                if saved:
+                    print("note: %s is not running; starting from its last observation (%s)" % (base, saved[0].name))
+                    base = None
+                elif not args.server:
+                    base = live[0]["base_url"] if len(live) == 1 else None
+        if not base and len(live) > 1:
+            raise SystemExit("several llama-servers are running (%s); choose one with --server" % ", ".join(s["base_url"] for s in live))
+        if saved is None and not (base or args.log):
+            saved = _last_observation(out, cfg.get("server_url"))
+        if saved:
+            # the usual sequence on one GPU: improve refused while the user's server held the VRAM, the user stopped it, and
+            # runs improve again; the last observation still has that server's launch command line, which a log alone lacks
+            path, obs = saved
+            records = [obs]
+            start = "the last observation of your server %s (%s, %s; it is not running now)" % (cfg.get("server_url"), path.name, obs.get("created"))
+        elif base or args.log or cfg.get("server_log"):
+            obs = observe_mod.observe(cfg, log_path=args.log, base_url=base, sample_seconds=5.0)
+            _write(obs, args, "observation", observe_mod.observation_markdown(obs))
+            records = [obs]
+            start = "your running server %s (observed passively)" % base if base else "your server log"
+            if live:
+                names = ", ".join("pid %s (%s)" % (s.get("pid"), s["base_url"]) for s in live)
+                print("note: your llama-server %s is running. Experiments run on hotpath's own server (port %d) and need the GPU memory it holds; "
+                      "hotpath never stops, restarts or reconfigures your server. Stop it yourself before the run, or pass --wait-s N." % (names, args.port))
+        else:
+            start = "no running server or log: a baseline of your configuration on hotpath's own server"
+    shape = None
+    if args.requests:
+        args.workload = requests_workload(args.requests)
+    if records and not (args.workload or cfg.get("workload")):
+        shape = diag_mod.diagnose(records, cfg=cfg).get("traffic_shape")
+    workload = choose_workload(args.workload, cfg, shape)
+    print("starting point: %s" % start)
+    with _session_gpu(args):
+        rep = imp.improve(cfg, records, workload, out, None if args.dry_run else _experiment_runner(cfg, args.wait_s), max_experiments=args.max_experiments,
+                          max_minutes=args.max_minutes, rounds=args.rounds, repetitions=args.repetitions, warmup=args.warmup, port=args.port,
+                              n_predict=args.n_predict, dry_run=args.dry_run, initial_args=split_args_string(args.args) if args.args else None,
+                          bandwidth_gbs=args.bandwidth_gbs, log=lambda m: print(m, flush=True), cache_mode=args.cache_mode,
+                          step_requests=args.step_requests, validation_requests=args.validation_requests)
+    print("")
+    print(imp.improvement_markdown(rep))
+    print("wrote %s" % rep["path"])
+    if args.dry_run and rep.get("next_step"):
+        print("\nNothing was launched. Run without --dry-run to start (ACTIVE: launches hotpath's own llama-server on port %d, one experiment at a time)." % args.port)
     return 0
 
 
@@ -219,7 +582,8 @@ def cmd_tools(args):
     import platform
     from hotpath import gpu as gpu_mod
     cfg = load_local(args.local)
-    print("hotpath %s, Python %s, %s" % (__version__, platform.python_version(), platform.platform()))
+    from hotpath import safepath
+    print("hotpath %s, Python %s, %s" % (__version__, platform.python_version(), safepath.os_description()))
     if cfg.get("_missing"):
         print("config:            not found (%s). Run `hotpath init` to create one; commands that need paths will ask for them." % cfg["_path"])
     else:
@@ -252,6 +616,8 @@ def cmd_bench(args):
         print("refusing: background GPU utilization max %.0f%% > %s" % (bg["util_pct_max"], args.max_background_util))
         return 3
     _require(args.model or cfg.get("model_path"), "model file", "--model", "model_path")
+    if agentgate.active() and args.model and Path(args.model).resolve() != Path(str(cfg.get("model_path") or "")).resolve():
+        raise SystemExit("refused: an agent-run benchmark uses the configured model_path only")
     cmd = ad.recipe(args.model or cfg.get("model_path"), ngl=args.ngl, ub=args.ub, pp=args.pp, tg=args.tg, reps=args.reps)
     print(" ".join(cmd))
     res = adapters.run_recipe(cmd, path_prepend=cfg.get("path_prepend"))
@@ -362,9 +728,60 @@ def build_parser():
     s.add_argument("records", nargs="+")
     s.set_defaults(fn=cmd_compare)
 
-    s = sub.add_parser("init", help="write a starter hotpath.local.json in the current directory")
+    def discovery_args(s):
+        s.add_argument("--root", action="append", help="also search this directory (repeatable; bounded depth; drive roots are refused)")
+        s.add_argument("--no-exec", action="store_true", help="do not run `llama-server --version` on found binaries")
+        s.add_argument("--no-exec-roots", action="store_true", help=argparse.SUPPRESS)
+
+    s = sub.add_parser("discover", help="find the local setup: running llama-servers and their launch settings, installs, GGUF models, GPU, tools, logs (passive)")
+    discovery_args(s)
+    s.add_argument("--max-depth", type=int, help="directory depth for --root searches (default 4)")
+    s.set_defaults(fn=cmd_discover)
+
+    s = sub.add_parser("init", help="write hotpath.local.json from discovery (the running server's binary, model, args, log; CUDA path fixes)")
     s.add_argument("path", nargs="?", help="where to write it (default hotpath.local.json)")
+    discovery_args(s)
+    s.add_argument("--binary", help="choose this llama-server when several are found"); s.add_argument("--model", help="choose this GGUF model")
+    s.add_argument("--server", help="choose this running server (URL) when several answer")
+    s.add_argument("--update", action="store_true", help="add discovered keys to an existing file; existing values are never changed")
+    s.add_argument("--template", action="store_true", help="write the old placeholder template instead of discovering")
     s.set_defaults(fn=cmd_init)
+
+    s = sub.add_parser("inspect", help="passive, one step: discover + observe the running server (command line, log, /metrics, GPU) + diagnose")
+    discovery_args(s)
+    s.add_argument("--server", help="server URL (default: server_url in the config, else the only running llama-server)")
+    s.add_argument("--log", help="server log (default: the server's --log-file, else server_log in the config)")
+    s.add_argument("--sample-seconds", type=float, default=5.0); s.add_argument("--bandwidth-gbs", type=float)
+    s.set_defaults(fn=cmd_inspect)
+
+    s = sub.add_parser("improve", help="ACTIVE (unless --dry-run): test the top findings one experiment at a time on hotpath's own server, "
+                                       "adopt only keep verdicts, confirm the result, print the launch line to apply")
+    discovery_args(s)
+    s.add_argument("--from", dest="from_records", nargs="+", metavar="RECORD", help="start from these records (observation, measurement, diagnosis inputs) "
+                   "instead of observing the running server")
+    s.add_argument("--server", help="the running server to start from (default: server_url, else the only running llama-server)")
+    s.add_argument("--log", help="server log to diagnose from (default: the server's --log-file, else server_log)")
+    s.add_argument("--workload", help="workload file (default: 'workload' in the config, else synthetic prompts shaped like your observed traffic)")
+    s.add_argument("--requests", metavar="CAPTURED", help="your application's own request bodies (JSON array or JSONL of llama-server request bodies, "
+                   "optionally {\"class\": ..., \"body\": ...}): every step and the final validation run these real requests instead of synthetic prompts; "
+                   "the workload is written to workloads/ (keep it local: it holds your prompts)")
+    s.add_argument("--cache-mode", choices=("cold", "warm", "as-is"), help="prompt-cache handling for request workloads: %s" % (
+        "cold (default): every request fully processed, prompt cache off; warm: your requests in your application's order with the prompt cache as "
+        "it sends them; as-is: no intervention, for diagnostics only"))
+    s.add_argument("--step-requests", type=int, default=2, help="requests per request class in each step (default 2: the median and the largest)")
+    s.add_argument("--validation-requests", type=int, default=4, help="requests per request class in the final validation (default 4, smallest to "
+                   "largest, preferring ones the steps did not run)")
+    s.add_argument("--args", help="starting llama-server arguments as one quoted string, when no server runs, e.g. --args \"-ngl 99 -c 8192\" "
+                   "(default: server_args, else defaults fitted to your GPU)")
+    s.add_argument("--max-experiments", type=int, default=3, help="experiments to run at most, not counting the baseline and the final confirmation (default 3)")
+    s.add_argument("--max-minutes", type=float, default=60, help="stop before a step whose estimated duration would exceed this (default 60)")
+    s.add_argument("--dry-run", action="store_true", help="passive: diagnose and write the first spec, launch nothing")
+    s.add_argument("--resume", metavar="SESSION", help="continue an interrupted session (its directory name under results/local): experiments it already "
+                   "recorded are reused, not run again; the session's starting point and workload are kept")
+    s.add_argument("--wait-s", type=int, default=0, help="wait up to this long for each experiment's preconditions (free GPU)")
+    s.add_argument("--port", type=int, default=8099); s.add_argument("--rounds", type=int, default=3); s.add_argument("--repetitions", type=int, default=2)
+    s.add_argument("--warmup", type=int, default=1); s.add_argument("--n-predict", type=int); s.add_argument("--bandwidth-gbs", type=float)
+    s.set_defaults(fn=cmd_improve)
 
     s = sub.add_parser("mcp", help="run the MCP server on stdio so AI coding agents can call hotpath (active tools are off unless HOTPATH_MCP_ALLOW_ACTIVE=1)")
     s.set_defaults(fn=cmd_mcp)
@@ -402,10 +819,19 @@ def _tolerant_console():
             pass
 
 
+_GPU_COMMANDS = {"cmd_bench": "bench", "cmd_profile": "profile", "cmd_kernels": "kernels", "cmd_measure": "measure"}
+
+
 def main(argv=None):
     _tolerant_console()
     args = build_parser().parse_args(argv)
+    # started by the MCP server: stop this process's servers and exit if that server is killed outright
+    locks.watch_parent()
     try:
+        kind = _GPU_COMMANDS.get(getattr(args.fn, "__name__", ""))
+        if kind:
+            with locks.gpu_work(kind, getattr(args, "label", None) or getattr(args, "mode", None), wait_s=getattr(args, "wait_s", 0) or 0):
+                return args.fn(args)
         return args.fn(args)
     except (OSError, ValueError, KeyError) as e:
         if os.environ.get("HOTPATH_DEBUG"):

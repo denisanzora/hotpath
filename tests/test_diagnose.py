@@ -83,7 +83,15 @@ class DecodeCeilingTests(unittest.TestCase):
         self.assertEqual(f["measurements"]["ceiling_tps_at_peak_bandwidth"], 100.0)
         self.assertAlmostEqual(f["measurements"]["achieved_fraction"], 0.25, places=2)
         self.assertEqual(f["severity"], "high")
-        self.assertEqual(f["experiment"]["kind"], "cuda_graphs")
+        # graphs are not disabled here: toggling them could only confirm the current state, so the next step is a decode profile
+        self.assertEqual(f["experiment"]["kind"], "profile_decode")
+
+    def test_graphs_experiment_only_when_graphs_are_off_and_baseline_first(self):
+        reqs = [_req(1500, 3000, 64, 2560, 5700, prompt_id="p%02d" % i) for i in range(6)]
+        rec = _experiment("e", {"base": (["--ubatch-size", "512"], reqs, 5000)})
+        rec["arms"]["base"]["env_ggml"] = {"GGML_CUDA_DISABLE_GRAPHS": "1"}
+        f = {x["id"]: x for x in dg.diagnose([rec])["findings"]}["decode_below_ceiling"]
+        self.assertEqual([a["name"] for a in f["experiment"]["arms"]], ["graphs-off", "graphs-on"])
 
     def test_missing_bandwidth_is_insufficient(self):
         reqs = [_req(1500, 3000, 64, 2560, 5700, prompt_id="p%02d" % i) for i in range(6)]
