@@ -1246,8 +1246,7 @@ def experiment_verdict(rec):
                                 detail="both arms warm in the application's request order; they reused different numbers of cached tokens on prompt(s) %s, "
                                        "which is the effect of the prompt-cache setting under test: wall time includes the reuse it loses or gains" % differs[:5])
                     row["cache"]["comparability"] = comp
-                elif differs and _cache_sibling(rec, lab, labels) and not prompt_reuse_differs(
-                        _verified([r for r in arms[_cache_sibling(rec, lab, labels)].get("requests") or [] if not r.get("error")], "warm")[0], vc):
+                elif differs and _sibling_explains_reuse(rec, lab, labels, arms, vb, vc, differs):
                     sib = _cache_sibling(rec, lab, labels)
                     # the candidate changes a prompt-cache setting and something else; arm `sib` changes only that cache setting and
                     # loses or gains the same reuse on the same prompts, so the reuse difference is the cache setting's effect, part of
@@ -1422,6 +1421,23 @@ def _cache_sibling(rec, arm_name, names):
         if (sib.get("args_override") or {}) == over and sorted(str(f) for f in sib.get("args_remove") or []) == removed:
             return other
     return None
+
+
+def _sibling_explains_reuse(rec, arm_name, names, arms, base_verified, cand_verified, differs):
+    """Whether a cache-only sibling of a combined candidate accounts for the candidate's reuse difference from the baseline.
+    The sibling must have verified requests on every prompt where the candidate's reuse differs, must itself differ from the
+    baseline on those prompts, and must reuse what the candidate reuses. A sibling that produced no usable requests, or never
+    ran those prompts, explains nothing: missing evidence is not read as agreement."""
+    sib = _cache_sibling(rec, arm_name, names)
+    if not sib or not differs:
+        return False
+    sib_verified = _verified([r for r in arms[sib].get("requests") or [] if not r.get("error")], "warm")[0]
+    covered = {r.get("prompt_id") for r in sib_verified}
+    if not set(differs) <= covered:
+        return False
+    if not set(differs) <= set(prompt_reuse_differs(base_verified, sib_verified)):
+        return False
+    return not prompt_reuse_differs(sib_verified, cand_verified)
 
 
 def rejected_requests(reqs):

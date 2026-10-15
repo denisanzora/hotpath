@@ -52,6 +52,40 @@ class CacheSiblingAttributionTests(unittest.TestCase):
         self.assertFalse(row["cache"]["comparability"]["comparable"])
 
 
+class CacheSiblingEvidenceTests(unittest.TestCase):
+    """Missing or non-explaining sibling evidence must never turn a reuse difference into a comparable result."""
+
+    def _row(self, rec):
+        return next(r for r in dg.experiment_verdict(rec)["arms"] if r["arm"] == "b")
+
+    def test_a_sibling_with_no_usable_requests_explains_nothing(self):
+        rec = _three_arms(300, 0)
+        for r in rec["arms"]["s"]["requests"]:
+            r["error"] = "rejected"
+        row = self._row(rec)
+        self.assertFalse(row["cache"]["comparability"]["comparable"])
+        self.assertTrue(row["verdict"].startswith("inconclusive"), row["verdict"])
+
+    def test_a_sibling_that_never_ran_the_differing_prompt_explains_nothing(self):
+        rec = _three_arms(300, 0)
+        rec["arms"]["s"]["requests"] = [r for r in rec["arms"]["s"]["requests"] if r["prompt_id"] != "p3"]
+        row = self._row(rec)
+        self.assertFalse(row["cache"]["comparability"]["comparable"])
+        self.assertTrue(row["verdict"].startswith("inconclusive"), row["verdict"])
+
+    def test_a_sibling_that_reuses_like_the_baseline_does_not_explain_the_candidates_reuse(self):
+        rec = _three_arms(900, 300)      # the cache-only arm keeps all its reuse; only the combined candidate loses it
+        row = self._row(rec)
+        self.assertFalse(row["cache"]["comparability"]["comparable"])
+        self.assertIsNone(row["cache"]["comparability"].get("reuse_matched_by"))
+
+    def test_a_record_without_a_recorded_spec_has_no_sibling(self):
+        rec = _three_arms(300, 300)
+        del rec["spec_redacted"]
+        self.assertIsNone(dg._cache_sibling(rec, "b", ["a", "s", "b"]))
+        self.assertFalse(self._row(rec)["cache"]["comparability"]["comparable"])
+
+
 class ProductionGateTextTests(unittest.TestCase):
     def test_a_warm_run_is_not_described_as_cache_off(self):
         rec = _three_arms(300, 300)
