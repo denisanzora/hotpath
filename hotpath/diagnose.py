@@ -1246,6 +1246,16 @@ def experiment_verdict(rec):
                                 detail="both arms warm in the application's request order; they reused different numbers of cached tokens on prompt(s) %s, "
                                        "which is the effect of the prompt-cache setting under test: wall time includes the reuse it loses or gains" % differs[:5])
                     row["cache"]["comparability"] = comp
+                elif differs and _sibling_explains_reuse(rec, lab, labels, arms, vb, vc, differs):
+                    sib = _cache_sibling(rec, lab, labels)
+                    # the candidate changes a prompt-cache setting and something else; arm `sib` changes only that cache setting and
+                    # loses or gains the same reuse on the same prompts, so the reuse difference is the cache setting's effect, part of
+                    # the candidate, and wall time in the application's order compares the whole change
+                    comp = dict(comp, basis="warm", reuse_is_the_effect=True, reuse_matched_by=sib,
+                                detail="both arms warm in the application's request order; they reused different numbers of cached tokens on prompt(s) %s, "
+                                       "as arm %s does, which changes only the prompt-cache setting this candidate also changes, and the candidate reuses "
+                                       "what %s reuses: the reuse difference is that setting's effect, and wall time includes it" % (differs[:5], sib, sib))
+                    row["cache"]["comparability"] = comp
                 elif differs:
                     comp = {"comparable": False, "basis": "warm reuse differs",
                             "detail": "both arms warm, but they reused a different number of cached tokens on prompt(s) %s (> 10%% apart): the change in reuse, not the change under test, drives prefill and wall time" % differs[:5]}
@@ -1381,12 +1391,53 @@ CACHE_SETTING_FLAGS = ("--cache-ram", "-cram", "--ctx-checkpoints", "-ctxcp", "-
                        "--cache-idle-slots", "--no-cache-idle-slots", "--swa-full")
 
 
-def _cache_setting_arm(rec, arm_name):
-    """Whether an arm of a recorded experiment changes only prompt-cache settings (relative to the spec's common arguments)."""
+def _arm_spec(rec, arm_name):
     spec = rec.get("spec_redacted") or {}
-    arm = next((a for a in spec.get("arms") or [] if a.get("name") == arm_name), None) or {}
+    return next((a for a in spec.get("arms") or [] if a.get("name") == arm_name), None) or {}
+
+
+def _cache_setting_arm(rec, arm_name):
+    """Whether an arm of a recorded experiment changes only prompt-cache settings (relative to the spec's common arguments):
+    no other argument, no environment, and the same binary and model."""
+    arm = _arm_spec(rec, arm_name)
     changed = list((arm.get("args_override") or {}).keys()) + list(arm.get("args_remove") or [])
-    return bool(changed) and not arm.get("env_override") and not arm.get("env_remove") and all(str(f).split("=")[0] in CACHE_SETTING_FLAGS for f in changed)
+    return (bool(changed) and not arm.get("env_override") and not arm.get("env_remove") and not arm.get("binary") and not arm.get("model")
+            and all(str(f).split("=")[0] in CACHE_SETTING_FLAGS for f in changed))
+
+
+def _cache_sibling(rec, arm_name, names):
+    """For an arm that changes prompt-cache settings together with something else (a build, a microbatch): another arm of the
+    same experiment that changes exactly those cache settings and nothing else, or None. With it, a reuse difference against
+    the baseline can be traced to the cache setting: the candidate must reuse what that sibling reuses."""
+    arm = _arm_spec(rec, arm_name)
+    over = {k: v for k, v in (arm.get("args_override") or {}).items() if str(k).split("=")[0] in CACHE_SETTING_FLAGS}
+    removed = sorted(str(f) for f in arm.get("args_remove") or [] if str(f).split("=")[0] in CACHE_SETTING_FLAGS)
+    if not (over or removed) or _cache_setting_arm(rec, arm_name):
+        return None
+    for other in names:
+        if other == arm_name or not _cache_setting_arm(rec, other):
+            continue
+        sib = _arm_spec(rec, other)
+        if (sib.get("args_override") or {}) == over and sorted(str(f) for f in sib.get("args_remove") or []) == removed:
+            return other
+    return None
+
+
+def _sibling_explains_reuse(rec, arm_name, names, arms, base_verified, cand_verified, differs):
+    """Whether a cache-only sibling of a combined candidate accounts for the candidate's reuse difference from the baseline.
+    The sibling must have verified requests on every prompt where the candidate's reuse differs, must itself differ from the
+    baseline on those prompts, and must reuse what the candidate reuses. A sibling that produced no usable requests, or never
+    ran those prompts, explains nothing: missing evidence is not read as agreement."""
+    sib = _cache_sibling(rec, arm_name, names)
+    if not sib or not differs:
+        return False
+    sib_verified = _verified([r for r in arms[sib].get("requests") or [] if not r.get("error")], "warm")[0]
+    covered = {r.get("prompt_id") for r in sib_verified}
+    if not set(differs) <= covered:
+        return False
+    if not set(differs) <= set(prompt_reuse_differs(base_verified, sib_verified)):
+        return False
+    return not prompt_reuse_differs(sib_verified, cand_verified)
 
 
 def rejected_requests(reqs):
@@ -1729,7 +1780,9 @@ def diagnose(records, bandwidth_gbs=None, cfg=None, focus=None):
                                                                           for a in (r.get("spec_redacted") or {}).get("arms") or []):
             cp = cache_pattern_evidence(ev)
             if not cp.get("available") or cp.get("thin"):
-                gate = "production applicability unknown: no (or too little) cache-pattern evidence for real traffic (add an `observe --log` record of the real server). The gain was measured on isolated requests with the prompt cache off."
+                measured = ("The gain was measured warm, in the workload's own request order: real traffic's reuse decides whether it holds."
+                            if r.get("cache_mode") == "warm" else "The gain was measured on isolated requests with the prompt cache off.")
+                gate = "production applicability unknown: no (or too little) cache-pattern evidence for real traffic (add an `observe --log` record of the real server). " + measured
             elif cp["level"] == "low":
                 gate = "production applicability supported: %s, so little prefix reuse is lost." % reuse_text(cp)
             else:

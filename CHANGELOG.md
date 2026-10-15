@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+- A candidate that changes a prompt-cache setting together with something else (a runtime build, a microbatch) was inconclusive in warm runs whenever its reuse differed from the baseline's. When the same experiment has an arm that changes only that cache setting, ran every prompt whose reuse differs, differs from the baseline on them, and reuses what the candidate reuses, the reuse difference is attributed to the cache setting and wall time compares the whole change. A cache-only arm with no usable requests, or without those prompts, attributes nothing.
+- An arm that changed the binary or the model together with a prompt-cache flag counted as a cache-setting-only arm, which exempted its reuse difference.
+- The production gate of a warm experiment said the gain was measured with the prompt cache off.
+
 ## 0.3.0 (2026-10-12)
 
 ### Security
